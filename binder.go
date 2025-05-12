@@ -242,7 +242,7 @@ func getFieldInfo(typ reflect.Type) map[string]fieldInfo {
 	return info
 }
 
-// Helper to recursively bind nested structs.
+// BindStruct a helper to recursively bind nested structs.
 func BindStruct(field reflect.Value, data map[string]interface{}) error {
 	target := field
 	if field.Kind() == reflect.Ptr {

@@ -1,6 +1,8 @@
 # Go HTTP Binder
 
-A lightweight, zero-dependency library for binding HTTP request data to Go structs.
+This lightweight, zero-dependency library is primarily designed to work with Go's standard `net/http` routing for 
+binding HTTP request data to Go structs. While it can be integrated with third-party routers that support named path 
+parameters, its core functionality is built around the standard library's HTTP handling.
 
 ## Features
 
@@ -37,13 +39,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
     type UserRequest struct {
         ID        int      `path:"id"`
         Name      string   `query:"name"`
-        Email     string   `body:"email" json:"email"`
-        Tags      []string `body:"tags" json:"tags"`
-        Newsletter bool    `body:"newsletter,omitempty" json:"newsletter,omitempty"`
+        Email     string   `body:"email"`
+        Tags      []string `body:"tags"`
+        Newsletter bool    `body:"newsletter,omitempty"`
     }
     
     var req UserRequest
-    if err := gobind.Bind(r, &req); err != nil {
+    if err := binder.Bind(r, &req); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
     }
@@ -64,22 +66,35 @@ The library supports binding from multiple sources:
 
 - `path:"name"` - Binds from path parameters (requires a path parameter handler that supports named parameters)
 - `query:"name"` - Binds from URL query parameters
-- `body:"name"` - Binds from request body (form data or JSON)
-- `json:"name"` - Alias for body when using JSON 
 - `cookie:"name"` - Binds from HTTP cookies
+- `body:"name"` - Binds from request body (form data `x-www-form-urlencoded` or JSON)
+- `json:"name"` - Backwards compatibility with existing types
+
+### Body vs JSON Tags
+
+The `body:` tag is the primary tag for binding request body data and automatically handles both JSON and form-encoded 
+data based on the request's Content-Type header.
+
+The `json:` tag serves as:
+- An alternative to `body:` when working specifically with JSON data
+- A way to maintain compatibility with code that already uses `json:` tags for serialization
+
+In most cases, you should prefer using the `body:` tag as it provides content-type awareness.
+
+**Note:** Avoid using both `body:` and `json:` tags on the same field as this creates redundancy.
 
 ## Options
 
 Add `,omitempty` to skip binding if the value is empty:
 
 ```go
-Email string `body:"email,omitempty" json:"email,omitempty"`
+Email string `body:"email,omitempty"`
 ```
 
 Add `,required` to return an error if the field is missing:
 
 ```go
-Email string `body:"email,required" json:"email,required"`
+Email string `body:"email,required"`
 ```
 
 ## Advanced Usage
@@ -107,37 +122,37 @@ type Request struct {
 
 ```go
 type Address struct {
-    Street string `json:"street"`
-    City   string `json:"city"`
+    Street string `body:"street"`
+    City   string `body:"city"`
 }
 
 type User struct {
-    Name    string  `json:"name"`
-    Address Address `json:"address"`
+    Name    string  `body:"name"`
+    Address Address `body:"address"`
 }
 ```
 
 ### Configuration Options
 
 ```go
-opts := gobind.BindOptions{
+opts := binder.BindOptions{
     SkipUnknownFields: true,
     DisallowExtraFields: false,
     ErrorOnRequired: true,
 }
 
-if err := gobind.BindWithOptions(r, &req, opts); err != nil {
+if err := binder.BindWithOptions(r, &req, opts); err != nil {
     // Handle error
 }
 ```
 
 ## Error Handling
 
-Errors from binding are of type `*gobind.BindError`, which provides detailed information about what went wrong:
+Errors from binding are of type `*binder.BindError`, which provides detailed information about what went wrong:
 
 ```go
-if err := gobind.Bind(r, &req); err != nil {
-    if bindErr, ok := err.(*gobind.BindError); ok {
+if err := binder.Bind(r, &req); err != nil {
+    if bindErr, ok := err.(*binder.BindError); ok {
         fmt.Printf("Error binding field '%s': %s\n", bindErr.Field, bindErr.Message)
     }
     http.Error(w, err.Error(), http.StatusBadRequest)
@@ -173,16 +188,6 @@ if err := gobind.Bind(r, &req); err != nil {
 * **Highest memory usage:** BindMixed/WithForm (9.75 KB/op)
 * **Fewest allocations:** BindPathOnly (1 allocs/op)
 * **Most allocations:** BindMixed/WithJSON (59 allocs/op)
-
-## Key Insights
-
-* **Path parameter binding** is significantly faster than other binding types, with only a single memory allocation.
-* **JSON and form body parsing** are the most resource-intensive operations, consuming around 7-10KB of memory per operation.
-* **Mixed binding operations** (combining multiple sources) have the highest time cost, taking 3.5-3.7ms per operation.
-* The cached version of `Bind` is approximately 18% faster than the uncached version (2.66ms vs 3.26ms).
-* **Cookie binding** is quite efficient, requiring only 4 allocations and 0.23KB of memory.
-* **Parallel binding** demonstrates good performance, which suggests the `Bind` function is suitable for concurrent use.
-
 
 ## Contributing
 
