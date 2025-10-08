@@ -469,6 +469,172 @@ func TestBindUnsupportedType(t *testing.T) {
 	}
 }
 
+func TestBindSlicesExplicitly(t *testing.T) {
+	t.Run("IntSlice", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"values": []int{1, 2, 3, 4, 5},
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Failed to marshal JSON: %v", err)
+		}
+
+		r := httptest.NewRequest("POST", "/test", bytes.NewBuffer(payloadBytes))
+		r.Header.Set("Content-Type", "application/json")
+
+		type params struct {
+			Values []int `body:"values"`
+		}
+
+		var p params
+		err = Bind(r, &p)
+		if err != nil {
+			t.Errorf("Binding should succeed with int slice, got error: %v", err)
+		}
+
+		expected := []int{1, 2, 3, 4, 5}
+		if !reflect.DeepEqual(p.Values, expected) {
+			t.Errorf("Expected Values to be %v, got %v", expected, p.Values)
+		}
+	})
+
+	t.Run("StringSlice", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"tags": []string{"tag1", "tag2", "tag3", "tag4", "tag5"},
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Failed to marshal JSON: %v", err)
+		}
+
+		r := httptest.NewRequest("POST", "/test", bytes.NewBuffer(payloadBytes))
+		r.Header.Set("Content-Type", "application/json")
+
+		type params struct {
+			Tags []string `body:"tags"`
+		}
+
+		var p params
+		err = Bind(r, &p)
+		if err != nil {
+			t.Errorf("Binding should succeed with string slice, got error: %v", err)
+		}
+
+		expected := []string{"tag1", "tag2", "tag3", "tag4", "tag5"}
+		if !reflect.DeepEqual(p.Tags, expected) {
+			t.Errorf("Expected Tags to be %v, got %v", expected, p.Tags)
+		}
+	})
+
+	t.Run("EmptySlice", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"items": []interface{}{},
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Failed to marshal JSON: %v", err)
+		}
+
+		r := httptest.NewRequest("POST", "/test", bytes.NewBuffer(payloadBytes))
+		r.Header.Set("Content-Type", "application/json")
+
+		type params struct {
+			Items []string `body:"items"`
+		}
+
+		var p params
+		err = Bind(r, &p)
+		if err != nil {
+			t.Errorf("Binding should succeed with empty slice, got error: %v", err)
+		}
+
+		if len(p.Items) != 0 {
+			t.Errorf("Expected Items to be empty, got %v", p.Items)
+		}
+	})
+
+	t.Run("BoolSlice", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"flags": []bool{true, false, true, true, false},
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Failed to marshal JSON: %v", err)
+		}
+
+		r := httptest.NewRequest("POST", "/test", bytes.NewBuffer(payloadBytes))
+		r.Header.Set("Content-Type", "application/json")
+
+		type params struct {
+			Flags []bool `body:"flags"`
+		}
+
+		var p params
+		err = Bind(r, &p)
+		if err != nil {
+			t.Errorf("Binding should succeed with bool slice, got error: %v", err)
+		}
+
+		expected := []bool{true, false, true, true, false}
+		if !reflect.DeepEqual(p.Flags, expected) {
+			t.Errorf("Expected Flags to be %v, got %v", expected, p.Flags)
+		}
+	})
+
+	t.Run("FloatSlice", func(t *testing.T) {
+		payload := map[string]interface{}{
+			"prices": []float64{1.99, 2.99, 3.99, 4.99},
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Failed to marshal JSON: %v", err)
+		}
+
+		r := httptest.NewRequest("POST", "/test", bytes.NewBuffer(payloadBytes))
+		r.Header.Set("Content-Type", "application/json")
+
+		type params struct {
+			Prices []float64 `body:"prices"`
+		}
+
+		var p params
+		err = Bind(r, &p)
+		if err != nil {
+			t.Errorf("Binding should succeed with float slice, got error: %v", err)
+		}
+
+		expected := []float64{1.99, 2.99, 3.99, 4.99}
+		if !reflect.DeepEqual(p.Prices, expected) {
+			t.Errorf("Expected Prices to be %v, got %v", expected, p.Prices)
+		}
+	})
+
+	t.Run("SingleValueToSlice", func(t *testing.T) {
+		// Test binding a single query param value to a slice
+		r := httptest.NewRequest("GET", "/test?tag=important", nil)
+
+		type params struct {
+			Tag []string `query:"tag"`
+		}
+
+		var p params
+		err := Bind(r, &p)
+		if err != nil {
+			t.Errorf("Binding should succeed with single value to slice, got error: %v", err)
+		}
+
+		expected := []string{"important"}
+		if !reflect.DeepEqual(p.Tag, expected) {
+			t.Errorf("Expected Tag to be %v, got %v", expected, p.Tag)
+		}
+	})
+}
+
 func TestBindArrayNotSupported(t *testing.T) {
 	payload := map[string]interface{}{
 		"values": []int{1, 2, 3},
@@ -492,7 +658,7 @@ func TestBindArrayNotSupported(t *testing.T) {
 		t.Errorf("Binding should fail with array type")
 	}
 
-	if !strings.Contains(err.Error(), "arrays are not supported") {
+	if !strings.Contains(err.Error(), "arrays are not supported, use slices instead") {
 		t.Errorf("Expected error about arrays not supported, got: %v", err)
 	}
 }

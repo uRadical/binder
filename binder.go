@@ -1,3 +1,21 @@
+// Package binder provides zero-dependency HTTP request binding for Go.
+//
+// Binder maps data from HTTP requests to Go structs using struct tags,
+// supporting multiple data sources including path parameters, query strings,
+// request bodies (JSON and form-encoded), and cookies.
+//
+// Basic usage:
+//
+//	var req struct {
+//	    ID    int    `path:"id"`
+//	    Name  string `query:"name"`
+//	    Email string `body:"email"`
+//	}
+//	err := binder.Bind(r, &req)
+//
+// The library is designed to work with Go 1.22+ and its native path parameter support.
+// It maintains zero external dependencies and focuses solely on data binding,
+// leaving validation and transformation to other specialized tools.
 package binder
 
 import (
@@ -36,23 +54,62 @@ type fieldInfo struct {
 var fieldCache = make(map[reflect.Type]map[string]fieldInfo)
 var fieldCacheMutex sync.RWMutex
 
-// Validator interface allows structs to implement custom validation
+// Validator is an optional interface that structs can implement to provide
+// custom validation logic that runs automatically after successful binding.
+//
+// Example:
+//
+//	type CreateUserRequest struct {
+//	    Email string `body:"email"`
+//	    Age   int    `body:"age"`
+//	}
+//
+//	func (r CreateUserRequest) Validate() error {
+//	    if r.Age < 18 {
+//	        return errors.New("user must be 18 or older")
+//	    }
+//	    return nil
+//	}
+//
+// When a type implements Validator, Bind will call Validate after binding
+// and return any validation errors.
 type Validator interface {
 	Validate() error
 }
 
-// Bind maps data from an HTTP request into a struct.
-// It supports binding from path parameters, query strings, request body (JSON or form),
-// and cookies based on struct field tags.
+// Bind maps data from an HTTP request into a struct using reflection and struct tags.
 //
-// Supported tags:
-//   - `path:"name"` - Binds from URL path parameters
-//   - `query:"name"` - Binds from URL query parameters
-//   - `body:"name"` - Binds from request body (JSON or form)
-//   - `json:"name"` - Alternative for binding from JSON body
-//   - `cookie:"name"` - Binds from HTTP cookies
+// The target must be a pointer to a struct. Bind supports multiple data sources:
 //
-// Add "omitempty" to any tag to skip binding if the value is empty.
+//	- path:"name"   - URL path parameters (requires Go 1.22+)
+//	- query:"name"  - URL query parameters
+//	- body:"name"   - Request body (JSON or form-encoded based on Content-Type)
+//	- json:"name"   - Alternative to body tag for JSON data
+//	- cookie:"name" - HTTP cookies
+//
+// Tag modifiers:
+//
+//	- omitempty - Skip binding if the value is empty
+//
+// Example:
+//
+//	type UpdateUserRequest struct {
+//	    ID       int    `path:"id"`
+//	    Name     string `body:"name"`
+//	    Email    string `body:"email,omitempty"`
+//	    APIToken string `cookie:"api_token"`
+//	}
+//
+//	var req UpdateUserRequest
+//	if err := binder.Bind(r, &req); err != nil {
+//	    // Handle binding error
+//	}
+//
+// Returns an error if:
+//   - The target is not a pointer to a struct
+//   - Type conversion fails
+//   - Required fields are missing
+//   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i interface{}) error {
 	typ := reflect.TypeOf(i).Elem()
 	val := reflect.ValueOf(i).Elem()
@@ -77,16 +134,13 @@ func Bind(r *http.Request, i interface{}) error {
 		// Parse the body
 		b, err = parseBody(rCopy)
 		if err != nil {
-			// Log error but continue - we still want to bind other parameters
-			fmt.Printf("Warning: error parsing body: %v\n", err)
+			// Continue with empty body - we still want to bind other parameters
+			// The error is non-fatal as data might come from path/query/cookies
 			b = make(map[string]interface{})
 		}
 	} else {
 		b = make(map[string]interface{})
 	}
-
-	// Get or build field info cache
-	//fieldInfos := getFieldInfo(typ)
 
 	// Process each field
 	for x := 0; x < typ.NumField(); x++ {
@@ -242,7 +296,17 @@ func getFieldInfo(typ reflect.Type) map[string]fieldInfo {
 	return info
 }
 
-// BindStruct a helper to recursively bind nested structs.
+// BindStruct recursively binds data from a map to a struct field, handling nested structures.
+//
+// This function is exported for advanced use cases where you need to bind nested
+// data manually. Most users should use Bind instead.
+//
+// Parameters:
+//   - field: The reflect.Value of the struct field to bind to
+//   - data: Map containing the data to bind
+//
+// The function handles both pointer and non-pointer fields, automatically
+// initializing nil pointers as needed.
 func BindStruct(field reflect.Value, data map[string]interface{}) error {
 	target := field
 	if field.Kind() == reflect.Ptr {
@@ -367,7 +431,7 @@ func setField(field reflect.Value, value interface{}) error {
 		return setSlice(field, value)
 
 	case reflect.Array:
-		return fmt.Errorf("arrays are not supported")
+		return fmt.Errorf("arrays are not supported, use slices instead")
 
 	case reflect.Struct:
 		return setStruct(field, value)
