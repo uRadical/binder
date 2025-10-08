@@ -114,103 +114,15 @@ func Bind(r *http.Request, i interface{}) error {
 	typ := reflect.TypeOf(i).Elem()
 	val := reflect.ValueOf(i).Elem()
 
-	var b map[string]interface{}
-
-	// Handle request body if present
-	if r.Body != nil && r.ContentLength > 0 {
-		// Read the body once
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			return fmt.Errorf("error reading request body: %w", err)
-		}
-
-		// Restore the body for other potential readers
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-		// Create a copy of the request with the new body for parsing
-		rCopy := *r
-		rCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-		// Parse the body
-		b, err = parseBody(rCopy)
-		if err != nil {
-			// Continue with empty body - we still want to bind other parameters
-			// The error is non-fatal as data might come from path/query/cookies
-			b = make(map[string]interface{})
-		}
-	} else {
-		b = make(map[string]interface{})
+	// Parse request body once
+	bodyData, err := parseRequestBody(r)
+	if err != nil {
+		return err
 	}
 
-	// Process each field
-	for x := 0; x < typ.NumField(); x++ {
-		field := typ.Field(x)
-		f := val.Field(x)
-
-		tag := field.Tag
-		pathTag := tag.Get(path)
-		queryTag := tag.Get(query)
-		bodyTag := tag.Get(body)
-		jsonTag := tag.Get(jjson)
-		cookieTag := tag.Get(cookie)
-
-		omitEmpty := strings.Contains(tag.Get(path)+tag.Get(query)+tag.Get(body)+tag.Get(jjson)+tag.Get(cookie), "omitempty")
-
-		var v interface{}
-		var exists bool
-
-		switch {
-		case pathTag != "":
-			v = r.PathValue(pathTag)
-			exists = v != ""
-
-		case queryTag != "":
-			paramName := queryTag
-			if commaIndex := strings.Index(paramName, ","); commaIndex != -1 {
-				paramName = paramName[:commaIndex]
-			}
-
-			v = r.URL.Query().Get(paramName)
-			exists = v != ""
-
-		case bodyTag != "":
-			v, exists = b[bodyTag]
-
-		case jsonTag != "":
-			v, exists = b[jsonTag]
-
-		case cookieTag != "":
-			c, err := r.Cookie(cookieTag)
-			if err == nil {
-				v = c.Value
-				exists = true
-			}
-
-		default:
-			continue
-		}
-
-		if !exists || (omitEmpty && isEmptyValue(v)) {
-			continue // Skip setting if omitempty and value not present
-		}
-
-		if f.Kind() == reflect.Ptr && f.IsNil() {
-			f.Set(reflect.New(f.Type().Elem())) // Initialize pointer fields
-		}
-
-		// Handle nested structs recursively
-		if f.Kind() == reflect.Struct || (f.Kind() == reflect.Ptr && f.Elem().Kind() == reflect.Struct) {
-			if nestedMap, ok := v.(map[string]interface{}); ok {
-				if err := BindStruct(f, nestedMap); err != nil {
-					return fmt.Errorf("error binding nested field %s: %w", field.Name, err)
-				}
-				continue
-			}
-		}
-
-		if err := setField(f, v); err != nil {
-			return fmt.Errorf("error setting field %s: %w", field.Name, err)
-		}
+	// Process each field in the struct
+	if err := bindStructFields(r, typ, val, bodyData); err != nil {
+		return err
 	}
 
 	// Run validation if the struct implements Validator
@@ -220,6 +132,132 @@ func Bind(r *http.Request, i interface{}) error {
 		}
 	}
 
+	return nil
+}
+
+// parseRequestBody reads and parses the request body, restoring it for other readers
+func parseRequestBody(r *http.Request) (map[string]interface{}, error) {
+	if r.Body == nil || r.ContentLength <= 0 {
+		return make(map[string]interface{}), nil
+	}
+
+	// Read the body once
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading request body: %w", err)
+	}
+
+	// Restore the body for other potential readers
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Create a copy of the request with the new body for parsing
+	rCopy := *r
+	rCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Parse the body
+	bodyData, err := parseBody(rCopy)
+	if err != nil {
+		// Continue with empty body - we still want to bind other parameters
+		// The error is non-fatal as data might come from path/query/cookies
+		return make(map[string]interface{}), nil
+	}
+
+	return bodyData, nil
+}
+
+// bindStructFields processes each field in the struct and binds data from the request
+func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, bodyData map[string]interface{}) error {
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		fieldVal := val.Field(i)
+
+		// Extract value from appropriate source
+		value, exists, err := extractFieldValue(r, field, bodyData)
+		if err != nil {
+			return err
+		}
+
+		// Skip if value doesn't exist or should be omitted
+		if !exists || shouldOmitField(field, value) {
+			continue
+		}
+
+		// Set the field value
+		if err := bindFieldValue(fieldVal, value, field.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// extractFieldValue gets the value for a field from the appropriate request source
+func extractFieldValue(r *http.Request, field reflect.StructField, bodyData map[string]interface{}) (interface{}, bool, error) {
+	tag := field.Tag
+	pathTag := tag.Get(path)
+	queryTag := tag.Get(query)
+	bodyTag := tag.Get(body)
+	jsonTag := tag.Get(jjson)
+	cookieTag := tag.Get(cookie)
+
+	switch {
+	case pathTag != "":
+		v := r.PathValue(pathTag)
+		return v, v != "", nil
+
+	case queryTag != "":
+		paramName := queryTag
+		if commaIndex := strings.Index(paramName, ","); commaIndex != -1 {
+			paramName = paramName[:commaIndex]
+		}
+		v := r.URL.Query().Get(paramName)
+		return v, v != "", nil
+
+	case bodyTag != "":
+		v, exists := bodyData[bodyTag]
+		return v, exists, nil
+
+	case jsonTag != "":
+		v, exists := bodyData[jsonTag]
+		return v, exists, nil
+
+	case cookieTag != "":
+		c, err := r.Cookie(cookieTag)
+		if err == nil {
+			return c.Value, true, nil
+		}
+		return nil, false, nil
+
+	default:
+		return nil, false, nil
+	}
+}
+
+// shouldOmitField determines if a field should be skipped based on omitempty
+func shouldOmitField(field reflect.StructField, value interface{}) bool {
+	tag := field.Tag
+	omitEmpty := strings.Contains(tag.Get(path)+tag.Get(query)+tag.Get(body)+tag.Get(jjson)+tag.Get(cookie), "omitempty")
+	return omitEmpty && isEmptyValue(value)
+}
+
+// bindFieldValue sets the value on a struct field, handling nested structs and pointers
+func bindFieldValue(fieldVal reflect.Value, value interface{}, fieldName string) error {
+	if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
+		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
+	}
+
+	// Handle nested structs recursively
+	if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Elem().Kind() == reflect.Struct) {
+		if nestedMap, ok := value.(map[string]interface{}); ok {
+			if err := BindStruct(fieldVal, nestedMap); err != nil {
+				return fmt.Errorf("error binding nested field %s: %w", fieldName, err)
+			}
+			return nil
+		}
+	}
+
+	if err := setField(fieldVal, value); err != nil {
+		return fmt.Errorf("error setting field %s: %w", fieldName, err)
+	}
 	return nil
 }
 
@@ -395,22 +433,39 @@ func setField(field reflect.Value, value interface{}) error {
 	}
 
 	// Handle TextUnmarshaler interface
+	handled, err := tryTextUnmarshaler(field, value)
+	if handled {
+		return err
+	}
+
+	// Handle based on field kind
+	return setFieldByKind(field, value)
+}
+
+// tryTextUnmarshaler attempts to use TextUnmarshaler interface if implemented
+// Returns (handled, error) where handled indicates if TextUnmarshaler was used
+func tryTextUnmarshaler(field reflect.Value, value interface{}) (bool, error) {
 	if field.Type().Implements(reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()) {
 		strVal, ok := value.(string)
 		if !ok {
-			return errors.New("value is not a string for TextUnmarshaler")
+			return true, errors.New("value is not a string for TextUnmarshaler")
 		}
-		return field.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(strVal))
+		return true, field.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(strVal))
 	}
 
 	if field.CanAddr() && reflect.PointerTo(field.Type()).Implements(reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()) {
 		strVal, ok := value.(string)
 		if !ok {
-			return errors.New("value is not a string for TextUnmarshaler")
+			return true, errors.New("value is not a string for TextUnmarshaler")
 		}
-		return field.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(strVal))
+		return true, field.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(strVal))
 	}
 
+	return false, nil // No TextUnmarshaler interface found
+}
+
+// setFieldByKind sets the field value based on its reflect.Kind
+func setFieldByKind(field reflect.Value, value interface{}) error {
 	switch field.Kind() {
 	case reflect.String:
 		return setString(field, value)
