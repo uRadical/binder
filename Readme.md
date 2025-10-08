@@ -1,10 +1,5 @@
 # Binder - HTTP Request Binding for Go
 
-[![CI](https://github.com/uradical/tools/actions/workflows/ci.yml/badge.svg)](https://github.com/uradical/tools/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/uradical.io/go/binder)](https://goreportcard.com/report/uradical.io/go/binder)
-[![Coverage Status](https://codecov.io/gh/uradical/tools/branch/main/graph/badge.svg)](https://codecov.io/gh/uradical/tools)
-[![Go Reference](https://pkg.go.dev/badge/uradical.io/go/binder.svg)](https://pkg.go.dev/uradical.io/go/binder)
-
 A focused, zero-dependency library that does one thing well: binding HTTP request data to Go structs. Built specifically for Go 1.22+ and its native path parameter support.
 
 ## Why Binder?
