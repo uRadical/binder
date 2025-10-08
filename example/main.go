@@ -34,9 +34,9 @@ type GetUserRequest struct {
 }
 
 type ListUsersRequest struct {
-	Active  *bool  `query:"active,omitempty"`
-	Limit   int    `query:"limit,omitempty"`
-	APIKey  string `cookie:"api_key"`
+	Active *bool  `query:"active,omitempty"`
+	Limit  int    `query:"limit,omitempty"`
+	APIKey string `cookie:"api_key"`
 }
 
 type CreateUserRequest struct {
@@ -226,11 +226,11 @@ func main() {
 	mux := http.NewServeMux()
 
 	// API routes demonstrating different binding scenarios
-	mux.HandleFunc("GET /users/{id}", getUser)           // Path parameter
-	mux.HandleFunc("GET /users", listUsers)              // Query parameters + cookies
-	mux.HandleFunc("POST /users", createUser)            // JSON body + validation
-	mux.HandleFunc("PUT /users/{id}", updateUser)        // Path + body (partial updates)
-	mux.HandleFunc("DELETE /users/{id}", deleteUser)     // Path parameter
+	mux.HandleFunc("GET /users/{id}", getUser)       // Path parameter
+	mux.HandleFunc("GET /users", listUsers)          // Query parameters + cookies
+	mux.HandleFunc("POST /users", createUser)        // JSON body + validation
+	mux.HandleFunc("PUT /users/{id}", updateUser)    // Path + body (partial updates)
+	mux.HandleFunc("DELETE /users/{id}", deleteUser) // Path parameter
 
 	// Wrap with demo middleware
 	handler := demoMiddleware(mux)
