@@ -41,7 +41,7 @@ jobs:
       run: go build -v ./...
 
     - name: Run tests
-      run: go test -race -coverprofile=coverage.out ./...
+      run: go test -race ./...
 
     - name: Run benchmarks
       run: go test -bench=. -benchmem ./...
@@ -56,11 +56,3 @@ jobs:
 
     - name: Run vet
       run: go vet ./...
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.out
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
