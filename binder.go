@@ -81,15 +81,15 @@ type Validator interface {
 //
 // The target must be a pointer to a struct. Bind supports multiple data sources:
 //
-//	- path:"name"   - URL path parameters (requires Go 1.22+)
-//	- query:"name"  - URL query parameters
-//	- body:"name"   - Request body (JSON or form-encoded based on Content-Type)
-//	- json:"name"   - Alternative to body tag for JSON data
-//	- cookie:"name" - HTTP cookies
+//   - path:"name"   - URL path parameters (requires Go 1.22+)
+//   - query:"name"  - URL query parameters
+//   - body:"name"   - Request body (JSON or form-encoded based on Content-Type)
+//   - json:"name"   - Alternative to body tag for JSON data
+//   - cookie:"name" - HTTP cookies
 //
 // Tag modifiers:
 //
-//	- omitempty - Skip binding if the value is empty
+//   - omitempty - Skip binding if the value is empty
 //
 // Example:
 //
