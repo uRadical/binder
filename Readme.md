@@ -255,30 +255,40 @@ This library has been designed with production use in mind:
 - Complex validation requirements (use a separate validator)
 - Legacy Go versions (requires Go 1.22+ for path parameters)
 
-## Integration with Validation
+## Validation
 
-Binder intentionally doesn't include validation - that's a separate concern. Here's how to combine it with your validator of choice:
+For simple validation your types can implement a Validate function, this will be called as part of the binding:
 
 ```go
-func handler(w http.ResponseWriter, r *http.Request) {
-    var req CreateUserRequest
+  type CreateUserRequest struct {
+      Name  string `body:"name"`
+      Email string `body:"email"`
+  }
 
-    // Step 1: Bind
-    if err := binder.Bind(r, &req); err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
-        return
-    }
+  func (r CreateUserRequest) Validate() error {
+      if r.Name == "" {
+          return fmt.Errorf("name is required")
+      }
+      if r.Email == "" {
+          return fmt.Errorf("email is required")
+      }
+      return nil
+  }
 
-    // Step 2: Validate (using your preferred validator)
-    if err := validator.Validate(req); err != nil {
-        http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-        return
-    }
+  func handler(w http.ResponseWriter, r *http.Request) {
+      var req CreateUserRequest
 
-    // Step 3: Process
-    user := createUser(req)
-    json.NewEncoder(w).Encode(user)
-}
+      // Single step: bind + validate
+      if err := binder.Bind(r, &req); err != nil {
+          http.Error(w, err.Error(), http.StatusBadRequest)
+          return
+      }
+
+      // Process (req is already validated)
+      user := createUser(req)
+      json.NewEncoder(w).Encode(user)
+  }
+
 ```
 
 ## Realistic Comparison
