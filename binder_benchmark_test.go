@@ -1,7 +1,6 @@
 package binder
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -38,16 +37,25 @@ type MixedStruct struct {
 	SessionID string   `cookie:"session_id"`
 }
 
-// Helper to set path parameters in a standard way
-// Adjust this based on how your Bind function expects to find path parameters
+// setPathParams populates the path values that Bind reads through
+// r.PathValue. Values placed anywhere else, the request context included, are
+// invisible to it, so a benchmark set up that way binds nothing at all and
+// times an empty loop.
 func setPathParams(r *http.Request, params map[string]string) *http.Request {
-	// Your Bind function might look for path params in one of these common places:
-	// 1. In request context under a specific key
-	// 2. In request URL params
-	// 3. In a custom request field via type assertion
+	for name, value := range params {
+		r.SetPathValue(name, value)
+	}
+	return r
+}
 
-	// This is a guess - adjust based on your implementation
-	return r.WithContext(context.WithValue(r.Context(), "path_params", params))
+// requireBound fails a benchmark whose target does not receive the value it
+// was set up to bind, so that a broken fixture is reported rather than
+// quietly measured.
+func requireBound(b *testing.B, field string, got, want interface{}) {
+	b.Helper()
+	if got != want {
+		b.Fatalf("fixture binds nothing: %s = %v, want %v", field, got, want)
+	}
 }
 
 // BenchmarkBindPathOnly benchmarks binding from path parameters only
@@ -57,6 +65,12 @@ func BenchmarkBindPathOnly(b *testing.B) {
 
 	// Set path parameters - adjust this based on your implementation
 	r = setPathParams(r, map[string]string{"id": "123"})
+
+	var probe PathOnlyStruct
+	if err := Bind(r, &probe); err != nil {
+		b.Fatalf("Failed to bind path params: %v", err)
+	}
+	requireBound(b, "ID", probe.ID, 123)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -72,6 +86,12 @@ func BenchmarkBindPathOnly(b *testing.B) {
 func BenchmarkBindQueryOnly(b *testing.B) {
 	// Create a request with query parameters
 	r := httptest.NewRequest("GET", "/users?name=test_user", nil)
+
+	var probe QueryOnlyStruct
+	if err := Bind(r, &probe); err != nil {
+		b.Fatalf("Failed to bind query params: %v", err)
+	}
+	requireBound(b, "Name", probe.Name, "test_user")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -90,6 +110,14 @@ func BenchmarkBindBodyOnly(b *testing.B) {
 		formData.Add("email", "test@example.com")
 		formBody := formData.Encode()
 
+		probeReq := httptest.NewRequest("POST", "/users", strings.NewReader(formBody))
+		probeReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		var probe BodyOnlyStruct
+		if err := Bind(probeReq, &probe); err != nil {
+			b.Fatalf("Failed to bind form body: %v", err)
+		}
+		requireBound(b, "Email", probe.Email, "test@example.com")
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			// Create a new request for each iteration to avoid body read issues
@@ -106,6 +134,14 @@ func BenchmarkBindBodyOnly(b *testing.B) {
 
 	b.Run("JSONBody", func(b *testing.B) {
 		jsonBody := `{"tags":["tag1","tag2","tag3"]}`
+
+		probeReq := httptest.NewRequest("POST", "/users", strings.NewReader(jsonBody))
+		probeReq.Header.Set("Content-Type", "application/json")
+		var probe JSONOnlyStruct
+		if err := Bind(probeReq, &probe); err != nil {
+			b.Fatalf("Failed to bind JSON body: %v", err)
+		}
+		requireBound(b, "len(Tags)", len(probe.Tags), 3)
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -128,6 +164,12 @@ func BenchmarkBindCookieOnly(b *testing.B) {
 	r := httptest.NewRequest("GET", "/users", nil)
 	r.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
 
+	var probe CookieOnlyStruct
+	if err := Bind(r, &probe); err != nil {
+		b.Fatalf("Failed to bind cookies: %v", err)
+	}
+	requireBound(b, "SessionID", probe.SessionID, "abc123")
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var s CookieOnlyStruct
@@ -146,6 +188,19 @@ func BenchmarkBindMixed(b *testing.B) {
 	formData.Add("email", "test@example.com")
 
 	b.Run("WithJSON", func(b *testing.B) {
+		probeReq := httptest.NewRequest("POST", "/users/123?name=test_user", strings.NewReader(jsonBody))
+		probeReq.Header.Set("Content-Type", "application/json")
+		probeReq.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
+		probeReq = setPathParams(probeReq, map[string]string{"id": "123"})
+		var probe MixedStruct
+		if err := Bind(probeReq, &probe); err != nil {
+			b.Fatalf("Failed to bind mixed with JSON: %v", err)
+		}
+		requireBound(b, "ID", probe.ID, 123)
+		requireBound(b, "Name", probe.Name, "test_user")
+		requireBound(b, "SessionID", probe.SessionID, "abc123")
+		requireBound(b, "len(Tags)", len(probe.Tags), 3)
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			// Create a fresh request for each iteration
@@ -164,6 +219,19 @@ func BenchmarkBindMixed(b *testing.B) {
 
 	b.Run("WithForm", func(b *testing.B) {
 		formBody := formData.Encode()
+
+		probeReq := httptest.NewRequest("POST", "/users/123?name=test_user", strings.NewReader(formBody))
+		probeReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		probeReq.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
+		probeReq = setPathParams(probeReq, map[string]string{"id": "123"})
+		var probe MixedStruct
+		if err := Bind(probeReq, &probe); err != nil {
+			b.Fatalf("Failed to bind mixed with form: %v", err)
+		}
+		requireBound(b, "ID", probe.ID, 123)
+		requireBound(b, "Name", probe.Name, "test_user")
+		requireBound(b, "Email", probe.Email, "test@example.com")
+		requireBound(b, "SessionID", probe.SessionID, "abc123")
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -192,6 +260,12 @@ type OmitEmptyStruct struct {
 func BenchmarkBindOmitEmpty(b *testing.B) {
 	// Create a request with just a query parameter
 	r := httptest.NewRequest("GET", "/users?name=test_user", nil)
+
+	var probe OmitEmptyStruct
+	if err := Bind(r, &probe); err != nil {
+		b.Fatalf("Failed to bind with omitempty: %v", err)
+	}
+	requireBound(b, "Name", probe.Name, "test_user")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
