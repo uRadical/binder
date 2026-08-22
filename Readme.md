@@ -120,11 +120,15 @@ Add `,omitempty` to skip binding if the value is empty:
 Email string `body:"email,omitempty"`
 ```
 
-Add `,required` to return an error if the field is missing:
+Add `,required` to return an error if the value is missing from its source:
 
 ```go
 Email string `body:"email,required"`
 ```
+
+The error is a `*BindError` wrapping `ErrMissingRequired`. For `path` and
+`query` an empty value counts as missing, since neither source distinguishes
+the two; a body key that is present but empty satisfies `required`.
 
 ## Advanced Usage
 
@@ -177,11 +181,13 @@ type User struct {
 
 ### Configuration Options
 
+`BindWithOptions` is `Bind` with per-call configuration. The zero `BindOptions`
+behaves exactly as `Bind` does.
+
 ```go
 opts := binder.BindOptions{
-    SkipUnknownFields: true,
-    DisallowExtraFields: false,
-    ErrorOnRequired: true,
+    MaxBodySize:           1 << 20, // 1 MB for this call only
+    DisallowUnknownFields: true,    // reject body keys nothing binds
 }
 
 if err := binder.BindWithOptions(r, &req, opts); err != nil {
@@ -189,17 +195,63 @@ if err := binder.BindWithOptions(r, &req, opts); err != nil {
 }
 ```
 
+| Field | Default | Effect |
+|-------|---------|--------|
+| `MaxBodySize` | `0` | Overrides the package-level `binder.MaxBodySize` for this call. Zero leaves the package setting in force; a negative value removes the limit for this call alone. |
+| `DisallowUnknownFields` | `false` | Fails with `ErrUnknownField` when the body carries a top-level key that no field of the target binds. Keys nested inside objects are not inspected. |
+
+### Request Size Limits
+
+Bodies are capped at `binder.MaxBodySize`, which defaults to 10 MB, so a single
+request cannot exhaust server memory. Set it during program initialisation to
+change the default for every call:
+
+```go
+binder.MaxBodySize = 2 << 20 // 2 MB
+```
+
+Set it to zero or less to remove the limit entirely. An oversized body is
+rejected with `ErrBodyTooLarge` rather than truncated.
+
 ## Error Handling
 
-Errors from binding are of type `*binder.BindError`, which provides detailed information about what went wrong:
+Failures that concern a single field are of type `*binder.BindError`, which
+names the field and the input it came from:
 
 ```go
 if err := binder.Bind(r, &req); err != nil {
-    if bindErr, ok := err.(*binder.BindError); ok {
-        fmt.Printf("Error binding field '%s': %s\n", bindErr.Field, bindErr.Message)
+    var bindErr *binder.BindError
+    if errors.As(err, &bindErr) {
+        fmt.Printf("field %s from %s %q: %v\n",
+            bindErr.Field, bindErr.Source, bindErr.Name, bindErr)
     }
     http.Error(w, err.Error(), http.StatusBadRequest)
     return
+}
+```
+
+Failures that concern the request as a whole are reported with sentinel errors,
+so a handler can choose the right status code:
+
+| Error | Meaning | Suggested status |
+|-------|---------|------------------|
+| `ErrMalformedBody` | The body could not be parsed as its `Content-Type` declares | 400 Bad Request |
+| `ErrMissingRequired` | A field tagged `required` had no value; wrapped by a `BindError` | 400 Bad Request |
+| `ErrUnknownField` | The body carried a key nothing binds, with `DisallowUnknownFields` set | 400 Bad Request |
+| `ErrBodyTooLarge` | The body exceeded `MaxBodySize` | 413 Content Too Large |
+| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct | 500 Internal Server Error |
+
+`ErrInvalidTarget` reports a programming error rather than a bad request, so it
+is the one case that should not be blamed on the client:
+
+```go
+switch {
+case errors.Is(err, binder.ErrInvalidTarget):
+    http.Error(w, "server error", http.StatusInternalServerError)
+case errors.Is(err, binder.ErrBodyTooLarge):
+    http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+case err != nil:
+    http.Error(w, err.Error(), http.StatusBadRequest)
 }
 ```
 
@@ -236,10 +288,11 @@ if err := binder.Bind(r, &req); err != nil {
 
 This library has been designed with production use in mind:
 
-- **Thread-safe** - Concurrent requests handled safely with mutex-protected caching
-- **No panics** - All errors returned gracefully
+- **No panics** - An unusable target or an unsettable field is reported, not fatal
+- **Bounded reads** - Request bodies are capped, so one request cannot exhaust memory
+- **Errors are never swallowed** - A body that fails to parse is reported, not ignored
 - **Request body preservation** - Middleware-friendly, allows multiple reads
-- **Predictable behavior** - No global state, no surprises
+- **Configurable per call** - `BindWithOptions` avoids reaching for package-level settings
 - **Well-tested** - Comprehensive test suite including edge cases
 
 ## When to Use Binder

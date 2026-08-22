@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,6 +170,69 @@ var ErrMalformedBody = errors.New("malformed request body")
 // should answer http.StatusInternalServerError rather than blaming the client.
 var ErrInvalidTarget = errors.New("invalid bind target")
 
+// ErrMissingRequired is returned by Bind when a field tagged with the
+// "required" option had no value in its source. It is wrapped by a BindError
+// naming the field, so errors.As gives the detail and errors.Is gives the
+// category.
+var ErrMissingRequired = errors.New("missing required value")
+
+// ErrUnknownField is returned by BindWithOptions when DisallowUnknownFields is
+// set and the request body carries a key that no field of the target binds.
+var ErrUnknownField = errors.New("unknown field in request body")
+
+// BindError describes a failure to bind one field of the target struct. It
+// carries the field alongside the source it was read from, so a handler can
+// report which input was at fault rather than only that something failed:
+//
+//	var bindErr *binder.BindError
+//	if errors.As(err, &bindErr) {
+//	    fmt.Printf("field %s from %s %q: %v\n",
+//	        bindErr.Field, bindErr.Source, bindErr.Name, bindErr)
+//	}
+type BindError struct {
+	Field   string // name of the Go struct field
+	Source  string // tag source the value was read from, such as "query"
+	Name    string // key looked up in that source
+	Message string // complete description of what went wrong
+	Err     error  // underlying cause, reachable with errors.Is and errors.As
+}
+
+func (e *BindError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "bind error"
+}
+
+// Unwrap exposes the underlying cause to errors.Is and errors.As.
+func (e *BindError) Unwrap() error { return e.Err }
+
+// BindOptions configures a single call to BindWithOptions. The zero value
+// behaves exactly as Bind does.
+type BindOptions struct {
+	// MaxBodySize overrides the package-level MaxBodySize for this call.
+	// Zero leaves the package setting in force, and a negative value removes
+	// the limit for this call alone.
+	MaxBodySize int64
+
+	// DisallowUnknownFields makes binding fail with ErrUnknownField when the
+	// request body carries a top-level key that no field of the target binds.
+	// Keys nested inside objects are not inspected.
+	DisallowUnknownFields bool
+}
+
+// maxBodySize resolves the body limit for a call, falling back to the
+// package-level setting when the option is left at its zero value.
+func (o BindOptions) maxBodySize() int64 {
+	if o.MaxBodySize == 0 {
+		return MaxBodySize
+	}
+	return o.MaxBodySize
+}
+
 // Bind maps data from an HTTP request into a struct using reflection and struct tags.
 //
 // The target must be a pointer to a struct. Bind supports multiple data sources:
@@ -209,6 +273,22 @@ var ErrInvalidTarget = errors.New("invalid bind target")
 //   - The request body cannot be parsed (see ErrMalformedBody)
 //   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i interface{}) error {
+	return BindWithOptions(r, i, BindOptions{})
+}
+
+// BindWithOptions is Bind with per-call configuration. Bind is equivalent to
+// passing the zero BindOptions.
+//
+// Example:
+//
+//	opts := binder.BindOptions{
+//	    MaxBodySize:           1 << 20,
+//	    DisallowUnknownFields: true,
+//	}
+//	if err := binder.BindWithOptions(r, &req, opts); err != nil {
+//	    // Handle binding error
+//	}
+func BindWithOptions(r *http.Request, i interface{}, opts BindOptions) error {
 	if r == nil {
 		return fmt.Errorf("%w: cannot bind from a nil request", ErrInvalidTarget)
 	}
@@ -219,9 +299,15 @@ func Bind(r *http.Request, i interface{}) error {
 	}
 
 	// Parse request body once
-	bodyData, err := parseRequestBody(r)
+	bodyData, err := parseRequestBody(r, opts.maxBodySize())
 	if err != nil {
 		return err
+	}
+
+	if opts.DisallowUnknownFields {
+		if err := checkUnknownFields(typ, bodyData); err != nil {
+			return err
+		}
 	}
 
 	// Process each field in the struct
@@ -265,19 +351,28 @@ func targetStruct(i interface{}) (reflect.Type, reflect.Value, error) {
 }
 
 // parseRequestBody reads and parses the request body, restoring it for other readers
-func parseRequestBody(r *http.Request) (map[string]interface{}, error) {
-	if r.Body == nil || r.ContentLength <= 0 {
+func parseRequestBody(r *http.Request, maxBodySize int64) (map[string]interface{}, error) {
+	// Content-Length is not consulted here: a chunked request declares no
+	// length at all, so skipping on a non-positive Content-Length would drop
+	// its body entirely. Whether a body is empty is decided after reading.
+	if r.Body == nil || r.Body == http.NoBody {
 		return make(map[string]interface{}), nil
 	}
 
 	// Read the body once, refusing anything oversized
-	bodyBytes, err := readBody(r)
+	bodyBytes, err := readBody(r, maxBodySize)
 	if err != nil {
 		return nil, err
 	}
 
 	// Restore the body for other potential readers
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// An absent body is not a malformed one, so an empty read is reported as
+	// no data rather than handed to a parser that would reject it.
+	if len(bodyBytes) == 0 {
+		return make(map[string]interface{}), nil
+	}
 
 	// Create a copy of the request with the new body for parsing
 	rCopy := *r
@@ -294,8 +389,7 @@ func parseRequestBody(r *http.Request) (map[string]interface{}, error) {
 // Content-Length, which the client controls and may understate. An oversized
 // body is reported as an error rather than truncated, so that a request is
 // never bound from a partial body.
-func readBody(r *http.Request) ([]byte, error) {
-	limit := MaxBodySize
+func readBody(r *http.Request, limit int64) ([]byte, error) {
 	if limit <= 0 {
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -320,6 +414,37 @@ func readBody(r *http.Request) ([]byte, error) {
 	}
 
 	return bodyBytes, nil
+}
+
+// checkUnknownFields reports body keys that no field of the target binds.
+// Only top-level keys are considered, since nested values are bound by the
+// nested struct rather than by a tag on this one.
+func checkUnknownFields(typ reflect.Type, bodyData map[string]interface{}) error {
+	if len(bodyData) == 0 {
+		return nil
+	}
+
+	known := make(map[string]struct{}, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		source, name, _, ok := fieldTag(typ.Field(i))
+		if ok && (source == body || source == jjson) {
+			known[name] = struct{}{}
+		}
+	}
+
+	var unknown []string
+	for name := range bodyData {
+		if _, found := known[name]; !found {
+			unknown = append(unknown, strconv.Quote(name))
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+
+	// Sorted so the error does not vary with map iteration order.
+	slices.Sort(unknown)
+	return fmt.Errorf("%w: %s", ErrUnknownField, strings.Join(unknown, ", "))
 }
 
 // bindStructFields processes each field in the struct and binds data from the request
@@ -355,7 +480,7 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 		}
 
 		// Set the field value
-		if err := bindFieldValue(fieldVal, value, field.Name); err != nil {
+		if err := bindFieldValue(fieldVal, value, field); err != nil {
 			return err
 		}
 	}
@@ -402,7 +527,13 @@ func checkRequired(field reflect.StructField) error {
 	if !ok || !hasOption(opts, optRequired) {
 		return nil
 	}
-	return fmt.Errorf("missing required field %s: no %s value named %q", field.Name, source, name)
+	return &BindError{
+		Field:   field.Name,
+		Source:  source,
+		Name:    name,
+		Message: fmt.Sprintf("missing required field %s: no %s value named %q", field.Name, source, name),
+		Err:     ErrMissingRequired,
+	}
 }
 
 // shouldOmitField determines if a field should be skipped based on omitempty
@@ -413,7 +544,8 @@ func shouldOmitField(field reflect.StructField, value interface{}) bool {
 }
 
 // bindFieldValue sets the value on a struct field, handling nested structs and pointers
-func bindFieldValue(fieldVal reflect.Value, value interface{}, fieldName string) error {
+func bindFieldValue(fieldVal reflect.Value, value interface{}, field reflect.StructField) error {
+	fieldName := field.Name
 	if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
 		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
 	}
@@ -422,16 +554,29 @@ func bindFieldValue(fieldVal reflect.Value, value interface{}, fieldName string)
 	if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Elem().Kind() == reflect.Struct) {
 		if nestedMap, ok := value.(map[string]interface{}); ok {
 			if err := BindStruct(fieldVal, nestedMap); err != nil {
-				return fmt.Errorf("error binding nested field %s: %w", fieldName, err)
+				return newBindError(field, fmt.Sprintf("error binding nested field %s: %v", fieldName, err), err)
 			}
 			return nil
 		}
 	}
 
 	if err := setField(fieldVal, value); err != nil {
-		return fmt.Errorf("error setting field %s: %w", fieldName, err)
+		return newBindError(field, fmt.Sprintf("error setting field %s: %v", fieldName, err), err)
 	}
 	return nil
+}
+
+// newBindError builds a BindError carrying the field's binding source, so that
+// a caller can report which input was at fault.
+func newBindError(field reflect.StructField, message string, err error) *BindError {
+	source, name, _, _ := fieldTag(field)
+	return &BindError{
+		Field:   field.Name,
+		Source:  source,
+		Name:    name,
+		Message: message,
+		Err:     err,
+	}
 }
 
 // getFieldInfo returns cached field information for a struct type
