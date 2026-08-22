@@ -41,6 +41,43 @@ const (
 	cookie = "cookie"
 )
 
+// Tag option constants
+const (
+	optOmitEmpty = "omitempty"
+	optRequired  = "required"
+)
+
+// bindSources lists the tag sources in precedence order. The first source
+// present on a field is the one it binds from.
+var bindSources = [...]string{path, query, body, jjson, cookie}
+
+// fieldTag returns the active binding tag for a struct field: the source it
+// binds from, the name to look up in that source, and the options that follow
+// the name. ok is false when the field carries no binding tag.
+func fieldTag(field reflect.StructField) (source, name, opts string, ok bool) {
+	for _, src := range bindSources {
+		if tag := field.Tag.Get(src); tag != "" {
+			name, opts = splitTag(tag)
+			return src, name, opts, true
+		}
+	}
+	return "", "", "", false
+}
+
+// hasOption reports whether a comma-separated tag option list contains opt.
+// It compares whole options, so a name such as "omit" combined with a
+// neighbouring "empty" is never mistaken for "omitempty".
+func hasOption(opts, opt string) bool {
+	for opts != "" {
+		var cur string
+		cur, opts = splitTag(opts)
+		if cur == opt {
+			return true
+		}
+	}
+	return false
+}
+
 // splitTag separates a struct tag value into the source name and its
 // comma-separated options. Tags are written as `source:"name,opt,..."`, so the
 // name is everything before the first comma and the options are what follows:
@@ -102,7 +139,8 @@ type Validator interface {
 //
 // Tag modifiers:
 //
-//   - omitempty - Skip binding if the value is empty
+//   - omitempty - Skip binding if the value is present but empty
+//   - required  - Return an error if the value is missing from its source
 //
 // Example:
 //
@@ -190,8 +228,17 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 			return err
 		}
 
-		// Skip if value doesn't exist or should be omitted
-		if !exists || shouldOmitField(field, value) {
+		// A missing value is an error when the field is tagged required,
+		// and is otherwise simply left at its zero value.
+		if !exists {
+			if err := checkRequired(field); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Skip if the value should be omitted
+		if shouldOmitField(field, value) {
 			continue
 		}
 
@@ -205,36 +252,25 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 
 // extractFieldValue gets the value for a field from the appropriate request source
 func extractFieldValue(r *http.Request, field reflect.StructField, bodyData map[string]interface{}) (interface{}, bool, error) {
-	tag := field.Tag
-	pathTag := tag.Get(path)
-	queryTag := tag.Get(query)
-	bodyTag := tag.Get(body)
-	jsonTag := tag.Get(jjson)
-	cookieTag := tag.Get(cookie)
+	source, name, _, ok := fieldTag(field)
+	if !ok {
+		return nil, false, nil
+	}
 
-	switch {
-	case pathTag != "":
-		name, _ := splitTag(pathTag)
+	switch source {
+	case path:
 		v := r.PathValue(name)
 		return v, v != "", nil
 
-	case queryTag != "":
-		name, _ := splitTag(queryTag)
+	case query:
 		v := r.URL.Query().Get(name)
 		return v, v != "", nil
 
-	case bodyTag != "":
-		name, _ := splitTag(bodyTag)
+	case body, jjson:
 		v, exists := bodyData[name]
 		return v, exists, nil
 
-	case jsonTag != "":
-		name, _ := splitTag(jsonTag)
-		v, exists := bodyData[name]
-		return v, exists, nil
-
-	case cookieTag != "":
-		name, _ := splitTag(cookieTag)
+	case cookie:
 		c, err := r.Cookie(name)
 		if err == nil {
 			return c.Value, true, nil
@@ -244,6 +280,17 @@ func extractFieldValue(r *http.Request, field reflect.StructField, bodyData map[
 	default:
 		return nil, false, nil
 	}
+}
+
+// checkRequired reports an error when a field tagged with the "required"
+// option had no value in its source. For path and query parameters an empty
+// value counts as missing, since neither source distinguishes the two.
+func checkRequired(field reflect.StructField) error {
+	source, name, opts, ok := fieldTag(field)
+	if !ok || !hasOption(opts, optRequired) {
+		return nil
+	}
+	return fmt.Errorf("missing required field %s: no %s value named %q", field.Name, source, name)
 }
 
 // shouldOmitField determines if a field should be skipped based on omitempty
