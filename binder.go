@@ -92,17 +92,20 @@ func splitTag(tag string) (name, opts string) {
 	return tag, ""
 }
 
-// fieldInfo stores cached reflection data for struct fields
+// fieldInfo is one struct field's binding tag, resolved once per type. Holding
+// the parsed name and options here keeps tag parsing off the per-request path.
 type fieldInfo struct {
-	Index     int
-	FieldType reflect.StructField
-	Source    string // "path", "query", "body", "json", "cookie"
-	TagName   string
+	Index     int                 // position of the field within the struct
+	FieldType reflect.StructField // retained for error reporting
+	Source    string              // "path", "query", "body", "json", "cookie"
+	TagName   string              // key to look up in Source, without options
 	OmitEmpty bool
+	Required  bool
 }
 
-// Cache for struct field information to improve performance
-var fieldCache = make(map[reflect.Type]map[string]fieldInfo)
+// Cache of resolved binding tags, in field order. It is keyed by type and so
+// is bounded by the number of struct types a program binds into.
+var fieldCache = make(map[reflect.Type][]fieldInfo)
 var fieldCacheMutex sync.RWMutex
 
 // Validator is an optional interface that structs can implement to provide
@@ -425,10 +428,9 @@ func checkUnknownFields(typ reflect.Type, bodyData map[string]interface{}) error
 	}
 
 	known := make(map[string]struct{}, typ.NumField())
-	for i := 0; i < typ.NumField(); i++ {
-		source, name, _, ok := fieldTag(typ.Field(i))
-		if ok && (source == body || source == jjson) {
-			known[name] = struct{}{}
+	for _, fi := range getFieldInfo(typ) {
+		if fi.Source == body || fi.Source == jjson {
+			known[fi.TagName] = struct{}{}
 		}
 	}
 
@@ -447,20 +449,12 @@ func checkUnknownFields(typ reflect.Type, bodyData map[string]interface{}) error
 	return fmt.Errorf("%w: %s", ErrUnknownField, strings.Join(unknown, ", "))
 }
 
-// bindStructFields processes each field in the struct and binds data from the request
+// bindStructFields processes each bindable field in the struct and binds data
+// from the request.
 func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, bodyData map[string]interface{}) error {
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		fieldVal := val.Field(i)
-
-		// Unexported fields cannot be set through reflection, so they are
-		// ignored even when tagged, as encoding/json does.
-		if !fieldVal.CanSet() {
-			continue
-		}
-
+	for _, fi := range getFieldInfo(typ) {
 		// Extract value from appropriate source
-		value, exists, err := extractFieldValue(r, field, bodyData)
+		value, exists, err := extractFieldValue(r, fi, bodyData)
 		if err != nil {
 			return err
 		}
@@ -468,19 +462,19 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 		// A missing value is an error when the field is tagged required,
 		// and is otherwise simply left at its zero value.
 		if !exists {
-			if err := checkRequired(field); err != nil {
-				return err
+			if fi.Required {
+				return missingRequiredError(fi)
 			}
 			continue
 		}
 
 		// Skip if the value should be omitted
-		if shouldOmitField(field, value) {
+		if fi.OmitEmpty && isEmptyValue(value) {
 			continue
 		}
 
 		// Set the field value
-		if err := bindFieldValue(fieldVal, value, field); err != nil {
+		if err := bindFieldValue(val.Field(fi.Index), value, fi); err != nil {
 			return err
 		}
 	}
@@ -488,27 +482,22 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 }
 
 // extractFieldValue gets the value for a field from the appropriate request source
-func extractFieldValue(r *http.Request, field reflect.StructField, bodyData map[string]interface{}) (interface{}, bool, error) {
-	source, name, _, ok := fieldTag(field)
-	if !ok {
-		return nil, false, nil
-	}
-
-	switch source {
+func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]interface{}) (interface{}, bool, error) {
+	switch fi.Source {
 	case path:
-		v := r.PathValue(name)
+		v := r.PathValue(fi.TagName)
 		return v, v != "", nil
 
 	case query:
-		v := r.URL.Query().Get(name)
+		v := r.URL.Query().Get(fi.TagName)
 		return v, v != "", nil
 
 	case body, jjson:
-		v, exists := bodyData[name]
+		v, exists := bodyData[fi.TagName]
 		return v, exists, nil
 
 	case cookie:
-		c, err := r.Cookie(name)
+		c, err := r.Cookie(fi.TagName)
 		if err == nil {
 			return c.Value, true, nil
 		}
@@ -519,39 +508,22 @@ func extractFieldValue(r *http.Request, field reflect.StructField, bodyData map[
 	}
 }
 
-// checkRequired reports an error when a field tagged with the "required"
-// option had no value in its source. For path and query parameters an empty
-// value counts as missing, since neither source distinguishes the two.
-func checkRequired(field reflect.StructField) error {
-	source, name, opts, ok := fieldTag(field)
-	if !ok || !hasOption(opts, optRequired) {
-		return nil
-	}
+// missingRequiredError reports a field tagged with the "required" option that
+// had no value in its source. For path and query parameters an empty value
+// counts as missing, since neither source distinguishes the two.
+func missingRequiredError(fi fieldInfo) error {
 	return &BindError{
-		Field:   field.Name,
-		Source:  source,
-		Name:    name,
-		Message: fmt.Sprintf("missing required field %s: no %s value named %q", field.Name, source, name),
+		Field:   fi.FieldType.Name,
+		Source:  fi.Source,
+		Name:    fi.TagName,
+		Message: fmt.Sprintf("missing required field %s: no %s value named %q", fi.FieldType.Name, fi.Source, fi.TagName),
 		Err:     ErrMissingRequired,
 	}
 }
 
-// shouldOmitField determines if a field should be skipped based on omitempty.
-// Only the options of the tag the field actually binds from are consulted, and
-// they are matched whole: concatenating every tag and searching for a
-// substring found "omitempty" spanning a pair such as `path:"omit"` and
-// `query:"empty"`, and in a parameter that was merely named "omitempty".
-func shouldOmitField(field reflect.StructField, value interface{}) bool {
-	_, _, opts, ok := fieldTag(field)
-	if !ok {
-		return false
-	}
-	return hasOption(opts, optOmitEmpty) && isEmptyValue(value)
-}
-
 // bindFieldValue sets the value on a struct field, handling nested structs and pointers
-func bindFieldValue(fieldVal reflect.Value, value interface{}, field reflect.StructField) error {
-	fieldName := field.Name
+func bindFieldValue(fieldVal reflect.Value, value interface{}, fi fieldInfo) error {
+	fieldName := fi.FieldType.Name
 	if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
 		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
 	}
@@ -560,33 +532,34 @@ func bindFieldValue(fieldVal reflect.Value, value interface{}, field reflect.Str
 	if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Elem().Kind() == reflect.Struct) {
 		if nestedMap, ok := value.(map[string]interface{}); ok {
 			if err := BindStruct(fieldVal, nestedMap); err != nil {
-				return newBindError(field, fmt.Sprintf("error binding nested field %s: %v", fieldName, err), err)
+				return newBindError(fi, fmt.Sprintf("error binding nested field %s: %v", fieldName, err), err)
 			}
 			return nil
 		}
 	}
 
 	if err := setField(fieldVal, value); err != nil {
-		return newBindError(field, fmt.Sprintf("error setting field %s: %v", fieldName, err), err)
+		return newBindError(fi, fmt.Sprintf("error setting field %s: %v", fieldName, err), err)
 	}
 	return nil
 }
 
 // newBindError builds a BindError carrying the field's binding source, so that
 // a caller can report which input was at fault.
-func newBindError(field reflect.StructField, message string, err error) *BindError {
-	source, name, _, _ := fieldTag(field)
+func newBindError(fi fieldInfo, message string, err error) *BindError {
 	return &BindError{
-		Field:   field.Name,
-		Source:  source,
-		Name:    name,
+		Field:   fi.FieldType.Name,
+		Source:  fi.Source,
+		Name:    fi.TagName,
 		Message: message,
 		Err:     err,
 	}
 }
 
-// getFieldInfo returns cached field information for a struct type
-func getFieldInfo(typ reflect.Type) map[string]fieldInfo {
+// getFieldInfo returns the binding tags of a struct type, resolving them on
+// first use and reusing them afterwards. Only settable, tagged fields appear,
+// so callers need not re-check either condition.
+func getFieldInfo(typ reflect.Type) []fieldInfo {
 	fieldCacheMutex.RLock()
 	info, found := fieldCache[typ]
 	fieldCacheMutex.RUnlock()
@@ -595,7 +568,6 @@ func getFieldInfo(typ reflect.Type) map[string]fieldInfo {
 		return info
 	}
 
-	// Build field info
 	fieldCacheMutex.Lock()
 	defer fieldCacheMutex.Unlock()
 
@@ -604,54 +576,29 @@ func getFieldInfo(typ reflect.Type) map[string]fieldInfo {
 		return info
 	}
 
-	info = make(map[string]fieldInfo)
+	info = make([]fieldInfo, 0, typ.NumField())
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
-		fi := fieldInfo{
+
+		// Unexported fields cannot be set through reflection, so they are
+		// ignored even when tagged, as encoding/json does.
+		if !field.IsExported() {
+			continue
+		}
+
+		source, name, opts, ok := fieldTag(field)
+		if !ok {
+			continue
+		}
+
+		info = append(info, fieldInfo{
 			Index:     i,
 			FieldType: field,
-		}
-
-		// Check each tag type
-		if tag := field.Tag.Get(path); tag != "" {
-			fi.Source = path
-			fi.TagName = tag
-			fi.OmitEmpty = strings.Contains(tag, "omitempty")
-			info[field.Name] = fi
-			continue
-		}
-
-		if tag := field.Tag.Get(query); tag != "" {
-			fi.Source = query
-			fi.TagName = tag
-			fi.OmitEmpty = strings.Contains(tag, "omitempty")
-			info[field.Name] = fi
-			continue
-		}
-
-		if tag := field.Tag.Get(body); tag != "" {
-			fi.Source = body
-			fi.TagName = tag
-			fi.OmitEmpty = strings.Contains(tag, "omitempty")
-			info[field.Name] = fi
-			continue
-		}
-
-		if tag := field.Tag.Get(jjson); tag != "" {
-			fi.Source = jjson
-			fi.TagName = tag
-			fi.OmitEmpty = strings.Contains(tag, "omitempty")
-			info[field.Name] = fi
-			continue
-		}
-
-		if tag := field.Tag.Get(cookie); tag != "" {
-			fi.Source = cookie
-			fi.TagName = tag
-			fi.OmitEmpty = strings.Contains(tag, "omitempty")
-			info[field.Name] = fi
-			continue
-		}
+			Source:    source,
+			TagName:   name,
+			OmitEmpty: hasOption(opts, optOmitEmpty),
+			Required:  hasOption(opts, optRequired),
+		})
 	}
 
 	fieldCache[typ] = info

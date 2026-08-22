@@ -665,64 +665,70 @@ func TestBindArrayNotSupported(t *testing.T) {
 
 func TestFieldCache(t *testing.T) {
 	type cachedStruct struct {
-		ID   int    `path:"id"`
-		Name string `query:"name"`
+		ID       int    `path:"id"`
+		Name     string `query:"name,omitempty"`
+		Email    string `body:"email,required"`
+		Untagged string
+		hidden   string `body:"hidden"`
 	}
+	typ := reflect.TypeOf(cachedStruct{})
 
 	// Clear the cache before the test
 	fieldCacheMutex.Lock()
-	delete(fieldCache, reflect.TypeOf(cachedStruct{}))
+	delete(fieldCache, typ)
 	fieldCacheMutex.Unlock()
 
-	// First access - should build cache
-	info1 := getFieldInfo(reflect.TypeOf(cachedStruct{}))
-	if len(info1) != 2 {
-		t.Errorf("Expected 2 field info entries, got %d", len(info1))
+	// First access builds the cache, second must reuse it
+	info1 := getFieldInfo(typ)
+	info2 := getFieldInfo(typ)
+
+	// Only settable, tagged fields are cached: Untagged has no tag and
+	// hidden cannot be set through reflection.
+	if len(info1) != 3 {
+		t.Fatalf("Expected 3 field info entries, got %d", len(info1))
 	}
-
-	// Second access - should use cache
-	info2 := getFieldInfo(reflect.TypeOf(cachedStruct{}))
-
-	// Check equality of the two maps
 	if len(info1) != len(info2) {
 		t.Errorf("Expected info1 and info2 to have the same length")
 	}
+	// The second call must hand back the cached slice rather than rebuild it.
+	if &info1[0] != &info2[0] {
+		t.Error("Second call rebuilt the field info instead of reusing the cache")
+	}
 
-	// Manual deep equality check
-	for k, v1 := range info1 {
-		v2, exists := info2[k]
-		if !exists {
-			t.Errorf("Key %s exists in info1 but not in info2", k)
+	// Tags are resolved, not stored raw: the name excludes its options and
+	// the options are recorded separately.
+	want := []fieldInfo{
+		{Index: 0, Source: path, TagName: "id"},
+		{Index: 1, Source: query, TagName: "name", OmitEmpty: true},
+		{Index: 2, Source: body, TagName: "email", Required: true},
+	}
+	for i, w := range want {
+		got := info1[i]
+		if got.Index != w.Index || got.Source != w.Source || got.TagName != w.TagName ||
+			got.OmitEmpty != w.OmitEmpty || got.Required != w.Required {
+			t.Errorf("Entry %d = %+v, want Index=%d Source=%s TagName=%q OmitEmpty=%v Required=%v",
+				i, got, w.Index, w.Source, w.TagName, w.OmitEmpty, w.Required)
 		}
+	}
 
-		if v1.Index != v2.Index || v1.Source != v2.Source || v1.TagName != v2.TagName || v1.OmitEmpty != v2.OmitEmpty {
-			t.Errorf("Values for key %s differ between info1 and info2", k)
+	// Entries must be ordered by field index so binding order is stable
+	for i := 1; i < len(info1); i++ {
+		if info1[i].Index <= info1[i-1].Index {
+			t.Errorf("Entries are not in field order: %+v", info1)
+			break
 		}
 	}
 
 	// Check the cache directly
 	fieldCacheMutex.RLock()
-	cachedInfo, exists := fieldCache[reflect.TypeOf(cachedStruct{})]
+	cachedInfo, exists := fieldCache[typ]
 	fieldCacheMutex.RUnlock()
 
 	if !exists {
 		t.Errorf("Type should exist in cache")
 	}
-
-	// Check if cached info equals the returned info
-	if len(info1) != len(cachedInfo) {
+	if len(cachedInfo) != len(info1) {
 		t.Errorf("Expected cachedInfo to have the same length as info1")
-	}
-
-	for k, v1 := range info1 {
-		v2, exists := cachedInfo[k]
-		if !exists {
-			t.Errorf("Key %s exists in info1 but not in cachedInfo", k)
-		}
-
-		if v1.Index != v2.Index || v1.Source != v2.Source || v1.TagName != v2.TagName || v1.OmitEmpty != v2.OmitEmpty {
-			t.Errorf("Values for key %s differ between info1 and cachedInfo", k)
-		}
 	}
 }
 
@@ -813,7 +819,7 @@ func BenchmarkBindWithoutCache(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Clear cache for each iteration
 		fieldCacheMutex.Lock()
-		fieldCache = make(map[reflect.Type]map[string]fieldInfo)
+		fieldCache = make(map[reflect.Type][]fieldInfo)
 		fieldCacheMutex.Unlock()
 
 		var p params
