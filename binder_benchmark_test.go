@@ -223,3 +223,45 @@ func BenchmarkBindParallel(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkBindManyQueryParams binds several query parameters at once, which
+// is where reparsing the query string per field cost the most.
+type ManyQueryStruct struct {
+	A string `query:"a"`
+	B string `query:"b"`
+	C string `query:"c"`
+	D string `query:"d"`
+	E string `query:"e"`
+	F string `query:"f"`
+	G string `query:"g"`
+	H string `query:"h"`
+}
+
+func BenchmarkBindManyQueryParams(b *testing.B) {
+	r := httptest.NewRequest("GET", "/search?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var s ManyQueryStruct
+		if err := Bind(r, &s); err != nil {
+			b.Fatalf("Failed to bind query params: %v", err)
+		}
+	}
+}
+
+// BenchmarkBindNoQueryParams confirms a target that binds from no query
+// parameter does not pay to parse the query string.
+func BenchmarkBindNoQueryParams(b *testing.B) {
+	r := httptest.NewRequest("GET", "/search?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var s CookieOnlyStruct
+		if err := Bind(r, &s); err != nil {
+			b.Fatalf("Failed to bind cookie: %v", err)
+		}
+	}
+}

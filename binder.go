@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -449,12 +450,31 @@ func checkUnknownFields(typ reflect.Type, bodyData map[string]interface{}) error
 	return fmt.Errorf("%w: %s", ErrUnknownField, strings.Join(unknown, ", "))
 }
 
+// queryCache parses a request's query string on first use and reuses it for
+// the rest of the call. net/url reparses on every call to URL.Query, so a
+// struct with several query tags would otherwise parse the whole string once
+// per field. Parsing is deferred so that a target binding from no query
+// parameter at all does not pay for it.
+type queryCache struct {
+	url    *url.URL
+	values url.Values
+}
+
+func (q *queryCache) get(name string) string {
+	if q.values == nil {
+		q.values = q.url.Query()
+	}
+	return q.values.Get(name)
+}
+
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request.
 func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, bodyData map[string]interface{}) error {
+	queries := queryCache{url: r.URL}
+
 	for _, fi := range getFieldInfo(typ) {
 		// Extract value from appropriate source
-		value, exists, err := extractFieldValue(r, fi, bodyData)
+		value, exists, err := extractFieldValue(r, fi, bodyData, &queries)
 		if err != nil {
 			return err
 		}
@@ -482,14 +502,14 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 }
 
 // extractFieldValue gets the value for a field from the appropriate request source
-func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]interface{}) (interface{}, bool, error) {
+func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]interface{}, queries *queryCache) (interface{}, bool, error) {
 	switch fi.Source {
 	case path:
 		v := r.PathValue(fi.TagName)
 		return v, v != "", nil
 
 	case query:
-		v := r.URL.Query().Get(fi.TagName)
+		v := queries.get(fi.TagName)
 		return v, v != "", nil
 
 	case body, jjson:
