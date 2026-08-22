@@ -163,6 +163,12 @@ var ErrBodyTooLarge = errors.New("request body too large")
 // cookie values alone.
 var ErrMalformedBody = errors.New("malformed request body")
 
+// ErrInvalidTarget is returned by Bind when the destination is not a non-nil
+// pointer to a struct. Unlike ErrBodyTooLarge and ErrMalformedBody it reports
+// a programming error rather than a bad request, so a handler that sees it
+// should answer http.StatusInternalServerError rather than blaming the client.
+var ErrInvalidTarget = errors.New("invalid bind target")
+
 // Bind maps data from an HTTP request into a struct using reflection and struct tags.
 //
 // The target must be a pointer to a struct. Bind supports multiple data sources:
@@ -192,16 +198,25 @@ var ErrMalformedBody = errors.New("malformed request body")
 //	    // Handle binding error
 //	}
 //
+// Fields that reflection cannot set, meaning unexported ones, are ignored even
+// when they carry a binding tag.
+//
 // Returns an error if:
-//   - The target is not a pointer to a struct
+//   - The target is not a non-nil pointer to a struct (see ErrInvalidTarget)
 //   - Type conversion fails
 //   - Required fields are missing
 //   - The request body exceeds MaxBodySize (see ErrBodyTooLarge)
 //   - The request body cannot be parsed (see ErrMalformedBody)
 //   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i interface{}) error {
-	typ := reflect.TypeOf(i).Elem()
-	val := reflect.ValueOf(i).Elem()
+	if r == nil {
+		return fmt.Errorf("%w: cannot bind from a nil request", ErrInvalidTarget)
+	}
+
+	typ, val, err := targetStruct(i)
+	if err != nil {
+		return err
+	}
 
 	// Parse request body once
 	bodyData, err := parseRequestBody(r)
@@ -222,6 +237,31 @@ func Bind(r *http.Request, i interface{}) error {
 	}
 
 	return nil
+}
+
+// targetStruct validates the destination given to Bind and returns the struct
+// type and value to bind into. Bind's contract is a non-nil pointer to a
+// struct, and anything else is reported as ErrInvalidTarget rather than left
+// to panic inside the reflect package.
+func targetStruct(i interface{}) (reflect.Type, reflect.Value, error) {
+	if i == nil {
+		return nil, reflect.Value{}, fmt.Errorf("%w: target is nil", ErrInvalidTarget)
+	}
+
+	val := reflect.ValueOf(i)
+	if val.Kind() != reflect.Ptr {
+		return nil, reflect.Value{}, fmt.Errorf("%w: target is %s, want a pointer to a struct", ErrInvalidTarget, val.Type())
+	}
+	if val.IsNil() {
+		return nil, reflect.Value{}, fmt.Errorf("%w: target is a nil %s", ErrInvalidTarget, val.Type())
+	}
+
+	elem := val.Elem()
+	if elem.Kind() != reflect.Struct {
+		return nil, reflect.Value{}, fmt.Errorf("%w: target is %s, want a pointer to a struct", ErrInvalidTarget, val.Type())
+	}
+
+	return elem.Type(), elem, nil
 }
 
 // parseRequestBody reads and parses the request body, restoring it for other readers
@@ -287,6 +327,12 @@ func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, body
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		fieldVal := val.Field(i)
+
+		// Unexported fields cannot be set through reflection, so they are
+		// ignored even when tagged, as encoding/json does.
+		if !fieldVal.CanSet() {
+			continue
+		}
 
 		// Extract value from appropriate source
 		value, exists, err := extractFieldValue(r, field, bodyData)
