@@ -41,6 +41,19 @@ const (
 	cookie = "cookie"
 )
 
+// splitTag separates a struct tag value into the source name and its
+// comma-separated options. Tags are written as `source:"name,opt,..."`, so the
+// name is everything before the first comma and the options are what follows:
+//
+//	`body:"email,omitempty"` -> "email", "omitempty"
+//	`body:"email"`           -> "email", ""
+func splitTag(tag string) (name, opts string) {
+	if i := strings.Index(tag, ","); i != -1 {
+		return tag[:i], tag[i+1:]
+	}
+	return tag, ""
+}
+
 // fieldInfo stores cached reflection data for struct fields
 type fieldInfo struct {
 	Index     int
@@ -201,27 +214,28 @@ func extractFieldValue(r *http.Request, field reflect.StructField, bodyData map[
 
 	switch {
 	case pathTag != "":
-		v := r.PathValue(pathTag)
+		name, _ := splitTag(pathTag)
+		v := r.PathValue(name)
 		return v, v != "", nil
 
 	case queryTag != "":
-		paramName := queryTag
-		if commaIndex := strings.Index(paramName, ","); commaIndex != -1 {
-			paramName = paramName[:commaIndex]
-		}
-		v := r.URL.Query().Get(paramName)
+		name, _ := splitTag(queryTag)
+		v := r.URL.Query().Get(name)
 		return v, v != "", nil
 
 	case bodyTag != "":
-		v, exists := bodyData[bodyTag]
+		name, _ := splitTag(bodyTag)
+		v, exists := bodyData[name]
 		return v, exists, nil
 
 	case jsonTag != "":
-		v, exists := bodyData[jsonTag]
+		name, _ := splitTag(jsonTag)
+		v, exists := bodyData[name]
 		return v, exists, nil
 
 	case cookieTag != "":
-		c, err := r.Cookie(cookieTag)
+		name, _ := splitTag(cookieTag)
+		c, err := r.Cookie(name)
 		if err == nil {
 			return c.Value, true, nil
 		}
@@ -364,8 +378,9 @@ func BindStruct(field reflect.Value, data map[string]interface{}) error {
 		if tag == "" {
 			continue
 		}
+		name, _ := splitTag(tag)
 
-		nestedValue, ok := data[tag]
+		nestedValue, ok := data[name]
 		if !ok {
 			continue
 		}
@@ -684,7 +699,8 @@ func setStruct(field reflect.Value, value interface{}) error {
 			}
 
 			if tagValue != "" {
-				if nestedVal, exists := structMap[tagValue]; exists {
+				name, _ := splitTag(tagValue)
+				if nestedVal, exists := structMap[name]; exists {
 					if err := setField(nestedField, nestedVal); err != nil {
 						return fmt.Errorf("error setting nested field '%s': %w", nestedStructType.Name, err)
 					}
