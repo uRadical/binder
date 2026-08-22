@@ -149,6 +149,20 @@ var MaxBodySize = DefaultMaxBodySize
 //	}
 var ErrBodyTooLarge = errors.New("request body too large")
 
+// ErrMalformedBody is returned by Bind when the request body cannot be parsed
+// as the format its Content-Type declares. Handlers should treat it as
+// http.StatusBadRequest:
+//
+//	if errors.Is(err, binder.ErrMalformedBody) {
+//	    http.Error(w, "malformed request body", http.StatusBadRequest)
+//	    return
+//	}
+//
+// A body whose Content-Type is neither JSON nor form-encoded is not parsed at
+// all and so is never malformed; such a request binds from its path, query and
+// cookie values alone.
+var ErrMalformedBody = errors.New("malformed request body")
+
 // Bind maps data from an HTTP request into a struct using reflection and struct tags.
 //
 // The target must be a pointer to a struct. Bind supports multiple data sources:
@@ -183,6 +197,7 @@ var ErrBodyTooLarge = errors.New("request body too large")
 //   - Type conversion fails
 //   - Required fields are missing
 //   - The request body exceeds MaxBodySize (see ErrBodyTooLarge)
+//   - The request body cannot be parsed (see ErrMalformedBody)
 //   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i interface{}) error {
 	typ := reflect.TypeOf(i).Elem()
@@ -228,15 +243,10 @@ func parseRequestBody(r *http.Request) (map[string]interface{}, error) {
 	rCopy := *r
 	rCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	// Parse the body
-	bodyData, err := parseBody(rCopy)
-	if err != nil {
-		// Continue with empty body - we still want to bind other parameters
-		// The error is non-fatal as data might come from path/query/cookies
-		return make(map[string]interface{}), nil
-	}
-
-	return bodyData, nil
+	// Parse the body. A body that cannot be parsed is reported rather than
+	// discarded: binding would otherwise report success while every
+	// body-sourced field was silently left at its zero value.
+	return parseBody(rCopy)
 }
 
 // readBody reads the whole request body, refusing bodies larger than
@@ -520,7 +530,7 @@ func parseBody(r http.Request) (map[string]interface{}, error) {
 	case "application/json":
 		err := json.NewDecoder(r.Body).Decode(&reqBody)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode JSON body: %w", err)
+			return nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
 		}
 		return reqBody, nil
 
@@ -528,7 +538,7 @@ func parseBody(r http.Request) (map[string]interface{}, error) {
 		reqBody = make(map[string]interface{})
 		err := r.ParseForm()
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse form data: %w", err)
+			return nil, fmt.Errorf("%w: invalid form data: %w", ErrMalformedBody, err)
 		}
 		for k, v := range r.PostForm {
 			if len(v) == 1 {
