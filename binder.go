@@ -536,11 +536,17 @@ func checkRequired(field reflect.StructField) error {
 	}
 }
 
-// shouldOmitField determines if a field should be skipped based on omitempty
+// shouldOmitField determines if a field should be skipped based on omitempty.
+// Only the options of the tag the field actually binds from are consulted, and
+// they are matched whole: concatenating every tag and searching for a
+// substring found "omitempty" spanning a pair such as `path:"omit"` and
+// `query:"empty"`, and in a parameter that was merely named "omitempty".
 func shouldOmitField(field reflect.StructField, value interface{}) bool {
-	tag := field.Tag
-	omitEmpty := strings.Contains(tag.Get(path)+tag.Get(query)+tag.Get(body)+tag.Get(jjson)+tag.Get(cookie), "omitempty")
-	return omitEmpty && isEmptyValue(value)
+	_, _, opts, ok := fieldTag(field)
+	if !ok {
+		return false
+	}
+	return hasOption(opts, optOmitEmpty) && isEmptyValue(value)
 }
 
 // bindFieldValue sets the value on a struct field, handling nested structs and pointers
@@ -719,7 +725,12 @@ func parseBody(r http.Request) (map[string]interface{}, error) {
 
 	switch ct {
 	case "application/json":
-		err := json.NewDecoder(r.Body).Decode(&reqBody)
+		dec := json.NewDecoder(r.Body)
+		// Decode numbers as their literal text. Routing them through float64
+		// silently loses precision beyond 2^53, so an identifier such as
+		// 9007199254740993 would bind as 9007199254740992.
+		dec.UseNumber()
+		err := dec.Decode(&reqBody)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
 		}
@@ -862,6 +873,18 @@ func setInt(field reflect.Value, value interface{}) error {
 		field.SetInt(int64(v))
 	case float64:
 		field.SetInt(int64(v))
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			field.SetInt(i)
+			return nil
+		}
+		// Numbers written in a form Int64 rejects, such as 1e5 or 1.0, went
+		// through float64 before and still do.
+		f, err := v.Float64()
+		if err != nil {
+			return err
+		}
+		field.SetInt(int64(f))
 	case string:
 		i, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
@@ -897,6 +920,19 @@ func setUint(field reflect.Value, value interface{}) error {
 			return fmt.Errorf("cannot convert negative float to uint")
 		}
 		field.SetUint(uint64(v))
+	case json.Number:
+		if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+			field.SetUint(u)
+			return nil
+		}
+		f, err := v.Float64()
+		if err != nil {
+			return err
+		}
+		if f < 0 {
+			return fmt.Errorf("cannot convert negative float to uint")
+		}
+		field.SetUint(uint64(f))
 	case string:
 		i, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
@@ -924,6 +960,12 @@ func setBool(field reflect.Value, value interface{}) error {
 		field.SetBool(v != 0)
 	case float64:
 		field.SetBool(v != 0)
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return err
+		}
+		field.SetBool(f != 0)
 	default:
 		return fmt.Errorf("cannot convert %T to bool", value)
 	}
@@ -941,6 +983,12 @@ func setFloat(field reflect.Value, value interface{}) error {
 		// Use reflection to get the actual int value
 		val := reflect.ValueOf(v)
 		field.SetFloat(float64(val.Int()))
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return err
+		}
+		field.SetFloat(f)
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
@@ -1025,6 +1073,14 @@ func isEmptyValue(v interface{}) bool {
 	if v == nil {
 		return true
 	}
+
+	// A json.Number is a string underneath, so ask whether it is numerically
+	// zero rather than whether it has no characters.
+	if n, ok := v.(json.Number); ok {
+		f, err := n.Float64()
+		return err == nil && f == 0
+	}
+
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
 	case reflect.String, reflect.Array:
