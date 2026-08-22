@@ -127,6 +127,28 @@ type Validator interface {
 	Validate() error
 }
 
+// DefaultMaxBodySize is the body size limit Bind applies when MaxBodySize has
+// not been changed.
+const DefaultMaxBodySize int64 = 10 << 20 // 10 MB
+
+// MaxBodySize is the largest request body, in bytes, that Bind will read.
+// A larger body is rejected with ErrBodyTooLarge rather than buffered, so that
+// a single request cannot exhaust server memory. A value of zero or less
+// disables the limit and restores the previous unbounded behaviour.
+//
+// It is read on every call to Bind, so set it during program initialisation
+// rather than while requests are in flight.
+var MaxBodySize = DefaultMaxBodySize
+
+// ErrBodyTooLarge is returned by Bind when a request body exceeds MaxBodySize.
+// Handlers should treat it as http.StatusRequestEntityTooLarge:
+//
+//	if errors.Is(err, binder.ErrBodyTooLarge) {
+//	    http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+//	    return
+//	}
+var ErrBodyTooLarge = errors.New("request body too large")
+
 // Bind maps data from an HTTP request into a struct using reflection and struct tags.
 //
 // The target must be a pointer to a struct. Bind supports multiple data sources:
@@ -160,6 +182,7 @@ type Validator interface {
 //   - The target is not a pointer to a struct
 //   - Type conversion fails
 //   - Required fields are missing
+//   - The request body exceeds MaxBodySize (see ErrBodyTooLarge)
 //   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i interface{}) error {
 	typ := reflect.TypeOf(i).Elem()
@@ -192,10 +215,10 @@ func parseRequestBody(r *http.Request) (map[string]interface{}, error) {
 		return make(map[string]interface{}), nil
 	}
 
-	// Read the body once
-	bodyBytes, err := io.ReadAll(r.Body)
+	// Read the body once, refusing anything oversized
+	bodyBytes, err := readBody(r)
 	if err != nil {
-		return nil, fmt.Errorf("error reading request body: %w", err)
+		return nil, err
 	}
 
 	// Restore the body for other potential readers
@@ -214,6 +237,39 @@ func parseRequestBody(r *http.Request) (map[string]interface{}, error) {
 	}
 
 	return bodyData, nil
+}
+
+// readBody reads the whole request body, refusing bodies larger than
+// MaxBodySize. The limit is enforced while reading rather than trusting
+// Content-Length, which the client controls and may understate. An oversized
+// body is reported as an error rather than truncated, so that a request is
+// never bound from a partial body.
+func readBody(r *http.Request) ([]byte, error) {
+	limit := MaxBodySize
+	if limit <= 0 {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, fmt.Errorf("error reading request body: %w", err)
+		}
+		return bodyBytes, nil
+	}
+
+	// Reject an honestly declared oversized body without reading it at all.
+	if r.ContentLength > limit {
+		return nil, fmt.Errorf("%w: %d bytes declared, limit is %d", ErrBodyTooLarge, r.ContentLength, limit)
+	}
+
+	// Read one byte past the limit so an understated Content-Length is
+	// detected instead of silently truncating the body.
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("error reading request body: %w", err)
+	}
+	if int64(len(bodyBytes)) > limit {
+		return nil, fmt.Errorf("%w: limit is %d bytes", ErrBodyTooLarge, limit)
+	}
+
+	return bodyBytes, nil
 }
 
 // bindStructFields processes each field in the struct and binds data from the request
