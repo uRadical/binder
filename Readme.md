@@ -311,26 +311,26 @@ figures; it costs more memory than the binding itself.
 
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
-| BindPathOnly | 107 | 72 | 3 |
-| BindCookieOnly | 179 | 280 | 5 |
+| BindPathOnly | 105 | 72 | 3 |
+| BindCookieOnly | 181 | 280 | 5 |
 | BindNoQueryParams | 181 | 280 | 5 |
-| BindQueryOnly | 224 | 496 | 6 |
-| BindOmitEmpty | 247 | 528 | 6 |
-| BindParallel | 692 | 2,608 | 26 |
-| BindManyQueryParams | 904 | 832 | 20 |
-| BindBodyOnly/FormBody | 1,034 | 2,608 | 26 |
-| BindBodyOnly/JSONBody | 1,408 | 2,010 | 33 |
-| BindMixed/WithForm | 1,622 | 3,720 | 37 |
-| BindMixed/WithJSON | 1,836 | 2,731 | 41 |
-| Bind | 1,919 | 2,379 | 33 |
-| BindWithoutCache | 2,484 | 3,549 | 36 |
+| BindQueryOnly | 227 | 496 | 6 |
+| BindOmitEmpty | 250 | 528 | 6 |
+| BindParallel | 677 | 2,600 | 25 |
+| BindBodyOnly/JSONBody | 890 | 1,824 | 31 |
+| BindManyQueryParams | 903 | 832 | 20 |
+| BindBodyOnly/FormBody | 1,036 | 2,600 | 25 |
+| Bind | 1,250 | 2,152 | 29 |
+| BindMixed/WithJSON | 1,302 | 2,544 | 39 |
+| BindMixed/WithForm | 1,626 | 3,712 | 36 |
+| BindWithoutCache | 1,882 | 3,464 | 35 |
 
 Binding from path, query, cookie or header costs a few hundred nanoseconds and
-a handful of allocations. Binding a body costs more, because the body is
-decoded into a `map[string]interface{}` before conversion.
+a handful of allocations. A JSON body costs more, since the body must be read
+and parsed before any field can be converted.
 
-`Bind` against `BindWithoutCache` measures the per-type tag cache: 1,919 ns and
-33 allocations with it warm, against 2,484 ns and 36 allocations when it is
+`Bind` against `BindWithoutCache` measures the per-type tag cache: 1,250 ns and
+29 allocations with it warm, against 1,882 ns and 35 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`

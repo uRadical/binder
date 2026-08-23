@@ -728,7 +728,7 @@ func TestFieldCache(t *testing.T) {
 	if !exists {
 		t.Errorf("Type should exist in cache")
 	}
-	if len(cachedInfo) != len(info1) {
+	if len(cachedInfo.fields) != len(info1) {
 		t.Errorf("Expected cachedInfo to have the same length as info1")
 	}
 }
@@ -820,7 +820,7 @@ func BenchmarkBindWithoutCache(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Clear cache for each iteration
 		fieldCacheMutex.Lock()
-		fieldCache = make(map[reflect.Type][]fieldInfo)
+		fieldCache = make(map[reflect.Type]*typeInfo)
 		fieldCacheMutex.Unlock()
 
 		var p params

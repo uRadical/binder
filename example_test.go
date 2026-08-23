@@ -193,13 +193,17 @@ func ExampleBind_errorHandling() {
 	var req CreateUser
 	err := binder.Bind(r, &req)
 
+	// Match on the sentinels rather than on message text, which is not part
+	// of the compatibility promise.
 	switch {
 	case errors.Is(err, binder.ErrInvalidTarget):
 		fmt.Println(http.StatusInternalServerError)
 	case errors.Is(err, binder.ErrBodyTooLarge):
 		fmt.Println(http.StatusRequestEntityTooLarge)
+	case errors.Is(err, binder.ErrMalformedBody):
+		fmt.Println(http.StatusBadRequest, "malformed body")
 	case err != nil:
 		fmt.Println(http.StatusBadRequest, err)
 	}
-	// Output: 400 malformed request body: invalid JSON: invalid character 'N' looking for beginning of value
+	// Output: 400 malformed body
 }

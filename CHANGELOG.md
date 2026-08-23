@@ -65,9 +65,17 @@ point of most of it. Read **Upgrading** before taking it.
 - `MaxBodySize` and `DefaultMaxBodySize`.
 - Multi-value binding from query parameters, headers and form fields into
   slice fields.
+- A fallback JSON decoder for toolchains built with `GOEXPERIMENT=nojsonv2`,
+  where `encoding/json/jsontext` is unavailable. Both produce the same values;
+  only their error message text differs, which is not part of the contract.
 
 ### Fixed
 
+- A tagged unexported field inside a nested struct panicked on assignment.
+  Top-level fields were already skipped; nested ones were not, because the two
+  nested binders each had their own copy of the loop and neither checked.
+- `BindStruct` panicked when given something other than a struct. It now
+  reports `ErrInvalidTarget`.
 - Tag options broke the lookup key on every source except query, so
   `path:"id,omitempty"`, `body:"email,omitempty"`, `json:`, `cookie:` and the
   same tags on nested struct fields never bound.
@@ -107,6 +115,10 @@ point of most of it. Read **Upgrading** before taking it.
   unchanged.
 - The query string is parsed once per call rather than once per field. Binding
   eight query parameters is 74% faster and allocates 20 times rather than 90.
+- A JSON body is read by walking tokens rather than unmarshalling into a map,
+  and members no field binds are skipped rather than decoded. Binding a JSON
+  body is 24% to 37% faster and allocates less. Requests without a JSON body
+  are unaffected.
 
 ### Security
 

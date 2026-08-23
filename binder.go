@@ -111,9 +111,17 @@ type fieldInfo struct {
 // every field of every request.
 var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 
-// Cache of resolved binding tags, in field order. It is keyed by type and so
-// is bounded by the number of struct types a program binds into.
-var fieldCache = make(map[reflect.Type][]fieldInfo)
+// typeInfo is everything binding needs to know about a struct type, resolved
+// once. The body key set lives here rather than being rebuilt per request,
+// which would allocate on every call including those with no body at all.
+type typeInfo struct {
+	fields   []fieldInfo
+	bodyKeys map[string]struct{}
+}
+
+// Cache of resolved type information. It is keyed by type and so is bounded by
+// the number of struct types a program binds into.
+var fieldCache = make(map[reflect.Type]*typeInfo)
 var fieldCacheMutex sync.RWMutex
 
 // Validator is an optional interface that structs can implement to provide
@@ -311,20 +319,32 @@ func BindWithOptions(r *http.Request, i interface{}, opts BindOptions) error {
 		return err
 	}
 
+	// Resolve the type once: binding, the body key set and the unknown-field
+	// check all draw on it, and each lookup takes the cache lock.
+	info := typeInfoFor(typ)
+
+	// Decoding only the body members some field binds is faster, but the
+	// unknown-field check needs to see the ones nothing binds, so that option
+	// decodes everything.
+	var wanted map[string]struct{}
+	if !opts.DisallowUnknownFields {
+		wanted = info.bodyKeys
+	}
+
 	// Parse request body once
-	bodyData, err := parseRequestBody(r, opts.maxBodySize())
+	bodyData, err := parseRequestBody(r, opts.maxBodySize(), wanted)
 	if err != nil {
 		return err
 	}
 
 	if opts.DisallowUnknownFields {
-		if err := checkUnknownFields(typ, bodyData); err != nil {
+		if err := checkUnknownFields(info, bodyData); err != nil {
 			return err
 		}
 	}
 
 	// Process each field in the struct
-	if err := bindStructFields(r, typ, val, bodyData); err != nil {
+	if err := bindStructFields(r, info, val, bodyData); err != nil {
 		return err
 	}
 
@@ -364,7 +384,7 @@ func targetStruct(i interface{}) (reflect.Type, reflect.Value, error) {
 }
 
 // parseRequestBody reads and parses the request body, restoring it for other readers
-func parseRequestBody(r *http.Request, maxBodySize int64) (map[string]interface{}, error) {
+func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}) (map[string]interface{}, error) {
 	// Content-Length is not consulted here: a chunked request declares no
 	// length at all, so skipping on a non-positive Content-Length would drop
 	// its body entirely. Whether a body is empty is decided after reading.
@@ -394,7 +414,7 @@ func parseRequestBody(r *http.Request, maxBodySize int64) (map[string]interface{
 	// Parse the body. A body that cannot be parsed is reported rather than
 	// discarded: binding would otherwise report success while every
 	// body-sourced field was silently left at its zero value.
-	return parseBody(rCopy)
+	return parseBody(rCopy, bodyBytes, wanted)
 }
 
 // readBody reads the whole request body, refusing bodies larger than
@@ -432,17 +452,12 @@ func readBody(r *http.Request, limit int64) ([]byte, error) {
 // checkUnknownFields reports body keys that no field of the target binds.
 // Only top-level keys are considered, since nested values are bound by the
 // nested struct rather than by a tag on this one.
-func checkUnknownFields(typ reflect.Type, bodyData map[string]interface{}) error {
+func checkUnknownFields(info *typeInfo, bodyData map[string]interface{}) error {
 	if len(bodyData) == 0 {
 		return nil
 	}
 
-	known := make(map[string]struct{}, typ.NumField())
-	for _, fi := range getFieldInfo(typ) {
-		if fi.Source == body || fi.Source == jjson {
-			known[fi.TagName] = struct{}{}
-		}
-	}
+	known := info.bodyKeys
 
 	var unknown []string
 	for name := range bodyData {
@@ -483,10 +498,10 @@ func (q *queryCache) all(name string) []string { return q.ensure()[name] }
 
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request.
-func bindStructFields(r *http.Request, typ reflect.Type, val reflect.Value, bodyData map[string]interface{}) error {
+func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyData map[string]interface{}) error {
 	queries := queryCache{url: r.URL}
 
-	for _, fi := range getFieldInfo(typ) {
+	for _, fi := range info.fields {
 		// Extract value from appropriate source
 		value, exists, err := extractFieldValue(r, fi, bodyData, &queries)
 		if err != nil {
@@ -598,24 +613,31 @@ func newBindError(fi fieldInfo, message string, err error) *BindError {
 // getFieldInfo returns the binding tags of a struct type, resolving them on
 // first use and reusing them afterwards. Only settable, tagged fields appear,
 // so callers need not re-check either condition.
-func getFieldInfo(typ reflect.Type) []fieldInfo {
+func getFieldInfo(typ reflect.Type) []fieldInfo { return typeInfoFor(typ).fields }
+
+// bodyKeys returns the top-level body member names the target binds from.
+func bodyKeys(typ reflect.Type) map[string]struct{} { return typeInfoFor(typ).bodyKeys }
+
+// typeInfoFor resolves a struct type's binding tags on first use and reuses
+// them afterwards.
+func typeInfoFor(typ reflect.Type) *typeInfo {
 	fieldCacheMutex.RLock()
-	info, found := fieldCache[typ]
+	cached, found := fieldCache[typ]
 	fieldCacheMutex.RUnlock()
 
 	if found {
-		return info
+		return cached
 	}
 
 	fieldCacheMutex.Lock()
 	defer fieldCacheMutex.Unlock()
 
 	// Check again in case another goroutine built it while we were waiting
-	if info, found = fieldCache[typ]; found {
-		return info
+	if cached, found = fieldCache[typ]; found {
+		return cached
 	}
 
-	info = make([]fieldInfo, 0, typ.NumField())
+	info := make([]fieldInfo, 0, typ.NumField())
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 
@@ -647,8 +669,16 @@ func getFieldInfo(typ reflect.Type) []fieldInfo {
 		})
 	}
 
-	fieldCache[typ] = info
-	return info
+	keys := make(map[string]struct{})
+	for _, fi := range info {
+		if fi.Source == body || fi.Source == jjson {
+			keys[fi.TagName] = struct{}{}
+		}
+	}
+
+	cached = &typeInfo{fields: info, bodyKeys: keys}
+	fieldCache[typ] = cached
+	return cached
 }
 
 // BindStruct recursively binds data from a map to a struct field, handling nested structures.
@@ -738,18 +768,13 @@ func isJSONContentType(ct string) bool {
 }
 
 // parseBody extracts and parses the request body into a map
-func parseBody(r http.Request) (map[string]interface{}, error) {
+func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (map[string]interface{}, error) {
 	var reqBody map[string]interface{}
 	ct := parseContentType(r.Header.Get("Content-Type"))
 
 	switch {
 	case isJSONContentType(ct):
-		dec := json.NewDecoder(r.Body)
-		// Decode numbers as their literal text. Routing them through float64
-		// silently loses precision beyond 2^53, so an identifier such as
-		// 9007199254740993 would bind as 9007199254740992.
-		dec.UseNumber()
-		err := dec.Decode(&reqBody)
+		reqBody, err := decodeJSONObject(bodyBytes, wanted)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
 		}

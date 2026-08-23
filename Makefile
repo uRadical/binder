@@ -7,9 +7,9 @@
 COVERAGE   := coverage.out
 CRAP_FLAGS := --exclude 'example/.*\.go' --threshold 30
 
-.PHONY: all test cover crap crap-baseline bench vet fmt lint check fuzz mutants clean
+.PHONY: all test test-nojsonv2 cover crap crap-baseline bench vet fmt lint check fuzz mutants clean
 
-all: fmt vet check test
+all: fmt vet check test test-nojsonv2
 
 # Static analysis and vulnerability scanning, as CI runs them.
 check:
@@ -25,6 +25,12 @@ fuzz:
 
 test:
 	go test -race ./...
+
+# The JSON body decoder has a fallback for toolchains built without the
+# jsonv2 experiment, where encoding/json/jsontext does not exist.
+test-nojsonv2:
+	GOEXPERIMENT=nojsonv2 go build ./...
+	GOEXPERIMENT=nojsonv2 go test ./...
 
 # Produce the coverage profile the CRAP scan reads. Running it here means the
 # scan does not have to run the suite a second time.
