@@ -41,6 +41,7 @@ const (
 	body   = "body"
 	jjson  = "json"
 	cookie = "cookie"
+	header = "header"
 )
 
 // Tag option constants
@@ -50,8 +51,9 @@ const (
 )
 
 // bindSources lists the tag sources in precedence order. The first source
-// present on a field is the one it binds from.
-var bindSources = [...]string{path, query, body, jjson, cookie}
+// present on a field is the one it binds from. Header is last so that adding
+// it did not change which tag an existing field binds from.
+var bindSources = [...]string{path, query, body, jjson, cookie, header}
 
 // fieldTag returns the active binding tag for a struct field: the source it
 // binds from, the name to look up in that source, and the options that follow
@@ -102,7 +104,12 @@ type fieldInfo struct {
 	TagName   string              // key to look up in Source, without options
 	OmitEmpty bool
 	Required  bool
+	IsSlice   bool // destination is a slice, so repeated values all bind
 }
+
+// textUnmarshalerType is resolved once: tryTextUnmarshaler consults it for
+// every field of every request.
+var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 
 // Cache of resolved binding tags, in field order. It is keyed by type and so
 // is bounded by the number of struct types a program binds into.
@@ -246,6 +253,7 @@ func (o BindOptions) maxBodySize() int64 {
 //   - body:"name"   - Request body (JSON or form-encoded based on Content-Type)
 //   - json:"name"   - Alternative to body tag for JSON data
 //   - cookie:"name" - HTTP cookies
+//   - header:"name" - HTTP request headers, matched case-insensitively
 //
 // Tag modifiers:
 //
@@ -259,6 +267,7 @@ func (o BindOptions) maxBodySize() int64 {
 //	    Name     string `body:"name"`
 //	    Email    string `body:"email,omitempty"`
 //	    APIToken string `cookie:"api_token"`
+//	    TraceID  string `header:"X-Request-ID"`
 //	}
 //
 //	var req UpdateUserRequest
@@ -457,15 +466,20 @@ func checkUnknownFields(typ reflect.Type, bodyData map[string]interface{}) error
 // parameter at all does not pay for it.
 type queryCache struct {
 	url    *url.URL
-	values url.Values
+	parsed url.Values
 }
 
-func (q *queryCache) get(name string) string {
-	if q.values == nil {
-		q.values = q.url.Query()
+func (q *queryCache) ensure() url.Values {
+	if q.parsed == nil {
+		q.parsed = q.url.Query()
 	}
-	return q.values.Get(name)
+	return q.parsed
 }
+
+func (q *queryCache) get(name string) string { return q.ensure().Get(name) }
+
+// all returns every value given for a parameter, for binding into a slice.
+func (q *queryCache) all(name string) []string { return q.ensure()[name] }
 
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request.
@@ -509,6 +523,10 @@ func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]interf
 		return v, v != "", nil
 
 	case query:
+		if fi.IsSlice {
+			vs := queries.all(fi.TagName)
+			return vs, len(vs) > 0, nil
+		}
 		v := queries.get(fi.TagName)
 		return v, v != "", nil
 
@@ -522,6 +540,17 @@ func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]interf
 			return c.Value, true, nil
 		}
 		return nil, false, nil
+
+	case header:
+		// Header.Get and Header.Values canonicalise the name, so
+		// `header:"x-request-id"` and `header:"X-Request-ID"` name the same
+		// header.
+		if fi.IsSlice {
+			vs := r.Header.Values(fi.TagName)
+			return vs, len(vs) > 0, nil
+		}
+		v := r.Header.Get(fi.TagName)
+		return v, v != "", nil
 
 	default:
 		return nil, false, nil
@@ -611,6 +640,12 @@ func getFieldInfo(typ reflect.Type) []fieldInfo {
 			continue
 		}
 
+		// A pointer to a slice takes many values just as a slice does.
+		fieldType := field.Type
+		if fieldType.Kind() == reflect.Ptr {
+			fieldType = fieldType.Elem()
+		}
+
 		info = append(info, fieldInfo{
 			Index:     i,
 			FieldType: field,
@@ -618,6 +653,7 @@ func getFieldInfo(typ reflect.Type) []fieldInfo {
 			TagName:   name,
 			OmitEmpty: hasOption(opts, optOmitEmpty),
 			Required:  hasOption(opts, optRequired),
+			IsSlice:   fieldType.Kind() == reflect.Slice,
 		})
 	}
 
@@ -685,13 +721,26 @@ func parseContentType(header string) string {
 	return ""
 }
 
+// isJSONContentType reports whether a media type carries JSON. Besides
+// application/json it accepts the structured syntax suffix of RFC 6839, so
+// application/vnd.api+json, application/hal+json and application/problem+json
+// are recognised, as is the non-standard but common text/json. A body left
+// unrecognised is not parsed at all, and so binds nothing without saying so.
+func isJSONContentType(ct string) bool {
+	_, subtype, found := strings.Cut(ct, "/")
+	if !found {
+		return false
+	}
+	return subtype == jjson || strings.HasSuffix(subtype, "+"+jjson)
+}
+
 // parseBody extracts and parses the request body into a map
 func parseBody(r http.Request) (map[string]interface{}, error) {
 	var reqBody map[string]interface{}
 	ct := parseContentType(r.Header.Get("Content-Type"))
 
-	switch ct {
-	case "application/json":
+	switch {
+	case isJSONContentType(ct):
 		dec := json.NewDecoder(r.Body)
 		// Decode numbers as their literal text. Routing them through float64
 		// silently loses precision beyond 2^53, so an identifier such as
@@ -703,7 +752,7 @@ func parseBody(r http.Request) (map[string]interface{}, error) {
 		}
 		return reqBody, nil
 
-	case "application/x-www-form-urlencoded":
+	case ct == "application/x-www-form-urlencoded":
 		reqBody = make(map[string]interface{})
 		err := r.ParseForm()
 		if err != nil {
@@ -742,23 +791,46 @@ func setField(field reflect.Value, value interface{}) error {
 // tryTextUnmarshaler attempts to use TextUnmarshaler interface if implemented
 // Returns (handled, error) where handled indicates if TextUnmarshaler was used
 func tryTextUnmarshaler(field reflect.Value, value interface{}) (bool, error) {
-	if field.Type().Implements(reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()) {
-		strVal, ok := value.(string)
+	if field.Type().Implements(textUnmarshalerType) {
+		// A nil pointer has nothing to unmarshal into, and UnmarshalText
+		// would dereference it. Give it a value first, as the kind-based
+		// paths further down do for pointers they handle themselves.
+		if field.Kind() == reflect.Ptr && field.IsNil() {
+			if !field.CanSet() {
+				return false, nil
+			}
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+
+		strVal, ok := unmarshalText(value)
 		if !ok {
 			return true, errors.New("value is not a string for TextUnmarshaler")
 		}
-		return true, field.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(strVal))
+		return true, field.Interface().(encoding.TextUnmarshaler).UnmarshalText(strVal)
 	}
 
-	if field.CanAddr() && reflect.PointerTo(field.Type()).Implements(reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()) {
-		strVal, ok := value.(string)
+	if field.CanAddr() && reflect.PointerTo(field.Type()).Implements(textUnmarshalerType) {
+		strVal, ok := unmarshalText(value)
 		if !ok {
 			return true, errors.New("value is not a string for TextUnmarshaler")
 		}
-		return true, field.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(strVal))
+		return true, field.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(strVal)
 	}
 
 	return false, nil // No TextUnmarshaler interface found
+}
+
+// unmarshalText returns the bytes to hand a TextUnmarshaler, for the value
+// kinds a request body can produce.
+func unmarshalText(value interface{}) ([]byte, bool) {
+	switch v := value.(type) {
+	case string:
+		return []byte(v), true
+	case []byte:
+		return v, true
+	default:
+		return nil, false
+	}
 }
 
 // setFieldByKind sets the field value based on its reflect.Kind
@@ -970,6 +1042,16 @@ func setFloat(field reflect.Value, value interface{}) error {
 
 // setSlice sets a slice value to a field
 func setSlice(field reflect.Value, value interface{}) error {
+	// Repeated form fields, query parameters and headers arrive as []string.
+	// Widening them here lets one loop below cover every multi-valued source.
+	if strs, ok := value.([]string); ok {
+		elems := make([]interface{}, len(strs))
+		for i, sv := range strs {
+			elems[i] = sv
+		}
+		value = elems
+	}
+
 	if v, ok := value.([]interface{}); ok {
 		// Create a new slice with the same type as the field
 		s := reflect.MakeSlice(field.Type(), len(v), len(v))
@@ -1020,6 +1102,9 @@ func setStruct(field reflect.Value, value interface{}) error {
 			if tagValue != "" {
 				name, _ := splitTag(tagValue)
 				if nestedVal, exists := structMap[name]; exists {
+					if nestedField.Kind() == reflect.Ptr && nestedField.IsNil() {
+						nestedField.Set(reflect.New(nestedField.Type().Elem()))
+					}
 					if err := setField(nestedField, nestedVal); err != nil {
 						return fmt.Errorf("error setting nested field '%s': %w", nestedStructType.Name, err)
 					}

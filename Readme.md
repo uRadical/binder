@@ -41,6 +41,7 @@ err := binder.Bind(r, &req)
   - JSON request body
   - Form-encoded request body
   - Cookies
+  - Request headers
 - Support for primitive types, custom types, slices, and nested structs (arrays not supported - use slices)
 - Type conversion and validation
 - Support for required fields and omitempty behavior
@@ -98,11 +99,49 @@ The library supports binding from multiple sources:
 - `cookie:"name"` - Binds from HTTP cookies
 - `body:"name"` - Binds from request body (form data `x-www-form-urlencoded` or JSON)
 - `json:"name"` - Backwards compatibility with existing types
+- `header:"name"` - Binds from request headers, matched case-insensitively
+
+When a field carries more than one of these, the first in the order above wins:
+`path`, `query`, `body`, `json`, `cookie`, `header`.
+
+### Headers
+
+Header names are case-insensitive, so the tag may spell one however it likes:
+
+```go
+type Request struct {
+    Auth    string `header:"Authorization"`
+    TraceID string `header:"x-request-id"`
+}
+```
+
+### Repeated Values
+
+A query parameter, header or form field given more than once binds every value
+when the destination is a slice, and its first value otherwise:
+
+```go
+type Request struct {
+    Tags   []string `query:"tags"`   // ?tags=a&tags=b -> ["a", "b"]
+    Sort   string   `query:"sort"`   // ?sort=a&sort=b -> "a"
+    Accept []string `header:"Accept"`
+}
+```
+
+A single value still binds as a one-element slice. Values are never split on
+commas: `?tags=a,b` is one value, `"a,b"`.
 
 ### Body vs JSON Tags
 
 The `body:` tag is the primary tag for binding request body data and automatically handles both JSON and form-encoded 
 data based on the request's Content-Type header.
+
+JSON is recognised by media type, including the RFC 6839 suffix form, so
+`application/json`, `text/json`, `application/vnd.api+json`,
+`application/hal+json` and `application/problem+json` are all parsed as JSON.
+A body whose Content-Type is neither JSON nor `application/x-www-form-urlencoded`
+is not parsed, and the request binds from its path, query, cookie and header
+values alone.
 
 The `json:` tag serves as:
 - An alternative to `body:` when working specifically with JSON data
@@ -353,7 +392,7 @@ This comparison is based on actual analysis of each library's source code:
 | **Scope** | HTTP→struct binding only | Part of web framework | Part of web framework | Form values only |
 | **External Dependencies** | None | None* | validator/v10 | None |
 | **Lines of Code** | ~600 | ~500 | ~400 + validator | ~1,400 |
-| **Data Sources** | Path, Query, Body, Cookie | Path, Query, Body, Header | Path, Query, Body, Header | Query, Form only |
+| **Data Sources** | Path, Query, Body, Cookie, Header | Path, Query, Body, Header | Path, Query, Body, Header | Query, Form only |
 | **Content Types** | JSON, Form | JSON, XML, Form, Multipart | JSON, XML, YAML, TOML, Protobuf, MsgPack | Form only |
 | **Built-in Validation** | Interface only | No | Yes (via validator) | No |
 | **Go 1.22 PathValue** | Yes | No | No | N/A |

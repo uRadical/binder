@@ -112,13 +112,13 @@ func TestQueryAlongsideOtherSources(t *testing.T) {
 // A target with no query tag must not pay to parse the query string.
 func TestQueryNotParsedWhenUnused(t *testing.T) {
 	q := queryCache{url: httptest.NewRequest("GET", "/s?a=1", nil).URL}
-	if q.values != nil {
+	if q.parsed != nil {
 		t.Fatal("query parsed before any field asked for it")
 	}
 	if got := q.get("a"); got != "1" {
 		t.Errorf("get(a) = %q, want %q", got, "1")
 	}
-	if q.values == nil {
+	if q.parsed == nil {
 		t.Error("query not retained after first use")
 	}
 }
