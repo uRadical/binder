@@ -9,63 +9,9 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	"fmt"
+	"reflect"
+	"strconv"
 )
-
-// decodeJSONObject reads a JSON object into the representation binding works
-// with. It walks tokens rather than unmarshalling into a map, which lets it
-// skip the value of any top-level member no field binds, and keeps numbers as
-// their literal text so that precision beyond 2^53 survives.
-//
-// A nil wanted set decodes every member, which is what the unknown-field check
-// needs in order to see the members nothing binds.
-func decodeJSONObject(data []byte, wanted map[string]struct{}) (map[string]interface{}, error) {
-	// Duplicate names are accepted, and the last wins, as encoding/json does.
-	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true))
-
-	tok, err := dec.ReadToken()
-	if err != nil {
-		return nil, err
-	}
-	switch tok.Kind() {
-	case 'n':
-		// A literal null body carries no members, and is not an error.
-		return make(map[string]interface{}), nil
-	case '{':
-	default:
-		return nil, fmt.Errorf("cannot unmarshal %s into map[string]interface {}", jsonKindName(tok.Kind()))
-	}
-
-	out := make(map[string]interface{})
-	for dec.PeekKind() == '"' {
-		nameTok, err := dec.ReadToken()
-		if err != nil {
-			return nil, err
-		}
-		// A Token is voided by the next call on the decoder, so the name has
-		// to be taken before the value is read.
-		name := nameTok.String()
-
-		if wanted != nil {
-			if _, ok := wanted[name]; !ok {
-				if err := dec.SkipValue(); err != nil {
-					return nil, err
-				}
-				continue
-			}
-		}
-
-		value, err := decodeJSONValue(dec)
-		if err != nil {
-			return nil, err
-		}
-		out[name] = value
-	}
-
-	if _, err := dec.ReadToken(); err != nil { // the closing brace
-		return nil, err
-	}
-	return out, nil
-}
 
 // decodeJSONValue reads one value, producing the types the set* helpers
 // expect: string, bool, json.Number, []interface{}, map[string]interface{}
@@ -164,4 +110,185 @@ func jsonKindName(k jsontext.Kind) string {
 	default:
 		return "value"
 	}
+}
+
+// bindJSONBody fills a struct's body-sourced fields straight from the request
+// body, without first decoding it into a map.
+//
+// Going through map[string]interface{} costs an allocation per member for the
+// interface value, plus the map itself, before any conversion happens. Walking
+// the tokens once and writing into the destination as each member is reached
+// avoids both, and lets a member no field binds be skipped without decoding it
+// at all.
+//
+// It reports which fields were filled, so the caller can apply required to the
+// ones that were not, and the names of members nothing binds.
+func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool) (bodyData map[string]interface{}, bound []bool, unknown []string, err error) {
+	_ = wanted // the walk consults info.bodyFields directly
+	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true))
+
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	switch tok.Kind() {
+	case 'n':
+		return nil, nil, nil, nil // a null body carries no members
+	case '{':
+	default:
+		return nil, nil, nil, fmt.Errorf("cannot unmarshal %s into map[string]interface {}", jsonKindName(tok.Kind()))
+	}
+
+	bound = make([]bool, len(info.fields))
+	for dec.PeekKind() == '"' {
+		nameTok, err := dec.ReadToken()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		// A Token is voided by the next call on the decoder.
+		name := nameTok.String()
+
+		index, isBound := info.bodyFields[name]
+		if !isBound {
+			if wantUnknown {
+				unknown = append(unknown, name)
+			}
+			if err := dec.SkipValue(); err != nil {
+				return nil, nil, nil, err
+			}
+			continue
+		}
+
+		fi := info.fields[index]
+		if err := decodeJSONInto(dec, val.Field(fi.Index), fi); err != nil {
+			return nil, nil, nil, err
+		}
+		bound[index] = true
+	}
+
+	if _, err := dec.ReadToken(); err != nil { // the closing brace
+		return nil, nil, nil, err
+	}
+	return nil, bound, unknown, nil
+}
+
+// decodeJSONInto writes one JSON value into a struct field. Where the field is
+// a predeclared type and the token already matches it, the value is set
+// directly; everything else falls back to decoding a value and converting it,
+// so coercions such as a JSON string into an integer keep working.
+func decodeJSONInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) error {
+	kind := dec.PeekKind()
+
+	switch fi.Fast {
+	case fastString:
+		if kind == '"' {
+			tok, err := dec.ReadToken()
+			if err != nil {
+				return err
+			}
+			text := tok.String()
+			if fi.OmitEmpty && text == "" {
+				return nil
+			}
+			field.SetString(text)
+			return nil
+		}
+
+	case fastBool:
+		if kind == 't' || kind == 'f' {
+			tok, err := dec.ReadToken()
+			if err != nil {
+				return err
+			}
+			value := tok.Bool()
+			if fi.OmitEmpty && !value {
+				return nil
+			}
+			field.SetBool(value)
+			return nil
+		}
+
+	case fastInt, fastUint, fastFloat:
+		if kind == '0' {
+			return decodeNumberInto(dec, field, fi)
+		}
+	}
+
+	// The token does not match the destination, or the destination is not a
+	// predeclared type: decode the value and convert it as the other sources
+	// do, so coercions such as a JSON string into an integer keep working.
+	value, err := decodeJSONValue(dec)
+	if err != nil {
+		return err
+	}
+	if value == nil {
+		return nil
+	}
+	if fi.OmitEmpty && isEmptyValue(value) {
+		return nil
+	}
+	return conversionError(fi, setField(field, value))
+}
+
+// decodeNumberInto writes a numeric token into a predeclared numeric field.
+// A literal an exact parse rejects, such as 1e3 for an integer, is handed to
+// the general conversion, which accepts it as earlier releases did.
+func decodeNumberInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) error {
+	raw, err := dec.ReadValue()
+	if err != nil {
+		return err
+	}
+
+	switch fi.Fast {
+	case fastInt:
+		number, err := strconv.ParseInt(string(raw), 10, 64)
+		if err != nil {
+			return setFieldFromNumber(field, raw, fi)
+		}
+		if fi.OmitEmpty && number == 0 {
+			return nil
+		}
+		return conversionError(fi, setIntChecked(field, number))
+
+	case fastUint:
+		number, err := strconv.ParseUint(string(raw), 10, 64)
+		if err != nil {
+			return setFieldFromNumber(field, raw, fi)
+		}
+		if fi.OmitEmpty && number == 0 {
+			return nil
+		}
+		return conversionError(fi, setUintChecked(field, number))
+
+	default: // fastFloat
+		number, err := strconv.ParseFloat(string(raw), 64)
+		if err != nil {
+			return setFieldFromNumber(field, raw, fi)
+		}
+		if fi.OmitEmpty && number == 0 {
+			return nil
+		}
+		return conversionError(fi, setFloatChecked(field, number))
+	}
+}
+
+// setFieldFromNumber converts a number whose literal an exact parse rejected,
+// such as 1e3 into an integer field.
+func setFieldFromNumber(field reflect.Value, raw jsontext.Value, fi fieldInfo) error {
+	number := json.Number(raw.String())
+	if fi.OmitEmpty && isEmptyValue(number) {
+		return nil
+	}
+	return conversionError(fi, setField(field, number))
+}
+
+// conversionError marks a failure to convert a decoded value as concerning one
+// field, so that it is reported as a BindError naming it rather than as a
+// malformed body. A syntax error from the decoder is a different thing and
+// stays as it is.
+func conversionError(fi fieldInfo, err error) error {
+	if err == nil {
+		return nil
+	}
+	return newBindError(fi, fmt.Sprintf("error setting field %s: %v", fi.FieldType.Name, err), err)
 }

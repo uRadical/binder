@@ -106,7 +106,49 @@ type fieldInfo struct {
 	TagName   string              // key to look up in Source, without options
 	OmitEmpty bool
 	Required  bool
-	IsSlice   bool // destination is a slice, so repeated values all bind
+	IsSlice   bool     // destination is a slice, so repeated values all bind
+	Fast      fastKind // set straight from a JSON token, skipping conversion
+}
+
+// fastKind names the destinations a JSON token can fill without going through
+// an interface value. Anything else, including a type with its own
+// TextUnmarshaler, takes the general path.
+type fastKind uint8
+
+const (
+	fastNone fastKind = iota
+	fastString
+	fastInt
+	fastUint
+	fastFloat
+	fastBool
+)
+
+// fastKindOf reports how a field can be filled from a JSON token. Only
+// predeclared types qualify: a named type may define UnmarshalText, and a
+// conversion must be given the chance to run.
+func fastKindOf(t reflect.Type) fastKind {
+	if t.PkgPath() != "" {
+		return fastNone // a named type, which may unmarshal itself
+	}
+	if t.Implements(textUnmarshalerType) || reflect.PointerTo(t).Implements(textUnmarshalerType) {
+		return fastNone
+	}
+
+	switch t.Kind() {
+	case reflect.String:
+		return fastString
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return fastInt
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return fastUint
+	case reflect.Float32, reflect.Float64:
+		return fastFloat
+	case reflect.Bool:
+		return fastBool
+	default:
+		return fastNone
+	}
 }
 
 // textUnmarshalerType is resolved once: tryTextUnmarshaler consults it for
@@ -119,6 +161,9 @@ var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(
 type typeInfo struct {
 	fields   []fieldInfo
 	bodyKeys map[string]struct{}
+	// bodyFields indexes fields by the body member they bind, so a token walk
+	// can find the destination without a second pass.
+	bodyFields map[string]int
 }
 
 // Cache of resolved type information. It is keyed by type and so is bounded by
@@ -334,19 +379,19 @@ func BindWithOptions(r *http.Request, i interface{}, opts BindOptions) error {
 	}
 
 	// Parse request body once
-	bodyData, err := parseRequestBody(r, opts.maxBodySize(), wanted)
+	bodyData, bound, err := parseRequestBody(r, opts.maxBodySize(), wanted, info, val, opts.DisallowUnknownFields)
 	if err != nil {
 		return err
 	}
 
-	if opts.DisallowUnknownFields {
+	if opts.DisallowUnknownFields && bodyData != nil {
 		if err := checkUnknownFields(info, bodyData); err != nil {
 			return err
 		}
 	}
 
 	// Process each field in the struct
-	if err := bindStructFields(r, info, val, bodyData); err != nil {
+	if err := bindStructFields(r, info, val, bodyData, bound); err != nil {
 		return err
 	}
 
@@ -386,18 +431,23 @@ func targetStruct(i interface{}) (reflect.Type, reflect.Value, error) {
 }
 
 // parseRequestBody reads and parses the request body, restoring it for other readers
-func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}) (map[string]interface{}, error) {
+// parseRequestBody reads and parses the request body.
+//
+// A JSON body is bound straight into the target where the build allows it,
+// which returns a nil map and the set of fields it filled. Every other format
+// returns the map that binding reads from, and a nil set.
+func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}, info *typeInfo, val reflect.Value, wantUnknown bool) (map[string]interface{}, []bool, error) {
 	// Content-Length is not consulted here: a chunked request declares no
 	// length at all, so skipping on a non-positive Content-Length would drop
 	// its body entirely. Whether a body is empty is decided after reading.
 	if r.Body == nil || r.Body == http.NoBody {
-		return make(map[string]interface{}), nil
+		return make(map[string]interface{}), nil, nil
 	}
 
 	// Read the body once, refusing anything oversized
 	bodyBytes, err := readBody(r, maxBodySize)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Restore the body for other potential readers
@@ -406,7 +456,27 @@ func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]stru
 	// An absent body is not a malformed one, so an empty read is reported as
 	// no data rather than handed to a parser that would reject it.
 	if len(bodyBytes) == 0 {
-		return make(map[string]interface{}), nil
+		return make(map[string]interface{}), nil, nil
+	}
+
+	// A JSON body is handled before the other formats: where the build allows
+	// it, members go straight into their fields rather than through a map.
+	if isJSONContentType(parseContentType(r.Header.Get("Content-Type"))) {
+		bodyData, bound, unknown, err := jsonBodyInto(bodyBytes, info, val, wanted, wantUnknown)
+		if err != nil {
+			// A failure to convert one member concerns that field; only a
+			// failure to read the body concerns the body.
+			var bindErr *BindError
+			if errors.As(err, &bindErr) {
+				return nil, nil, err
+			}
+			return nil, nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
+		}
+		if wantUnknown && len(unknown) > 0 {
+			slices.Sort(unknown)
+			return nil, nil, fmt.Errorf("%w: %s", ErrUnknownField, quoteAll(unknown))
+		}
+		return bodyData, bound, nil
 	}
 
 	// Create a copy of the request with the new body for parsing
@@ -416,7 +486,8 @@ func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]stru
 	// Parse the body. A body that cannot be parsed is reported rather than
 	// discarded: binding would otherwise report success while every
 	// body-sourced field was silently left at its zero value.
-	return parseBody(rCopy, bodyBytes, wanted)
+	bodyData, err := parseBody(rCopy, bodyBytes, wanted)
+	return bodyData, nil, err
 }
 
 // readBody reads the whole request body, refusing bodies larger than
@@ -476,6 +547,15 @@ func checkUnknownFields(info *typeInfo, bodyData map[string]interface{}) error {
 	return fmt.Errorf("%w: %s", ErrUnknownField, strings.Join(unknown, ", "))
 }
 
+// quoteAll renders member names for an error message.
+func quoteAll(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = strconv.Quote(name)
+	}
+	return strings.Join(quoted, ", ")
+}
+
 // queryCache parses a request's query string on first use and reuses it for
 // the rest of the call. net/url reparses on every call to URL.Query, so a
 // struct with several query tags would otherwise parse the whole string once
@@ -500,10 +580,15 @@ func (q *queryCache) all(name string) []string { return q.ensure()[name] }
 
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request.
-func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyData map[string]interface{}) error {
+func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyData map[string]interface{}, bound []bool) error {
 	queries := queryCache{url: r.URL}
 
-	for _, fi := range info.fields {
+	for index, fi := range info.fields {
+		// A body field the JSON walk already filled needs nothing further.
+		if bound != nil && bound[index] {
+			continue
+		}
+
 		// Extract value from appropriate source
 		value, exists, err := extractFieldValue(r, fi, bodyData, &queries)
 		if err != nil {
@@ -617,9 +702,6 @@ func newBindError(fi fieldInfo, message string, err error) *BindError {
 // so callers need not re-check either condition.
 func getFieldInfo(typ reflect.Type) []fieldInfo { return typeInfoFor(typ).fields }
 
-// bodyKeys returns the top-level body member names the target binds from.
-func bodyKeys(typ reflect.Type) map[string]struct{} { return typeInfoFor(typ).bodyKeys }
-
 // typeInfoFor resolves a struct type's binding tags on first use and reuses
 // them afterwards.
 func typeInfoFor(typ reflect.Type) *typeInfo {
@@ -668,17 +750,20 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 			OmitEmpty: hasOption(opts, optOmitEmpty),
 			Required:  hasOption(opts, optRequired),
 			IsSlice:   fieldType.Kind() == reflect.Slice,
+			Fast:      fastKindOf(field.Type),
 		})
 	}
 
 	keys := make(map[string]struct{})
-	for _, fi := range info {
+	fields := make(map[string]int)
+	for i, fi := range info {
 		if fi.Source == body || fi.Source == jjson {
 			keys[fi.TagName] = struct{}{}
+			fields[fi.TagName] = i
 		}
 	}
 
-	cached = &typeInfo{fields: info, bodyKeys: keys}
+	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields}
 	fieldCache[typ] = cached
 	return cached
 }
@@ -775,13 +860,6 @@ func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (ma
 	ct := parseContentType(r.Header.Get("Content-Type"))
 
 	switch {
-	case isJSONContentType(ct):
-		reqBody, err := decodeJSONObject(bodyBytes, wanted)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
-		}
-		return reqBody, nil
-
 	case ct == "multipart/form-data":
 		reqBody, err := parseMultipartBody(r.Header.Get("Content-Type"), bodyBytes)
 		if err != nil {
@@ -1021,27 +1099,55 @@ func toString(value interface{}) (string, error) {
 	}
 }
 
+// setIntChecked writes an integer, refusing one the field cannot hold.
+// reflect truncates silently, so 9999 into an int8 would otherwise bind as 15.
+func setIntChecked(field reflect.Value, n int64) error {
+	if field.OverflowInt(n) {
+		return fmt.Errorf("%d overflows %s", n, field.Type())
+	}
+	field.SetInt(n)
+	return nil
+}
+
+// setUintChecked writes an unsigned integer, refusing one the field cannot
+// hold.
+func setUintChecked(field reflect.Value, n uint64) error {
+	if field.OverflowUint(n) {
+		return fmt.Errorf("%d overflows %s", n, field.Type())
+	}
+	field.SetUint(n)
+	return nil
+}
+
+// setFloatChecked writes a float, refusing one the field cannot hold.
+func setFloatChecked(field reflect.Value, n float64) error {
+	if field.OverflowFloat(n) {
+		return fmt.Errorf("%v overflows %s", n, field.Type())
+	}
+	field.SetFloat(n)
+	return nil
+}
+
 // setInt sets an integer value to a field
 func setInt(field reflect.Value, value interface{}) error {
 	switch v := value.(type) {
 	case int:
-		field.SetInt(int64(v))
+		return setIntChecked(field, int64(v))
 	case int8:
-		field.SetInt(int64(v))
+		return setIntChecked(field, int64(v))
 	case int16:
-		field.SetInt(int64(v))
+		return setIntChecked(field, int64(v))
 	case int32:
-		field.SetInt(int64(v))
+		return setIntChecked(field, int64(v))
 	case int64:
-		field.SetInt(v)
+		return setIntChecked(field, v)
 	case float32:
-		field.SetInt(int64(v))
+		return setIntChecked(field, int64(v))
 	case float64:
-		field.SetInt(int64(v))
+		return setIntChecked(field, int64(v))
 	case json.Number:
 		if i, err := v.Int64(); err == nil {
-			field.SetInt(i)
-			return nil
+			return setIntChecked(field, i)
 		}
 		// Numbers written in a form Int64 rejects, such as 1e5 or 1.0, went
 		// through float64 before and still do.
@@ -1049,46 +1155,44 @@ func setInt(field reflect.Value, value interface{}) error {
 		if err != nil {
 			return err
 		}
-		field.SetInt(int64(f))
+		return setIntChecked(field, int64(f))
 	case string:
 		i, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return err
 		}
-		field.SetInt(i)
+		return setIntChecked(field, i)
 	default:
 		return fmt.Errorf("cannot convert %T to int", value)
 	}
-	return nil
 }
 
 // setUint sets an unsigned integer value to a field
 func setUint(field reflect.Value, value interface{}) error {
 	switch v := value.(type) {
 	case uint:
-		field.SetUint(uint64(v))
+		return setUintChecked(field, uint64(v))
 	case uint8:
-		field.SetUint(uint64(v))
+		return setUintChecked(field, uint64(v))
 	case uint16:
-		field.SetUint(uint64(v))
+		return setUintChecked(field, uint64(v))
 	case uint32:
-		field.SetUint(uint64(v))
+		return setUintChecked(field, uint64(v))
 	case uint64:
-		field.SetUint(v)
+		return setUintChecked(field, v)
 	case int:
 		if v < 0 {
 			return fmt.Errorf("cannot convert negative int to uint")
 		}
-		field.SetUint(uint64(v))
+		return setUintChecked(field, uint64(v))
 	case float64:
 		if v < 0 {
 			return fmt.Errorf("cannot convert negative float to uint")
 		}
-		field.SetUint(uint64(v))
+		return setUintChecked(field, uint64(v))
 	case json.Number:
 		if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
-			field.SetUint(u)
-			return nil
+			return setUintChecked(field, u)
 		}
 		f, err := v.Float64()
 		if err != nil {
@@ -1097,17 +1201,16 @@ func setUint(field reflect.Value, value interface{}) error {
 		if f < 0 {
 			return fmt.Errorf("cannot convert negative float to uint")
 		}
-		field.SetUint(uint64(f))
+		return setUintChecked(field, uint64(f))
 	case string:
 		i, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
 			return err
 		}
-		field.SetUint(i)
+		return setUintChecked(field, i)
 	default:
 		return fmt.Errorf("cannot convert %T to uint", value)
 	}
-	return nil
 }
 
 // setBool sets a boolean value to a field
@@ -1141,29 +1244,28 @@ func setBool(field reflect.Value, value interface{}) error {
 func setFloat(field reflect.Value, value interface{}) error {
 	switch v := value.(type) {
 	case float32:
-		field.SetFloat(float64(v))
+		return setFloatChecked(field, float64(v))
 	case float64:
-		field.SetFloat(v)
+		return setFloatChecked(field, v)
 	case int, int8, int16, int32, int64:
 		// Use reflection to get the actual int value
 		val := reflect.ValueOf(v)
-		field.SetFloat(float64(val.Int()))
+		return setFloatChecked(field, float64(val.Int()))
 	case json.Number:
 		f, err := v.Float64()
 		if err != nil {
 			return err
 		}
-		field.SetFloat(f)
+		return setFloatChecked(field, f)
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return err
 		}
-		field.SetFloat(f)
+		return setFloatChecked(field, f)
 	default:
 		return fmt.Errorf("cannot convert %T to float", value)
 	}
-	return nil
 }
 
 // setSlice sets a slice value to a field
