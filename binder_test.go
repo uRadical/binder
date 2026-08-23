@@ -668,7 +668,9 @@ func TestFieldCache(t *testing.T) {
 		Name     string `query:"name,omitempty"`
 		Email    string `body:"email,required"`
 		Untagged string
-		hidden   string `body:"hidden"`
+		// Present so the cache can be shown to skip what it cannot set.
+		//lint:ignore U1000 fixture for the unexported-field case
+		hidden string `body:"hidden"`
 	}
 	typ := reflect.TypeOf(cachedStruct{})
 

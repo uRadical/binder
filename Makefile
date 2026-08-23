@@ -7,9 +7,21 @@
 COVERAGE   := coverage.out
 CRAP_FLAGS := --exclude 'example/.*\.go' --threshold 30
 
-.PHONY: all test cover crap crap-baseline bench vet fmt lint clean
+.PHONY: all test cover crap crap-baseline bench vet fmt lint check fuzz clean
 
-all: fmt vet test
+all: fmt vet check test
+
+# Static analysis and vulnerability scanning, as CI runs them.
+check:
+	staticcheck ./...
+	govulncheck ./...
+
+# A short fuzz run. CI does the same on every push; run longer when changing
+# the reflection paths.
+fuzz:
+	go test -run '^$$' -fuzz 'FuzzBind$$' -fuzztime=30s
+	go test -run '^$$' -fuzz 'FuzzBindWithOptions' -fuzztime=15s
+	go test -run '^$$' -fuzz 'FuzzBindStruct' -fuzztime=15s
 
 test:
 	go test -race ./...

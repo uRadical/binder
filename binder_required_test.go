@@ -29,7 +29,11 @@ func TestRequiredMissingReturnsError(t *testing.T) {
 			name:  "json",
 			field: "Nick",
 			bind: func(r *http.Request) error {
+				// The json source is binder's alias for body, so it carries
+				// binder's options. encoding/json does not define "required",
+				// which is why linters flag the tag below.
 				var s struct {
+					//lint:ignore SA5008 binder option on binder's json alias
 					Nick string `json:"nick,required"`
 				}
 				return Bind(r, &s)

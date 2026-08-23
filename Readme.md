@@ -151,6 +151,12 @@ In most cases, you should prefer using the `body:` tag as it provides content-ty
 
 **Note:** Avoid using both `body:` and `json:` tags on the same field as this creates redundancy.
 
+**Note:** Binder's options travel in whichever tag it reads. On a `json:` tag
+that means writing options `encoding/json` does not define, and linters such as
+staticcheck will flag `json:"email,required"` as an unknown tag option. Nothing
+breaks, but prefer `body:` when a field needs binder options, and keep `json:`
+for fields whose tag is shared with serialisation.
+
 ## Options
 
 Add `,omitempty` to skip binding if the value is empty:
