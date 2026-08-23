@@ -577,16 +577,6 @@ func bindFieldValue(fieldVal reflect.Value, value interface{}, fi fieldInfo) err
 		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
 	}
 
-	// Handle nested structs recursively
-	if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Elem().Kind() == reflect.Struct) {
-		if nestedMap, ok := value.(map[string]interface{}); ok {
-			if err := BindStruct(fieldVal, nestedMap); err != nil {
-				return newBindError(fi, fmt.Sprintf("error binding nested field %s: %v", fieldName, err), err)
-			}
-			return nil
-		}
-	}
-
 	if err := setField(fieldVal, value); err != nil {
 		return newBindError(fi, fmt.Sprintf("error setting field %s: %v", fieldName, err), err)
 	}
@@ -680,10 +670,28 @@ func BindStruct(field reflect.Value, data map[string]interface{}) error {
 		}
 		target = field.Elem()
 	}
+	if target.Kind() != reflect.Struct {
+		return fmt.Errorf("%w: target is %s, want a struct", ErrInvalidTarget, target.Kind())
+	}
+	return bindNestedFields(target, data)
+}
 
+// bindNestedFields binds map data into a struct's fields, matching each on its
+// body tag or the json alias. It is the one implementation behind BindStruct
+// and the struct case of setField, which previously carried a copy each and
+// drifted apart: only one of them allocated nil pointers, and neither skipped
+// fields reflection cannot set.
+func bindNestedFields(target reflect.Value, data map[string]interface{}) error {
 	typ := target.Type()
 	for i := 0; i < typ.NumField(); i++ {
 		fieldType := typ.Field(i)
+
+		// Unexported fields cannot be set through reflection, so they are
+		// ignored even when tagged, as the top-level fields are.
+		if !fieldType.IsExported() {
+			continue
+		}
+
 		tag := fieldType.Tag.Get(body)
 		if tag == "" {
 			tag = fieldType.Tag.Get(jjson)
@@ -698,12 +706,7 @@ func BindStruct(field reflect.Value, data map[string]interface{}) error {
 			continue
 		}
 
-		nestedField := target.Field(i)
-		if nestedField.Kind() == reflect.Ptr && nestedField.IsNil() {
-			nestedField.Set(reflect.New(nestedField.Type().Elem()))
-		}
-
-		if err := setField(nestedField, nestedValue); err != nil {
+		if err := setField(target.Field(i), nestedValue); err != nil {
 			return fmt.Errorf("error setting nested field %s: %w", fieldType.Name, err)
 		}
 	}
@@ -1088,36 +1091,16 @@ func setSlice(field reflect.Value, value interface{}) error {
 
 // setStruct sets a struct value to a field
 func setStruct(field reflect.Value, value interface{}) error {
-	// Handle map to struct conversion
-	if structMap, ok := value.(map[string]interface{}); ok {
-		for x := 0; x < field.NumField(); x++ {
-			nestedField := field.Field(x)
-			nestedStructType := field.Type().Field(x)
-
-			tagValue := nestedStructType.Tag.Get(body)
-			if tagValue == "" {
-				tagValue = nestedStructType.Tag.Get(jjson)
-			}
-
-			if tagValue != "" {
-				name, _ := splitTag(tagValue)
-				if nestedVal, exists := structMap[name]; exists {
-					if nestedField.Kind() == reflect.Ptr && nestedField.IsNil() {
-						nestedField.Set(reflect.New(nestedField.Type().Elem()))
-					}
-					if err := setField(nestedField, nestedVal); err != nil {
-						return fmt.Errorf("error setting nested field '%s': %w", nestedStructType.Name, err)
-					}
-				}
-			}
+	structMap, ok := value.(map[string]interface{})
+	if !ok {
+		if reflect.TypeOf(value).Kind() == reflect.Map {
+			// A map of some other key or element type cannot be walked as
+			// decoded JSON would be.
+			return fmt.Errorf("value mismatch for struct mapping")
 		}
-		return nil
-	} else if reflect.TypeOf(value).Kind() == reflect.Map {
-		// If not directly map[string]interface{}, handle map or struct assignment gracefully
-		return fmt.Errorf("value mismatch for struct mapping")
+		return fmt.Errorf("cannot set struct field with value of type %T", value)
 	}
-
-	return fmt.Errorf("cannot set struct field with value of type %T", value)
+	return bindNestedFields(field, structMap)
 }
 
 // isEmptyValue checks if a value is empty or zero
