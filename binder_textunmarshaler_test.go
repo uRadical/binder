@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,33 @@ func TestTextUnmarshalerFromOtherSources(t *testing.T) {
 	}
 	if got.H == nil || got.H.V != "BETA" {
 		t.Errorf("H = %+v, want V=BETA", got.H)
+	}
+}
+
+// tryTextUnmarshaler must allocate a nil pointer itself. Exercising it through
+// a nested struct cannot prove that, because setStruct allocates first; this
+// reaches setField directly so only the unmarshaler's own guard is in play.
+func TestTextUnmarshalerAllocatesNilPointerDirectly(t *testing.T) {
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("setField panicked on a nil pointer: %v", p)
+		}
+	}()
+
+	field := reflect.New(reflect.TypeOf((*upperText)(nil))).Elem()
+	if !field.IsNil() {
+		t.Fatal("fixture is not a nil pointer")
+	}
+
+	if err := setField(field, "hello"); err != nil {
+		t.Fatalf("got error %v, want nil", err)
+	}
+
+	got, ok := field.Interface().(*upperText)
+	if !ok || got == nil {
+		t.Fatalf("pointer was not allocated: %#v", field.Interface())
+	}
+	if got.V != "HELLO" {
+		t.Errorf("V = %q, want %q", got.V, "HELLO")
 	}
 }

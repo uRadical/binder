@@ -7,7 +7,7 @@
 COVERAGE   := coverage.out
 CRAP_FLAGS := --exclude 'example/.*\.go' --threshold 30
 
-.PHONY: all test cover crap crap-baseline bench vet fmt lint check fuzz clean
+.PHONY: all test cover crap crap-baseline bench vet fmt lint check fuzz mutants clean
 
 all: fmt vet check test
 
@@ -57,6 +57,17 @@ lint:
 		gofmt -s -l .; \
 		exit 1; \
 	fi
+
+# Mutation testing. Not part of CI: a run takes about ninety seconds, and
+# gremlins releases after v0.4.0 currently fail Go checksum verification, so
+# the version is pinned rather than tracking latest.
+#
+#   go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.4.0
+#
+# The timeout coefficient is raised because gremlins sizes its per-mutant
+# timeout from the coverage pass, which is far quicker than the full suite.
+mutants:
+	gremlins unleash --timeout-coefficient 12 .
 
 clean:
 	rm -f $(COVERAGE)

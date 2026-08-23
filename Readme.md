@@ -431,6 +431,36 @@ This comparison is based on actual analysis of each library's source code:
 - **Echo/Gin**: You're already using these frameworks and want integrated binding
 - **Gorilla Schema**: You only need form/query parameter decoding with more features
 
+## Compatibility
+
+Binder follows [Semantic Versioning](https://semver.org/). Within a major
+version, the following are stable and will not change incompatibly:
+
+- The exported functions `Bind`, `BindWithOptions` and `BindStruct`.
+- The exported types `BindOptions`, `BindError` and `Validator`, and the
+  meaning of their fields.
+- The sentinel errors `ErrMalformedBody`, `ErrBodyTooLarge`,
+  `ErrInvalidTarget`, `ErrMissingRequired` and `ErrUnknownField`. Match on
+  these with `errors.Is` rather than on message text.
+- The struct tags `path`, `query`, `body`, `json`, `cookie` and `header`, the
+  order in which they take precedence, and the `omitempty` and `required`
+  options.
+
+The following are **not** part of the contract and may change in any release:
+
+- The text of error messages. Only the sentinels and `BindError`'s fields are
+  stable; parsing a message is not supported.
+- The default value of `MaxBodySize`. Set it explicitly if your service
+  depends on a particular limit.
+- The order in which fields are bound, and how many allocations binding takes.
+
+### Go Version Support
+
+Binder requires the two most recent major Go releases. It currently requires
+Go 1.27, for the standard library `uuid` package and native path values.
+Raising that minimum is a minor version bump, not a major one, in line with
+the wider Go ecosystem.
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.

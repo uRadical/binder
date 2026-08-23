@@ -189,3 +189,31 @@ func TestCommaInValueIsNotSplit(t *testing.T) {
 		t.Errorf("Tags = %v, want [\"a,b\"]", got.Tags)
 	}
 }
+
+// A required header slice with no values must fail, the same as a required
+// query slice. Only the query case was covered, so the header branch could
+// have reported an empty slice as present and nothing would have noticed.
+func TestRequiredHeaderSliceWithNoValues(t *testing.T) {
+	var got struct {
+		Accept []string `header:"X-Accept,required"`
+	}
+	err := Bind(httptest.NewRequest("GET", "/s", nil), &got)
+	if !errors.Is(err, ErrMissingRequired) {
+		t.Fatalf("got %v, want ErrMissingRequired", err)
+	}
+}
+
+// An absent header slice leaves the field alone.
+func TestAbsentHeaderSliceLeavesFieldAlone(t *testing.T) {
+	var got struct {
+		Accept []string `header:"X-Accept"`
+	}
+	got.Accept = []string{"preexisting"}
+
+	if err := Bind(httptest.NewRequest("GET", "/s", nil), &got); err != nil {
+		t.Fatalf("got error %v, want nil", err)
+	}
+	if len(got.Accept) != 1 || got.Accept[0] != "preexisting" {
+		t.Errorf("Accept = %v, want it untouched", got.Accept)
+	}
+}
