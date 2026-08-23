@@ -1,5 +1,7 @@
 # Binder - HTTP Request Binding for Go
 
+[Docs](https://gobinder.dev) · [API reference](https://pkg.go.dev/uradical.io/go/binder) · [Source](https://github.com/uRadical/binder)
+
 A focused, zero-dependency library that does one thing well: binding HTTP request data to Go structs. Built for Go 1.27+, using its native path parameter support and standard library UUID type.
 
 ## Why Binder?
@@ -507,3 +509,5 @@ the wider Go ecosystem.
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.
+
+Binder is maintained by [uRadical](https://uradical.io).
