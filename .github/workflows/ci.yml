@@ -56,3 +56,31 @@ jobs:
 
     - name: Run vet
       run: go vet ./...
+
+  # go-crap needs a newer Go than the compatibility matrix above, and the score
+  # does not vary by Go version, so it runs once in its own job.
+  crap:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    - name: Install go-crap
+      run: go install github.com/padiazg/go-crap@latest
+
+    - name: Test with coverage
+      run: go test -coverprofile=coverage.out ./...
+
+    # Flags are kept in step with the Makefile's crap target.
+    - name: CRAP score
+      run: >-
+        go-crap scan ./...
+        --exclude 'example/.*\.go'
+        --threshold 30
+        --coverage-profile=coverage.out
+        --fail-above
