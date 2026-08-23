@@ -30,9 +30,23 @@ point of most of it. Read **Upgrading** before taking it.
 - **Repeated values fill slices.** A query parameter, header or form field
   given more than once now binds every value to a slice field rather than the
   first. Non-slice fields are unaffected.
+- **Go 1.27 is required.** The previous release declared `go 1.25.1`; the
+  documentation's claim of 1.22+ was never accurate.
 - **`errors.As(err, &*json.SyntaxError{})` no longer matches** when built with
   Go 1.27, where `encoding/json` is implemented on json/v2 and returns
   different error types. Test for `ErrMalformedBody` instead.
+
+### Changed
+
+- **Requires Go 1.27.** The module previously declared `go 1.25.1` while the
+  documentation claimed 1.22+ and CI listed a 1.22 to 1.25 matrix that, because
+  of toolchain resolution, silently ran 1.25.1 for every entry. The
+  requirement, the documentation and the matrix now agree.
+- **`github.com/google/uuid` is no longer required.** The tests use the
+  standard library `uuid` package introduced in Go 1.27, so the module has no
+  dependencies at all and `go.sum` is gone. `uuid.UUID` binds through
+  `encoding.TextUnmarshaler` exactly as before, so nothing changes for callers
+  using either package in their own request types.
 
 ### Added
 

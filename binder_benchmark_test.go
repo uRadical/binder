@@ -1,6 +1,7 @@
 package binder
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -46,6 +47,14 @@ func setPathParams(r *http.Request, params map[string]string) *http.Request {
 		r.SetPathValue(name, value)
 	}
 	return r
+}
+
+// resetBody re-arms a request's body between iterations. Rebuilding the whole
+// request instead would fold httptest.NewRequest into the measurement, and it
+// costs more memory than the binding under test.
+func resetBody(r *http.Request, body string) {
+	r.Body = io.NopCloser(strings.NewReader(body))
+	r.ContentLength = int64(len(body))
 }
 
 // requireBound fails a benchmark whose target does not receive the value it
@@ -118,11 +127,13 @@ func BenchmarkBindBodyOnly(b *testing.B) {
 		}
 		requireBound(b, "Email", probe.Email, "test@example.com")
 
+		r := httptest.NewRequest("POST", "/users", strings.NewReader(formBody))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// Create a new request for each iteration to avoid body read issues
-			r := httptest.NewRequest("POST", "/users", strings.NewReader(formBody))
-			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resetBody(r, formBody)
+			r.PostForm = nil // ParseForm caches, so clear it between runs
 
 			var s BodyOnlyStruct
 			err := Bind(r, &s)
@@ -143,11 +154,12 @@ func BenchmarkBindBodyOnly(b *testing.B) {
 		}
 		requireBound(b, "len(Tags)", len(probe.Tags), 3)
 
+		r := httptest.NewRequest("POST", "/users", strings.NewReader(jsonBody))
+		r.Header.Set("Content-Type", "application/json")
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// Create a new request for each iteration to avoid body read issues
-			r := httptest.NewRequest("POST", "/users", strings.NewReader(jsonBody))
-			r.Header.Set("Content-Type", "application/json")
+			resetBody(r, jsonBody)
 
 			var s JSONOnlyStruct
 			err := Bind(r, &s)
@@ -201,13 +213,14 @@ func BenchmarkBindMixed(b *testing.B) {
 		requireBound(b, "SessionID", probe.SessionID, "abc123")
 		requireBound(b, "len(Tags)", len(probe.Tags), 3)
 
+		r := httptest.NewRequest("POST", "/users/123?name=test_user", strings.NewReader(jsonBody))
+		r.Header.Set("Content-Type", "application/json")
+		r.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
+		r = setPathParams(r, map[string]string{"id": "123"})
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// Create a fresh request for each iteration
-			r := httptest.NewRequest("POST", "/users/123?name=test_user", strings.NewReader(jsonBody))
-			r.Header.Set("Content-Type", "application/json")
-			r.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
-			r = setPathParams(r, map[string]string{"id": "123"})
+			resetBody(r, jsonBody)
 
 			var s MixedStruct
 			err := Bind(r, &s)
@@ -233,13 +246,15 @@ func BenchmarkBindMixed(b *testing.B) {
 		requireBound(b, "Email", probe.Email, "test@example.com")
 		requireBound(b, "SessionID", probe.SessionID, "abc123")
 
+		r := httptest.NewRequest("POST", "/users/123?name=test_user", strings.NewReader(formBody))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
+		r = setPathParams(r, map[string]string{"id": "123"})
+
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// Create a fresh request for each iteration
-			r := httptest.NewRequest("POST", "/users/123?name=test_user", strings.NewReader(formBody))
-			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			r.AddCookie(&http.Cookie{Name: "session_id", Value: "abc123"})
-			r = setPathParams(r, map[string]string{"id": "123"})
+			resetBody(r, formBody)
+			r.PostForm = nil // ParseForm caches, so clear it between runs
 
 			var s MixedStruct
 			err := Bind(r, &s)
@@ -279,15 +294,19 @@ func BenchmarkBindOmitEmpty(b *testing.B) {
 
 // BenchmarkBindParallel benchmarks parallel binding
 func BenchmarkBindParallel(b *testing.B) {
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			// Use a basic form binding as a simple test case
-			formData := url.Values{}
-			formData.Add("email", "test@example.com")
-			formBody := formData.Encode()
+	formData := url.Values{}
+	formData.Add("email", "test@example.com")
+	formBody := formData.Encode()
 
-			r := httptest.NewRequest("POST", "/users", strings.NewReader(formBody))
-			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	b.RunParallel(func(pb *testing.PB) {
+		// One request per goroutine, re-armed per iteration, so the
+		// measurement is the binding rather than the fixture.
+		r := httptest.NewRequest("POST", "/users", strings.NewReader(formBody))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		for pb.Next() {
+			resetBody(r, formBody)
+			r.PostForm = nil
 
 			var s BodyOnlyStruct
 			err := Bind(r, &s)

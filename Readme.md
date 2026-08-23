@@ -1,6 +1,6 @@
 # Binder - HTTP Request Binding for Go
 
-A focused, zero-dependency library that does one thing well: binding HTTP request data to Go structs. Built specifically for Go 1.22+ and its native path parameter support.
+A focused, zero-dependency library that does one thing well: binding HTTP request data to Go structs. Built for Go 1.27+, using its native path parameter support and standard library UUID type.
 
 ## Why Binder?
 
@@ -296,23 +296,40 @@ case err != nil:
 
 ## Benchmark Results
 
-![Benchmark Results](./benchmark_results.png)
+Measured on an Apple M-series laptop with Go 1.27, `-benchtime=200ms -count=10`,
+reporting the median of ten runs. Reproduce with `make bench`.
 
+Each benchmark times binding alone. The request is built once and its body
+re-armed between iterations, so `httptest.NewRequest` is not folded into the
+figures; it costs more memory than the binding itself.
 
-| Test | Time (ms/op) | Memory (KB/op) | Allocations |
-|------|-------------|---------------|-------------|
-| BindPathOnly | 0.000 | 0.01 | 1 |
-| BindCookieOnly | 0.000 | 0.23 | 4 |
-| BindQueryOnly | 0.000 | 0.44 | 5 |
-| BindOmitEmpty | 0.001 | 0.47 | 5 |
-| BindParallel | 0.002 | 8.02 | 44 |
-| BindBodyOnly/JSONBody | 0.002 | 7.55 | 44 |
-| BindBodyOnly/FormBody | 0.002 | 7.87 | 36 |
-| Bind | 0.003 | 2.52 | 31 |
-| BindWithoutCache | 0.003 | 2.57 | 32 |
-| BindMixed/WithJSON | 0.004 | 9.05 | 59 |
-| BindMixed/WithForm | 0.004 | 9.75 | 54 |
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| BindPathOnly | 107 | 72 | 3 |
+| BindCookieOnly | 179 | 280 | 5 |
+| BindNoQueryParams | 181 | 280 | 5 |
+| BindQueryOnly | 224 | 496 | 6 |
+| BindOmitEmpty | 247 | 528 | 6 |
+| BindParallel | 692 | 2,608 | 26 |
+| BindManyQueryParams | 904 | 832 | 20 |
+| BindBodyOnly/FormBody | 1,034 | 2,608 | 26 |
+| BindBodyOnly/JSONBody | 1,408 | 2,010 | 33 |
+| BindMixed/WithForm | 1,622 | 3,720 | 37 |
+| BindMixed/WithJSON | 1,836 | 2,731 | 41 |
+| Bind | 1,919 | 2,379 | 33 |
+| BindWithoutCache | 2,484 | 3,549 | 36 |
 
+Binding from path, query, cookie or header costs a few hundred nanoseconds and
+a handful of allocations. Binding a body costs more, because the body is
+decoded into a `map[string]interface{}` before conversion.
+
+`Bind` against `BindWithoutCache` measures the per-type tag cache: 1,919 ns and
+33 allocations with it warm, against 2,484 ns and 36 allocations when it is
+cleared before every iteration.
+
+`BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
+binds none, showing that the query string is parsed once per call and only when
+a field asks for it.
 
 ## Performance Analysis
 
@@ -337,7 +354,7 @@ This library has been designed with production use in mind:
 ## When to Use Binder
 
 **Perfect for:**
-- Standard REST APIs using Go 1.22+
+- Standard REST APIs using Go 1.27+
 - High-throughput services where performance matters
 - Teams that value simplicity and maintainability
 - Projects that need to minimize dependencies
@@ -345,7 +362,7 @@ This library has been designed with production use in mind:
 **Not suitable for:**
 - File uploads (no multipart/form-data support)
 - Complex validation requirements (use a separate validator)
-- Legacy Go versions (requires Go 1.22+ for path parameters)
+- Older Go versions (requires Go 1.27+)
 
 ## Validation
 
@@ -395,7 +412,7 @@ This comparison is based on actual analysis of each library's source code:
 | **Data Sources** | Path, Query, Body, Cookie, Header | Path, Query, Body, Header | Path, Query, Body, Header | Query, Form only |
 | **Content Types** | JSON, Form | JSON, XML, Form, Multipart | JSON, XML, YAML, TOML, Protobuf, MsgPack | Form only |
 | **Built-in Validation** | Interface only | No | Yes (via validator) | No |
-| **Go 1.22 PathValue** | Yes | No | No | N/A |
+| **Native PathValue** | Yes | No | No | N/A |
 | **Multipart/Files** | No | Yes | Yes | No |
 | **Custom Types** | TextUnmarshaler | BindUnmarshaler | Custom tags | Type converters |
 | **Performance** | 0.18-4.76ms | Not benchmarked | Not benchmarked | Not benchmarked |
@@ -404,7 +421,7 @@ This comparison is based on actual analysis of each library's source code:
 
 ### When to Choose Each:
 
-- **Binder**: You want a standalone, zero-dependency solution for Go 1.22+ REST APIs
+- **Binder**: You want a standalone, zero-dependency solution for Go 1.27+ REST APIs
 - **Echo/Gin**: You're already using these frameworks and want integrated binding
 - **Gorilla Schema**: You only need form/query parameter decoding with more features
 

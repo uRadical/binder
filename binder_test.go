@@ -11,8 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // CustomTime implements TextUnmarshaler for testing
