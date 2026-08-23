@@ -8,9 +8,13 @@ This example demonstrates how to use the Binder library to build a complete REST
 - **Query parameters** - `/users?active=true&limit=5`
 - **Request bodies** - JSON data in POST/PUT requests
 - **Cookies** - API key authentication
+- **Headers** - Request tracing via `X-Request-ID`
+- **Repeated values** - `/users?tags=admin&tags=user` filling a slice
+- **Required fields** - Reporting a missing value rather than binding a zero one
+- **Per-call options** - `BindWithOptions` for body limits and unknown fields
 - **Validation** - Using the `Validator` interface
 - **Partial updates** - Using `omitempty` for PATCH-like behavior
-- **Error handling** - Proper HTTP status codes and error responses
+- **Error handling** - Choosing a status code from the error
 
 ## Running the Example
 
@@ -35,7 +39,7 @@ curl http://localhost:8080/users/1
 
 ### 2. List Users with Filters
 ```bash
-# Demonstrates query parameters and cookies
+# Demonstrates query parameters, repeated values and cookies
 curl http://localhost:8080/users?active=true&limit=5
 ```
 
@@ -100,37 +104,81 @@ type UpdateUserRequest struct {
 }
 ```
 
-### Validation Integration
+### Required Fields and Validation
+
+Presence is a binding concern, so the `required` option handles it. Validation
+is left for rules binding cannot express:
+
 ```go
 type CreateUserRequest struct {
-    Name   string   `body:"name"`
-    Email  string   `body:"email"`
+    Name  string `body:"name,required"`
+    Email string `body:"email,required"`
     // ... other fields
 }
 
 // Implement binder.Validator interface
 func (r CreateUserRequest) Validate() error {
-    if r.Name == "" {
-        return fmt.Errorf("name is required")
-    }
-    if r.Email == "" {
-        return fmt.Errorf("email is required")
+    if !strings.Contains(r.Email, "@") {
+        return fmt.Errorf("email %q is not a valid address", r.Email)
     }
     return nil
 }
 ```
 
-### Error Handling Pattern
-```go
-func createUser(w http.ResponseWriter, r *http.Request) {
-    var req CreateUserRequest
-    if err := binder.Bind(r, &req); err != nil {
-        respondError(w, err.Error(), http.StatusBadRequest)
-        return
-    }
+A missing required value reports which input was at fault:
 
-    // Business logic here...
+```json
+{
+  "error": "missing required field Name: no body value named \"name\"",
+  "field": "Name",
+  "source": "body",
+  "parameter": "name"
 }
+```
+
+### Error Handling Pattern
+
+Not every binding failure is the client's fault, so they do not all deserve a
+400. The example routes each kind to the status that fits, and uses
+`*binder.BindError` to say which input was at fault:
+
+```go
+switch {
+case errors.Is(err, binder.ErrInvalidTarget):
+    // A bug in this handler, not a bad request.
+    respondError(w, "internal server error", http.StatusInternalServerError)
+
+case errors.Is(err, binder.ErrBodyTooLarge):
+    respondError(w, err.Error(), http.StatusRequestEntityTooLarge)
+
+default:
+    var bindErr *binder.BindError
+    if errors.As(err, &bindErr) {
+        // bindErr.Field, .Source and .Name identify the offending input
+    }
+    respondError(w, err.Error(), http.StatusBadRequest)
+}
+```
+
+### Per-Call Options
+
+`BindWithOptions` narrows the rules for one endpoint. Creating a user takes a
+tighter body limit than the package default and refuses keys nothing binds, so
+a typo is reported instead of ignored:
+
+```go
+opts := binder.BindOptions{
+    MaxBodySize:           64 << 10,
+    DisallowUnknownFields: true,
+}
+```
+
+```bash
+# A key nothing binds is rejected
+curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Carol","email":"carol@example.com","surprise":1}'
+# {"error":"unknown field in request body: \"surprise\""}
 ```
 
 ## Form Data Example

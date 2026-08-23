@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"uradical.io/go/binder"
@@ -31,28 +33,31 @@ var nextID = 3
 
 type GetUserRequest struct {
 	ID int `path:"id"`
+	// Headers bind like any other source.
+	TraceID string `header:"X-Request-ID"`
 }
 
 type ListUsersRequest struct {
 	Active *bool  `query:"active,omitempty"`
 	Limit  int    `query:"limit,omitempty"`
 	APIKey string `cookie:"api_key"`
+	// A repeated parameter fills a slice: ?tags=admin&tags=user
+	Tags []string `query:"tags,omitempty"`
 }
 
 type CreateUserRequest struct {
-	Name   string   `body:"name"`
-	Email  string   `body:"email"`
+	// required reports a missing value rather than binding a zero one.
+	Name   string   `body:"name,required"`
+	Email  string   `body:"email,required"`
 	Active bool     `body:"active"`
 	Tags   []string `body:"tags"`
 }
 
-// Validate implements the binder.Validator interface
+// Validate implements the binder.Validator interface. Presence is handled by
+// the required tag, so validation is left for rules binding cannot express.
 func (r CreateUserRequest) Validate() error {
-	if r.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if r.Email == "" {
-		return fmt.Errorf("email is required")
+	if !strings.Contains(r.Email, "@") {
+		return fmt.Errorf("email %q is not a valid address", r.Email)
 	}
 	return nil
 }
@@ -65,12 +70,48 @@ type UpdateUserRequest struct {
 	Tags   []string `body:"tags,omitempty"`
 }
 
+// bindRequest binds a request and, on failure, answers with a status matching
+// what went wrong. Not every binding failure is the client's fault, so they do
+// not all deserve a 400.
+func bindRequest(w http.ResponseWriter, r *http.Request, target interface{}, opts binder.BindOptions) bool {
+	err := binder.BindWithOptions(r, target, opts)
+	if err == nil {
+		return true
+	}
+
+	switch {
+	case errors.Is(err, binder.ErrInvalidTarget):
+		// A programming error in this handler, not a bad request.
+		log.Printf("bind target is wrong: %v", err)
+		respondError(w, "internal server error", http.StatusInternalServerError)
+
+	case errors.Is(err, binder.ErrBodyTooLarge):
+		respondError(w, err.Error(), http.StatusRequestEntityTooLarge)
+
+	default:
+		// A BindError names the field and the input it came from, so the
+		// response can tell the client which part of the request to fix
+		// rather than handing back one opaque string.
+		var bindErr *binder.BindError
+		if errors.As(err, &bindErr) {
+			respondJSON(w, map[string]interface{}{
+				"error":     bindErr.Error(),
+				"field":     bindErr.Field,
+				"source":    bindErr.Source,
+				"parameter": bindErr.Name,
+			}, http.StatusBadRequest)
+			return false
+		}
+		respondError(w, err.Error(), http.StatusBadRequest)
+	}
+	return false
+}
+
 // HTTP Handlers
 
 func getUser(w http.ResponseWriter, r *http.Request) {
 	var req GetUserRequest
-	if err := binder.Bind(r, &req); err != nil {
-		respondError(w, err.Error(), http.StatusBadRequest)
+	if !bindRequest(w, r, &req, binder.BindOptions{}) {
 		return
 	}
 
@@ -85,8 +126,7 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 
 func listUsers(w http.ResponseWriter, r *http.Request) {
 	var req ListUsersRequest
-	if err := binder.Bind(r, &req); err != nil {
-		respondError(w, err.Error(), http.StatusBadRequest)
+	if !bindRequest(w, r, &req, binder.BindOptions{}) {
 		return
 	}
 
@@ -109,6 +149,11 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Filter by any of the repeated tags parameters, if given
+		if len(req.Tags) > 0 && !hasAnyTag(user, req.Tags) {
+			continue
+		}
+
 		result = append(result, user)
 		count++
 		if count >= limit {
@@ -125,8 +170,14 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 
 func createUser(w http.ResponseWriter, r *http.Request) {
 	var req CreateUserRequest
-	if err := binder.Bind(r, &req); err != nil {
-		respondError(w, err.Error(), http.StatusBadRequest)
+	// Per-call options: a tighter body limit than the package default, and
+	// refuse a body carrying keys nothing binds, so typos are reported
+	// rather than ignored.
+	opts := binder.BindOptions{
+		MaxBodySize:           64 << 10,
+		DisallowUnknownFields: true,
+	}
+	if !bindRequest(w, r, &req, opts) {
 		return
 	}
 
@@ -148,8 +199,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 
 func updateUser(w http.ResponseWriter, r *http.Request) {
 	var req UpdateUserRequest
-	if err := binder.Bind(r, &req); err != nil {
-		respondError(w, err.Error(), http.StatusBadRequest)
+	if !bindRequest(w, r, &req, binder.BindOptions{}) {
 		return
 	}
 
@@ -179,8 +229,7 @@ func updateUser(w http.ResponseWriter, r *http.Request) {
 
 func deleteUser(w http.ResponseWriter, r *http.Request) {
 	var req GetUserRequest
-	if err := binder.Bind(r, &req); err != nil {
-		respondError(w, err.Error(), http.StatusBadRequest)
+	if !bindRequest(w, r, &req, binder.BindOptions{}) {
 		return
 	}
 
@@ -191,6 +240,18 @@ func deleteUser(w http.ResponseWriter, r *http.Request) {
 
 	delete(users, req.ID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// hasAnyTag reports whether the user carries any of the given tags.
+func hasAnyTag(u User, tags []string) bool {
+	for _, want := range tags {
+		for _, has := range u.Tags {
+			if has == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Helper functions
@@ -223,6 +284,10 @@ func demoMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	// Cap request bodies for every call that does not override it. The
+	// default is 10 MB; this API has no need for anything that large.
+	binder.MaxBodySize = 1 << 20
+
 	mux := http.NewServeMux()
 
 	// API routes demonstrating different binding scenarios
@@ -240,6 +305,7 @@ func main() {
 	fmt.Println("Try these examples:")
 	fmt.Println("  GET    http://localhost:8080/users/1")
 	fmt.Println("  GET    http://localhost:8080/users?active=true&limit=5")
+	fmt.Println("  GET    http://localhost:8080/users?tags=admin&tags=user")
 	fmt.Println("  POST   http://localhost:8080/users")
 	fmt.Println("  PUT    http://localhost:8080/users/1")
 	fmt.Println("  DELETE http://localhost:8080/users/1")
