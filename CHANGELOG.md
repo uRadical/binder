@@ -75,6 +75,12 @@ point of most of it. Read **Upgrading** before taking it.
 
 ### Fixed
 
+Most of these were latent: paths that were wrong but that no reported use
+reached, needing an input or a struct shape nothing was sending. The two a
+caller could meet in ordinary use were tag options not binding outside
+`query:`, and the Readme describing an API that did not exist. Nothing here
+was reported in the field.
+
 - A tagged unexported field inside a nested struct panicked on assignment.
   Top-level fields were already skipped; nested ones were not, because the two
   nested binders each had their own copy of the loop and neither checked.
