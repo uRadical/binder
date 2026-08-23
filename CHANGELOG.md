@@ -13,6 +13,10 @@ point of most of it. Read **Upgrading** before taking it.
 
 ### Upgrading
 
+1.1.0 is the first release intended for general use; 1.0 ran only on our own
+client projects. If you are arriving here fresh, none of this applies to you —
+it is written for those two codebases.
+
 - **Request bodies are capped at 10 MB.** Anything larger is rejected with
   `ErrBodyTooLarge` instead of being read into memory. Set `binder.MaxBodySize`
   during initialisation to raise or lower it, or to zero to remove the limit.
@@ -139,7 +143,8 @@ was reported in the field.
 
 ## [1.0.0]
 
-Initial release.
+Initial release. Used internally on client projects rather than published for
+general use.
 
 [1.1.0]: https://github.com/uRadical/binder/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/uRadical/binder/releases/tag/v1.0.0
