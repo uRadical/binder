@@ -40,6 +40,7 @@ err := binder.Bind(r, &req)
   - Query parameters
   - JSON request body
   - Form-encoded request body
+  - Multipart forms, including file uploads
   - Cookies
   - Request headers
 - Support for primitive types, custom types, slices, and nested structs (arrays not supported - use slices)
@@ -101,6 +102,9 @@ The library supports binding from multiple sources:
 - `json:"name"` - Backwards compatibility with existing types
 - `header:"name"` - Binds from request headers, matched case-insensitively
 
+Bodies are parsed as JSON, form-encoded data or a multipart form, chosen by the
+request's `Content-Type`. The `body:` tag reads from whichever it is.
+
 When a field carries more than one of these, the first in the order above wins:
 `path`, `query`, `body`, `json`, `cookie`, `header`.
 
@@ -114,6 +118,40 @@ type Request struct {
     TraceID string `header:"x-request-id"`
 }
 ```
+
+### File Uploads
+
+A `multipart/form-data` body binds its text parts like any other body field,
+and its file parts to `*multipart.FileHeader`:
+
+```go
+type UploadRequest struct {
+    Name   string                  `body:"name"`
+    Avatar *multipart.FileHeader   `body:"avatar"`
+    Docs   []*multipart.FileHeader `body:"docs"`
+}
+
+var req UploadRequest
+if err := binder.Bind(r, &req); err != nil {
+    // Handle binding error
+}
+
+f, err := req.Avatar.Open()
+```
+
+A field given one file binds a one-element slice; a field declared as a single
+file takes the first part sent.
+
+Uploads count against `MaxBodySize` like any other body, and the whole request
+is held in memory rather than spilled to a temporary file. Raise the limit
+deliberately on an upload endpoint:
+
+```go
+binder.BindWithOptions(r, &req, binder.BindOptions{MaxBodySize: 32 << 20})
+```
+
+That bound is the point: without one, an upload endpoint is the easiest way to
+exhaust a server's memory.
 
 ### Repeated Values
 
@@ -322,8 +360,9 @@ figures; it costs more memory than the binding itself.
 | BindBodyOnly/FormBody | 1,036 | 2,600 | 25 |
 | Bind | 1,250 | 2,152 | 29 |
 | BindMixed/WithJSON | 1,302 | 2,544 | 39 |
-| BindMixed/WithForm | 1,626 | 3,712 | 36 |
-| BindWithoutCache | 1,882 | 3,464 | 35 |
+| BindMixed/WithForm | 1,632 | 3,712 | 36 |
+| BindWithoutCache | 1,902 | 3,464 | 35 |
+| BindMultipart | 8,850 | 38,069 | 91 |
 
 Binding from path, query, cookie or header costs a few hundred nanoseconds and
 a handful of allocations. A JSON body costs more, since the body must be read
@@ -336,6 +375,11 @@ cleared before every iteration.
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
 binds none, showing that the query string is parsed once per call and only when
 a field asks for it.
+
+`BindMultipart` carries two text fields and a 4 KB file. Multipart is an order
+of magnitude dearer than the other formats, which is inherent to the encoding
+rather than to binding: the parser copies each part, and the file is held in
+memory rather than spilled to disk.
 
 ## Performance Analysis
 
@@ -366,7 +410,6 @@ This library has been designed with production use in mind:
 - Projects that need to minimize dependencies
 
 **Not suitable for:**
-- File uploads (no multipart/form-data support)
 - Complex validation requirements (use a separate validator)
 - Older Go versions (requires Go 1.27+)
 
@@ -415,7 +458,7 @@ This comparison is based on actual analysis of each library's source code:
 | **Scope** | HTTP→struct binding only | Part of web framework | Part of web framework | Form values only |
 | **External Dependencies** | None | None* | validator/v10 | None |
 | **Lines of Code** | ~600 | ~500 | ~400 + validator | ~1,400 |
-| **Data Sources** | Path, Query, Body, Cookie, Header | Path, Query, Body, Header | Path, Query, Body, Header | Query, Form only |
+| **Data Sources** | Path, Query, Body, Multipart, Cookie, Header | Path, Query, Body, Header | Path, Query, Body, Header | Query, Form only |
 | **Content Types** | JSON, Form | JSON, XML, Form, Multipart | JSON, XML, YAML, TOML, Protobuf, MsgPack | Form only |
 | **Built-in Validation** | Interface only | No | Yes (via validator) | No |
 | **Native PathValue** | Yes | No | No | N/A |

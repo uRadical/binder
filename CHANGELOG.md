@@ -65,6 +65,10 @@ point of most of it. Read **Upgrading** before taking it.
 - `MaxBodySize` and `DefaultMaxBodySize`.
 - Multi-value binding from query parameters, headers and form fields into
   slice fields.
+- `multipart/form-data` bodies. Text parts bind as ordinary body fields and
+  file parts bind to `*multipart.FileHeader` or `[]*multipart.FileHeader`. An
+  upload counts against `MaxBodySize` and is held in memory rather than spilled
+  to a temporary file, so raise the limit deliberately on an upload endpoint.
 - A fallback JSON decoder for toolchains built with `GOEXPERIMENT=nojsonv2`,
   where `encoding/json/jsontext` is unavailable. Both produce the same values;
   only their error message text differs, which is not part of the contract.

@@ -1,7 +1,9 @@
 package binder
 
 import (
+	"bytes"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -355,6 +357,61 @@ func BenchmarkBindNoQueryParams(b *testing.B) {
 		var s CookieOnlyStruct
 		if err := Bind(r, &s); err != nil {
 			b.Fatalf("Failed to bind cookie: %v", err)
+		}
+	}
+}
+
+// BenchmarkBindMultipart binds a multipart form carrying text fields and a
+// small file, which is the shape of a typical upload endpoint.
+type MultipartStruct struct {
+	Name   string                `body:"name"`
+	Email  string                `body:"email"`
+	Avatar *multipart.FileHeader `body:"avatar"`
+}
+
+func multipartFixture(b *testing.B) (string, []byte) {
+	b.Helper()
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("name", "Alice")
+	_ = w.WriteField("email", "alice@example.com")
+	part, err := w.CreateFormFile("avatar", "avatar.png")
+	if err != nil {
+		b.Fatalf("creating file part: %v", err)
+	}
+	if _, err := part.Write(bytes.Repeat([]byte("x"), 4096)); err != nil {
+		b.Fatalf("writing file part: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		b.Fatalf("closing writer: %v", err)
+	}
+	return w.FormDataContentType(), buf.Bytes()
+}
+
+func BenchmarkBindMultipart(b *testing.B) {
+	contentType, body := multipartFixture(b)
+
+	r := httptest.NewRequest("POST", "/upload", bytes.NewReader(body))
+	r.Header.Set("Content-Type", contentType)
+
+	var probe MultipartStruct
+	if err := Bind(r, &probe); err != nil {
+		b.Fatalf("Failed to bind multipart form: %v", err)
+	}
+	requireBound(b, "Name", probe.Name, "Alice")
+	if probe.Avatar == nil {
+		b.Fatal("fixture binds no file")
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+
+		var s MultipartStruct
+		if err := Bind(r, &s); err != nil {
+			b.Fatalf("Failed to bind multipart form: %v", err)
 		}
 	}
 }

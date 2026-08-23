@@ -25,6 +25,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -780,6 +782,13 @@ func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (ma
 		}
 		return reqBody, nil
 
+	case ct == "multipart/form-data":
+		reqBody, err := parseMultipartBody(r.Header.Get("Content-Type"), bodyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid multipart form: %w", ErrMalformedBody, err)
+		}
+		return reqBody, nil
+
 	case ct == "application/x-www-form-urlencoded":
 		reqBody = make(map[string]interface{})
 		err := r.ParseForm()
@@ -799,11 +808,100 @@ func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (ma
 	return make(map[string]interface{}), nil
 }
 
+// fileHeaderType and fileHeaderSliceType are the destinations an uploaded file
+// binds to.
+var (
+	fileHeaderType      = reflect.TypeOf((*multipart.FileHeader)(nil))
+	fileHeaderSliceType = reflect.TypeOf([]*multipart.FileHeader(nil))
+)
+
+// parseMultipartBody reads a multipart form into the same shape the other body
+// formats produce: text parts as strings, and file parts as *FileHeader.
+//
+// The whole body has already been read and bounded by MaxBodySize, so the
+// parser is given that same allowance and never spills a part to a temporary
+// file. Raise MaxBodySize on an endpoint that accepts uploads.
+func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]interface{}, error) {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, err
+	}
+	boundary, ok := params["boundary"]
+	if !ok {
+		return nil, errors.New("no boundary in Content-Type")
+	}
+
+	// The body is already in memory and within the limit, so allow the parser
+	// to keep all of it there rather than writing parts to disk.
+	maxMemory := int64(len(bodyBytes)) + 1
+
+	form, err := multipart.NewReader(bytes.NewReader(bodyBytes), boundary).ReadForm(maxMemory)
+	if err != nil {
+		return nil, err
+	}
+
+	reqBody := make(map[string]interface{}, len(form.Value)+len(form.File))
+	for name, values := range form.Value {
+		if len(values) == 1 {
+			reqBody[name] = values[0]
+		} else {
+			reqBody[name] = values
+		}
+	}
+	for name, files := range form.File {
+		if len(files) == 1 {
+			reqBody[name] = files[0]
+		} else {
+			reqBody[name] = files
+		}
+	}
+	return reqBody, nil
+}
+
+// setFileHeader binds an uploaded file, or a set of them, to a field declared
+// as *multipart.FileHeader or []*multipart.FileHeader. Reports whether the
+// value was a file part at all.
+func setFileHeader(field reflect.Value, value interface{}) (bool, error) {
+	single, isSingle := value.(*multipart.FileHeader)
+	many, isMany := value.([]*multipart.FileHeader)
+	if !isSingle && !isMany {
+		return false, nil
+	}
+
+	switch field.Type() {
+	case fileHeaderType:
+		if isMany {
+			// More than one part was sent for a field that takes one file.
+			if len(many) == 0 {
+				return true, errors.New("no file in upload")
+			}
+			single = many[0]
+		}
+		field.Set(reflect.ValueOf(single))
+		return true, nil
+
+	case fileHeaderSliceType:
+		if isSingle {
+			many = []*multipart.FileHeader{single}
+		}
+		field.Set(reflect.ValueOf(many))
+		return true, nil
+
+	default:
+		return true, fmt.Errorf("cannot bind an uploaded file to %s", field.Type())
+	}
+}
+
 // setField sets the appropriate value on the given reflect.Value field
 func setField(field reflect.Value, value interface{}) error {
 	// Handle nil value
 	if value == nil {
 		return nil
+	}
+
+	// An uploaded file is not converted, it is handed over as it arrived.
+	if handled, err := setFileHeader(field, value); handled {
+		return err
 	}
 
 	// Handle TextUnmarshaler interface

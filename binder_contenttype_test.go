@@ -39,13 +39,13 @@ func TestJSONContentTypeVariants(t *testing.T) {
 	}
 }
 
-// Types that do not carry JSON must not be parsed as JSON.
+// Types that do not carry JSON must not be parsed as JSON. Multipart is
+// absent because it is a body format binder does parse, just not as JSON.
 func TestNonJSONContentTypesNotParsed(t *testing.T) {
 	nonJSON := []string{
 		"text/plain",
 		"application/xml",
 		"application/octet-stream",
-		"multipart/form-data; boundary=x",
 		"application/jsonp",    // not a suffix, a different subtype
 		"application/json-rpc", // likewise
 		"",
