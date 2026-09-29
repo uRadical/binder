@@ -324,10 +324,6 @@ func demoMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
-	// Cap request bodies for every call that does not override it. The
-	// default is 10 MB; this API has no need for anything that large.
-	binder.MaxBodySize = 1 << 20
-
 	mux := http.NewServeMux()
 
 	// API routes demonstrating different binding scenarios

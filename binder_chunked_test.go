@@ -107,15 +107,13 @@ func TestChunkedBodySatisfiesRequired(t *testing.T) {
 // The size cap still applies when no length is declared - this is the case
 // the Content-Length check could never have caught.
 func TestChunkedBodyStillCapped(t *testing.T) {
-	withMaxBodySize(t, 1024)
-
 	var got struct {
 		Data string `body:"data"`
 	}
 	var bindErr error
 
 	serveChunked(t, "application/json", jsonBodyOfSize(64<<10), func(r *http.Request) {
-		bindErr = Bind(r, &got)
+		bindErr = BindWithOptions(r, &got, BindOptions{MaxBodySize: 1024})
 	})
 
 	if !errors.Is(bindErr, ErrBodyTooLarge) {

@@ -32,9 +32,7 @@ func TestBindWithOptionsZeroValueMatchesBind(t *testing.T) {
 	}
 }
 
-func TestOptionsMaxBodySizeOverridesPackage(t *testing.T) {
-	withMaxBodySize(t, 64<<10) // generous package-level setting
-
+func TestOptionsMaxBodySize(t *testing.T) {
 	r := httptest.NewRequest("POST", "/u", strings.NewReader(jsonBodyOfSize(4096)))
 	r.Header.Set("Content-Type", "application/json")
 
@@ -42,35 +40,6 @@ func TestOptionsMaxBodySizeOverridesPackage(t *testing.T) {
 	err := BindWithOptions(r, &got, BindOptions{MaxBodySize: 1024})
 	if !errors.Is(err, ErrBodyTooLarge) {
 		t.Fatalf("per-call limit of 1024 against a 4096 byte body: got %v, want ErrBodyTooLarge", err)
-	}
-}
-
-// A negative per-call limit lifts a package-level limit for one call.
-func TestOptionsNegativeMaxBodySizeDisablesLimit(t *testing.T) {
-	withMaxBodySize(t, 1024)
-
-	r := httptest.NewRequest("POST", "/u", strings.NewReader(jsonBodyOfSize(8192)))
-	r.Header.Set("Content-Type", "application/json")
-
-	var got sizedRequest
-	if err := BindWithOptions(r, &got, BindOptions{MaxBodySize: -1}); err != nil {
-		t.Fatalf("negative per-call limit: got error %v, want nil", err)
-	}
-	if got.Data == "" {
-		t.Error("body was not bound with the per-call limit disabled")
-	}
-}
-
-// Zero leaves the package setting in force.
-func TestOptionsZeroMaxBodySizeInheritsPackage(t *testing.T) {
-	withMaxBodySize(t, 1024)
-
-	r := httptest.NewRequest("POST", "/u", strings.NewReader(jsonBodyOfSize(4096)))
-	r.Header.Set("Content-Type", "application/json")
-
-	var got sizedRequest
-	if err := BindWithOptions(r, &got, BindOptions{}); !errors.Is(err, ErrBodyTooLarge) {
-		t.Fatalf("zero per-call limit: got %v, want the package limit to apply", err)
 	}
 }
 

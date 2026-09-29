@@ -145,7 +145,7 @@ f, err := req.Avatar.Open()
 A field given one file binds a one-element slice; a field declared as a single
 file takes the first part sent.
 
-Uploads count against `MaxBodySize` like any other body, and the whole request
+Uploads count against the body size limit like any other body, and the whole request
 is held in memory rather than spilled to a temporary file. Raise the limit
 deliberately on an upload endpoint:
 
@@ -285,20 +285,20 @@ if err := binder.BindWithOptions(r, &req, opts); err != nil {
 
 | Field | Default | Effect |
 |-------|---------|--------|
-| `MaxBodySize` | `0` | Overrides the package-level `binder.MaxBodySize` for this call. Zero leaves the package setting in force; a negative value removes the limit for this call alone. |
+| `MaxBodySize` | `0` | The largest body, in bytes, this call reads. Zero applies `binder.DefaultMaxBodySize` (10 MB); a negative value removes the limit. |
 | `DisallowUnknownFields` | `false` | Reports each top-level body key that no field of the target binds, as a `BindErrors` entry wrapping `ErrUnknownField`. Keys nested inside objects are not inspected. |
 
 ### Request Size Limits
 
-Bodies are capped at `binder.MaxBodySize`, which defaults to 10 MB, so a single
-request cannot exhaust server memory. Set it during program initialisation to
-change the default for every call:
+`Bind` caps bodies at `binder.DefaultMaxBodySize`, 10 MB, so a single request
+cannot exhaust server memory. To use a different limit, pass it per call:
 
 ```go
-binder.MaxBodySize = 2 << 20 // 2 MB
+binder.BindWithOptions(r, &req, binder.BindOptions{MaxBodySize: 2 << 20}) // 2 MB
 ```
 
-Set it to zero or less to remove the limit entirely. An oversized body is
+A `MaxBodySize` of zero applies the default, so setting only another option
+never removes the cap. A negative value removes the limit. An oversized body is
 rejected with `ErrBodyTooLarge` rather than truncated.
 
 ## Error Handling
@@ -348,7 +348,7 @@ end binding at once, since nothing bound after them could be trusted:
 | Error | Meaning | Suggested status |
 |-------|---------|------------------|
 | `ErrMalformedBody` | The body could not be parsed as its `Content-Type` declares | 400 Bad Request |
-| `ErrBodyTooLarge` | The body exceeded `MaxBodySize` | 413 Content Too Large |
+| `ErrBodyTooLarge` | The body exceeded the size limit | 413 Content Too Large |
 | `ErrInvalidTarget` | The target was not a non-nil pointer to a struct, or the request was nil | 500 Internal Server Error |
 
 Two further sentinels are carried by individual `BindErrors` entries rather
@@ -420,7 +420,7 @@ This library has been designed with production use in mind:
 - **Bounded reads** - Request bodies are capped, so one request cannot exhaust memory
 - **Errors are never swallowed** - A body that fails to parse is reported, not ignored
 - **Request body preservation** - The body is restored after binding, so later handlers can read it again
-- **Configurable per call** - `BindWithOptions` avoids reaching for package-level settings
+- **Configurable per call** - `BindWithOptions` sets limits per endpoint; there is no package-level state to change
 - **Well-tested** - About 95% statement coverage, run under the race detector, with fuzz targets for the reflection paths
 
 ## When to Use Binder
@@ -569,8 +569,8 @@ The following are **not** part of the contract and may change in any release:
 
 - The text of error messages. Only the sentinels and `BindError`'s fields are
   stable; parsing a message is not supported.
-- The default value of `MaxBodySize`. Set it explicitly if your service
-  depends on a particular limit.
+- The value of `DefaultMaxBodySize`. Pass `BindOptions.MaxBodySize` if your
+  service depends on a particular limit.
 - The order in which fields are bound, and how many allocations binding takes.
 
 ### Go Version Support

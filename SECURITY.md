@@ -39,7 +39,7 @@ These are in scope:
 - A panic reachable from `Bind` with any request and any target struct. Binding
   should always return an error instead.
 - Unbounded resource use: memory, CPU or goroutines growing with attacker
-  controlled input beyond `MaxBodySize`.
+  controlled input beyond the body size limit.
 - Binding a value into a field that should not have received it, or reporting
   success while a field is silently wrong.
 - A data race in the shared field cache.
@@ -49,17 +49,20 @@ These are not:
 - A panic caused by a target that breaks `Bind`'s contract, such as a nil
   pointer or a non-struct. Those return `ErrInvalidTarget` by design, and
   passing one is a programming error rather than an attack.
-- Resource use within a configured `MaxBodySize`. Set it to suit your service;
-  the default is 10 MB.
+- Resource use within the body size limit. Set `BindOptions.MaxBodySize` to
+  suit your service; the default is 10 MB.
 - Behaviour of a `Validator` implementation, which is your code.
 - Anything requiring the attacker to control the target struct definition,
   which is compiled in.
 
 ## Hardening Notes
 
-- `MaxBodySize` bounds every read. It defaults to 10 MB and applies per call
-  through `BindOptions.MaxBodySize`. Setting it to zero removes the limit,
-  which is not recommended for an endpoint reachable from the internet.
+- Every body read is bounded. `Bind` applies `DefaultMaxBodySize`, 10 MB, and
+  `BindOptions.MaxBodySize` sets a limit per call. A negative value removes
+  the limit, which is not recommended for an endpoint reachable from the
+  internet.
 - `Bind` restores the request body after reading it, so middleware downstream
   still sees the bytes. The buffered copy is held for the life of the request.
-- multipart/form-data is not parsed. File uploads need handling before binding.
+- multipart/form-data bodies, file uploads included, are read into memory in
+  full and never spilled to disk, so the body size limit bounds them too.
+  Raise it deliberately on an upload endpoint.

@@ -43,10 +43,15 @@ func multipartBody(t *testing.T, fields map[string][]string, files map[string][]
 
 func bindMultipart(t *testing.T, target interface{}, fields map[string][]string, files map[string][]string) error {
 	t.Helper()
+	return bindMultipartLimit(t, target, fields, files, DefaultMaxBodySize)
+}
+
+func bindMultipartLimit(t *testing.T, target interface{}, fields map[string][]string, files map[string][]string, limit int64) error {
+	t.Helper()
 	ct, body := multipartBody(t, fields, files)
 	r := httptest.NewRequest("POST", "/upload", bytes.NewReader(body))
 	r.Header.Set("Content-Type", ct)
-	return Bind(r, target)
+	return BindWithOptions(r, target, BindOptions{MaxBodySize: limit})
 }
 
 // Text parts of a multipart form bind like any other body field.
@@ -177,27 +182,23 @@ func TestMultipartRequiredFile(t *testing.T) {
 	}
 }
 
-// An upload counts against MaxBodySize, so a service accepting files must
-// raise it deliberately.
+// An upload counts against the body size limit, so a service accepting files
+// must raise it deliberately.
 func TestMultipartRespectsBodyLimit(t *testing.T) {
-	withMaxBodySize(t, 512)
-
 	var got struct {
 		Doc *multipart.FileHeader `body:"doc"`
 	}
-	err := bindMultipart(t, &got, nil, map[string][]string{"doc": {strings.Repeat("x", 4096)}})
+	err := bindMultipartLimit(t, &got, nil, map[string][]string{"doc": {strings.Repeat("x", 4096)}}, 512)
 	if !errors.Is(err, ErrBodyTooLarge) {
 		t.Fatalf("got %v, want ErrBodyTooLarge", err)
 	}
 }
 
 func TestMultipartWithinBodyLimit(t *testing.T) {
-	withMaxBodySize(t, 64<<10)
-
 	var got struct {
 		Doc *multipart.FileHeader `body:"doc"`
 	}
-	if err := bindMultipart(t, &got, nil, map[string][]string{"doc": {strings.Repeat("x", 4096)}}); err != nil {
+	if err := bindMultipartLimit(t, &got, nil, map[string][]string{"doc": {strings.Repeat("x", 4096)}}, 64<<10); err != nil {
 		t.Fatalf("got error %v, want nil", err)
 	}
 	if got.Doc == nil || got.Doc.Size != 4096 {

@@ -200,20 +200,13 @@ type Validator interface {
 	Validate(ctx context.Context) error
 }
 
-// DefaultMaxBodySize is the body size limit Bind applies when MaxBodySize has
-// not been changed.
+// DefaultMaxBodySize is the largest request body, in bytes, that Bind reads,
+// and the limit BindWithOptions applies when BindOptions.MaxBodySize is zero.
+// A larger body is rejected with ErrBodyTooLarge rather than buffered, so that
+// a single request cannot exhaust server memory.
 const DefaultMaxBodySize int64 = 10 << 20 // 10 MB
 
-// MaxBodySize is the largest request body, in bytes, that Bind will read.
-// A larger body is rejected with ErrBodyTooLarge rather than buffered, so that
-// a single request cannot exhaust server memory. A value of zero or less
-// disables the limit and restores the previous unbounded behaviour.
-//
-// It is read on every call to Bind, so set it during program initialisation
-// rather than while requests are in flight.
-var MaxBodySize = DefaultMaxBodySize
-
-// ErrBodyTooLarge is returned by Bind when a request body exceeds MaxBodySize.
+// ErrBodyTooLarge is returned when a request body exceeds the body size limit.
 // Handlers should treat it as http.StatusRequestEntityTooLarge:
 //
 //	if errors.Is(err, binder.ErrBodyTooLarge) {
@@ -285,9 +278,8 @@ func (e *BindError) Unwrap() error { return e.Err }
 // BindOptions configures a single call to BindWithOptions. The zero value
 // behaves exactly as Bind does.
 type BindOptions struct {
-	// MaxBodySize overrides the package-level MaxBodySize for this call.
-	// Zero leaves the package setting in force, and a negative value removes
-	// the limit for this call alone.
+	// MaxBodySize is the largest request body, in bytes, this call reads.
+	// Zero applies DefaultMaxBodySize, and a negative value removes the limit.
 	MaxBodySize int64
 
 	// DisallowUnknownFields makes binding fail with ErrUnknownField when the
@@ -296,11 +288,12 @@ type BindOptions struct {
 	DisallowUnknownFields bool
 }
 
-// maxBodySize resolves the body limit for a call, falling back to the
-// package-level setting when the option is left at its zero value.
+// maxBodySize resolves the body limit for a call. Zero means the default
+// rather than no limit, so that setting only another option cannot silently
+// remove the cap.
 func (o BindOptions) maxBodySize() int64 {
 	if o.MaxBodySize == 0 {
-		return MaxBodySize
+		return DefaultMaxBodySize
 	}
 	return o.MaxBodySize
 }
@@ -343,15 +336,15 @@ func (o BindOptions) maxBodySize() int64 {
 //   - The target is not a non-nil pointer to a struct (see ErrInvalidTarget)
 //   - Type conversion fails
 //   - Required fields are missing
-//   - The request body exceeds MaxBodySize (see ErrBodyTooLarge)
+//   - The request body exceeds DefaultMaxBodySize (see ErrBodyTooLarge)
 //   - The request body cannot be parsed (see ErrMalformedBody)
 //   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i interface{}) error {
-	return BindWithOptions(r, i, BindOptions{})
+	return BindWithOptions(r, i, BindOptions{MaxBodySize: DefaultMaxBodySize})
 }
 
-// BindWithOptions is Bind with per-call configuration. Bind is equivalent to
-// passing the zero BindOptions.
+// BindWithOptions is Bind with per-call configuration. The zero BindOptions
+// behaves exactly as Bind does.
 //
 // Example:
 //
@@ -574,7 +567,7 @@ func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]stru
 }
 
 // readBody reads the whole request body, refusing bodies larger than
-// MaxBodySize. The limit is enforced while reading rather than trusting
+// limit. The limit is enforced while reading rather than trusting
 // Content-Length, which the client controls and may understate. An oversized
 // body is reported as an error rather than truncated, so that a request is
 // never bound from a partial body.
@@ -1012,9 +1005,9 @@ var (
 // parseMultipartBody reads a multipart form into the same shape the other body
 // formats produce: text parts as strings, and file parts as *FileHeader.
 //
-// The whole body has already been read and bounded by MaxBodySize, so the
+// The whole body has already been read and bounded by the size limit, so the
 // parser is given that same allowance and never spills a part to a temporary
-// file. Raise MaxBodySize on an endpoint that accepts uploads.
+// file. Raise BindOptions.MaxBodySize on an endpoint that accepts uploads.
 func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]interface{}, error) {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
