@@ -26,6 +26,13 @@ go run main.go
 
 The server will start on `http://localhost:8080`
 
+`main_test.go` exercises every endpoint and error case below through the same
+routes, and checks the shared store under concurrent requests:
+
+```bash
+go test -race .
+```
+
 ## API Endpoints
 
 ### 1. Get User by ID

@@ -256,3 +256,37 @@ func TestMultipartAlongsideOtherSources(t *testing.T) {
 		t.Errorf("bound %+v, want every source populated", got)
 	}
 }
+
+// Every failing field of a multipart body is reported, whether a text part
+// that does not convert, a file sent to a field that is not a FileHeader, or a
+// required file that is missing.
+func TestMultipartReportsEveryFieldError(t *testing.T) {
+	var got struct {
+		Age    int                   `body:"age"`
+		Count  int                   `body:"count"`
+		Avatar string                `body:"avatar"`
+		Doc    *multipart.FileHeader `body:"doc,required"`
+		Name   string                `body:"name"`
+	}
+	err := bindMultipart(t, &got,
+		map[string][]string{"age": {"old"}, "count": {"many"}, "name": {"Ann"}},
+		map[string][]string{"avatar": {"contents"}})
+
+	var errs BindErrors
+	if !errors.As(err, &errs) {
+		t.Fatalf("got %v (%T), want BindErrors", err, err)
+	}
+	var names []string
+	for _, e := range errs {
+		names = append(names, e.Name)
+	}
+	if got, want := strings.Join(names, ","), "age,count,avatar,doc"; got != want {
+		t.Fatalf("failing fields = %s, want %s\nerror: %v", got, want, err)
+	}
+	if !errors.Is(errs[3], ErrMissingRequired) {
+		t.Errorf("doc: got %v, want ErrMissingRequired", errs[3])
+	}
+	if got.Name != "Ann" {
+		t.Errorf("Name = %q, want the valid field bound despite the failures", got.Name)
+	}
+}

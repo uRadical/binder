@@ -323,7 +323,8 @@ func demoMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func main() {
+// routes wires the API's handlers, wrapped in the demo middleware.
+func routes() http.Handler {
 	mux := http.NewServeMux()
 
 	// API routes demonstrating different binding scenarios
@@ -333,8 +334,11 @@ func main() {
 	mux.HandleFunc("PUT /users/{id}", updateUser)    // Path + body (partial updates)
 	mux.HandleFunc("DELETE /users/{id}", deleteUser) // Path parameter
 
-	// Wrap with demo middleware
-	handler := demoMiddleware(mux)
+	return demoMiddleware(mux)
+}
+
+func main() {
+	handler := routes()
 
 	fmt.Println("🚀 Binder Example Server starting on :8080")
 	fmt.Println()
