@@ -14,7 +14,7 @@ This example demonstrates how to use the Binder library to build a complete REST
 - **Per-call options** - `BindWithOptions` for body limits and unknown fields
 - **Validation** - Using the `Validator` interface
 - **Partial updates** - Using `omitempty` for PATCH-like behavior
-- **Error handling** - Choosing a status code from the error
+- **Error handling** - One function turning every binding error into a response
 
 ## Running the Example
 
@@ -66,7 +66,7 @@ curl -X POST http://localhost:8080/users \
 - `body:"email"` - Required field from JSON
 - `body:"active"` - Boolean from JSON
 - `body:"tags"` - Slice of strings from JSON
-- `Validate()` method - Custom validation after binding
+- `Validate(ctx)` method - Custom validation after binding
 
 ### 4. Update User (Partial)
 ```bash
@@ -116,47 +116,82 @@ type CreateUserRequest struct {
     // ... other fields
 }
 
-// Implement binder.Validator interface
-func (r CreateUserRequest) Validate() error {
+// ValidationErrors is the application's own error type: problems keyed by
+// the field name the client sent.
+type ValidationErrors map[string]string
+
+func (v ValidationErrors) Error() string {
+    return fmt.Sprintf("%d fields failed validation", len(v))
+}
+
+// Implement binder.Validator interface, checking every rule
+func (r CreateUserRequest) Validate(ctx context.Context) error {
+    errs := ValidationErrors{}
     if !strings.Contains(r.Email, "@") {
-        return fmt.Errorf("email %q is not a valid address", r.Email)
+        errs["email"] = "is not a valid address"
+    }
+    if len(r.Tags) > 5 {
+        errs["tags"] = "must have at most 5 entries"
+    }
+    if len(errs) > 0 {
+        return errs
     }
     return nil
 }
 ```
 
-A missing required value reports which input was at fault:
-
-```json
-{
-  "error": "missing required field Name: no body value named \"name\"",
-  "field": "Name",
-  "source": "body",
-  "parameter": "name"
-}
-```
+What `Validate` returns is yours. Binder hands it back wrapped, so returning a
+type of your own lets `writeBindError` recognise it with `errors.As`.
 
 ### Error Handling Pattern
 
-Not every binding failure is the client's fault, so they do not all deserve a
-400. The example routes each kind to the status that fits, and uses
-`*binder.BindError` to say which input was at fault:
+Handlers call `binder.Bind` directly and pass any error to `writeBindError`,
+which an application writes once. Binder reports what went wrong as types to
+match; the response format and status codes are the application's choice:
 
 ```go
-switch {
-case errors.Is(err, binder.ErrInvalidTarget):
-    // A bug in this handler, not a bad request.
-    respondError(w, "internal server error", http.StatusInternalServerError)
-
-case errors.Is(err, binder.ErrBodyTooLarge):
-    respondError(w, err.Error(), http.StatusRequestEntityTooLarge)
-
-default:
-    var bindErr *binder.BindError
-    if errors.As(err, &bindErr) {
-        // bindErr.Field, .Source and .Name identify the offending input
+func createUser(w http.ResponseWriter, r *http.Request) {
+    var req CreateUserRequest
+    if err := binder.Bind(r, &req); err != nil {
+        writeBindError(w, err)
+        return
     }
-    respondError(w, err.Error(), http.StatusBadRequest)
+    // ...
+}
+
+func writeBindError(w http.ResponseWriter, err error) {
+    var bindErrs binder.BindErrors
+    var valErrs ValidationErrors
+
+    switch {
+    case errors.As(err, &bindErrs):
+        // Every field that failed, keyed by the name the client sent.
+        fields := map[string]string{}
+        for _, e := range bindErrs {
+            switch {
+            case errors.Is(e, binder.ErrMissingRequired):
+                fields[e.Name] = "required"
+            case errors.Is(e, binder.ErrUnknownField):
+                fields[e.Name] = "unknown field"
+            default:
+                fields[e.Name] = "invalid value"
+            }
+        }
+        respondJSON(w, map[string]interface{}{"errors": fields}, http.StatusBadRequest)
+
+    case errors.As(err, &valErrs):
+        respondJSON(w, map[string]interface{}{"errors": valErrs}, http.StatusUnprocessableEntity)
+
+    case errors.Is(err, binder.ErrBodyTooLarge):
+        respondError(w, "request body too large", http.StatusRequestEntityTooLarge)
+
+    case errors.Is(err, binder.ErrInvalidTarget):
+        // A bug in this handler, not a bad request.
+        respondError(w, "internal server error", http.StatusInternalServerError)
+
+    default:
+        respondError(w, err.Error(), http.StatusBadRequest)
+    }
 }
 ```
 
@@ -178,7 +213,7 @@ opts := binder.BindOptions{
 curl -X POST http://localhost:8080/users \
   -H "Content-Type: application/json" \
   -d '{"name":"Carol","email":"carol@example.com","surprise":1}'
-# {"error":"unknown field in request body: \"surprise\""}
+# 400 {"errors":{"surprise":"unknown field"}}
 ```
 
 ## Form Data Example
@@ -200,7 +235,7 @@ Binder automatically detects the content type and parses accordingly.
 3. **Omitempty** - Fields marked `omitempty` are optional
 4. **Multiple Sources** - Combining path, query, body, and cookie data in one struct
 5. **Content-Type Awareness** - Same handler works for JSON and form data
-6. **Custom Validation** - Implementing the `Validator` interface
+6. **Custom Validation** - Implementing the `Validator` interface with an error type of your own
 
 ## Testing with Different Tools
 
@@ -223,16 +258,31 @@ Try these to see error handling:
 ```bash
 # Invalid user ID (non-integer)
 curl http://localhost:8080/users/abc
+# 400 {"errors":{"id":"invalid value"}}
 
-# Missing required fields
+# Missing required fields: both are reported
 curl -X POST http://localhost:8080/users \
   -H "Content-Type: application/json" \
   -d '{}'
+# 400 {"errors":{"email":"required","name":"required"}}
 
-# Invalid JSON
+# Several problems at once: a bad value and an unknown key
+curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Carol","email":"carol@example.com","active":"maybe","surprise":1}'
+# 400 {"errors":{"active":"invalid value","surprise":"unknown field"}}
+
+# Binds, but fails validation: every broken rule is reported
+curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Carol","email":"nope","tags":["a","b","c","d","e","f"]}'
+# 422 {"errors":{"email":"is not a valid address","tags":"must have at most 5 entries"}}
+
+# Invalid JSON: the request as a whole is rejected
 curl -X POST http://localhost:8080/users \
   -H "Content-Type: application/json" \
   -d 'invalid json'
+# 400 {"error":"malformed request body: invalid JSON: ..."}
 ```
 
 ## Code Structure

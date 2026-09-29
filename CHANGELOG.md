@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Upgrading
+
+- **`Validator` now takes a context.** Change `Validate() error` to
+  `Validate(ctx context.Context) error`; rules that do not need the context
+  can ignore it. This breaks existing implementations: a type still declaring
+  `Validate() error` no longer satisfies `Validator` and is not validated.
+- **Field failures are returned as `BindErrors`.** Bind used to return the
+  first field failure as a `*BindError`; it now attempts every field and
+  returns all failures as `BindErrors`, even when there is only one. Code
+  asserting `err.(*binder.BindError)` no longer matches; use
+  `errors.As(err, &bindErrs)` to get the list, or `errors.As` with a
+  `*BindError` for the first failure.
+- **Unknown fields are `BindErrors` entries.** `DisallowUnknownFields` used to
+  return one error listing every unknown key; each key is now its own entry,
+  wrapping `ErrUnknownField`. `errors.Is(err, ErrUnknownField)` still works.
+- **Nested failures are named by path.** A failure inside a nested struct or
+  slice was reported as a message on the parent field; it is now its own
+  entry with `Field` and `Name` such as `Inner.A` and `inner.a`, or `IDs[1]`
+  and `id[1]`.
+
+### Added
+
+- `BindErrors`, the list of field failures Bind returns.
+
+### Changed
+
+- `Validator.Validate` receives `r.Context()`, so rules that depend on the
+  caller, a tenant or a deadline can run during binding.
+- Unknown fields are reported alongside field failures rather than ending
+  binding.
+
+- The documentation no longer says binder does not validate. It runs the
+  validation a type defines; what it does not provide is a rule language.
+
 ## [1.1.0] - 2026-08-23
 
 No exported function changed shape, so this release is source compatible. It

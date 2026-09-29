@@ -17,7 +17,8 @@ import (
 // write into fields directly or skip the members nothing binds, so it returns
 // the map for the caller to bind from, as earlier releases did. The values it
 // produces are the same either way.
-func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool) (map[string]interface{}, []bool, []string, error) {
+func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (map[string]interface{}, []bool, []string, error) {
+	_ = errs // fields are bound, and fail, after decoding
 	_ = info
 	_ = val
 	_ = wanted      // no selective decoding without jsontext

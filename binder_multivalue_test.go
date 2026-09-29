@@ -126,11 +126,8 @@ func TestBadRepeatedElementReportsField(t *testing.T) {
 	if !errors.As(err, &bindErr) {
 		t.Fatalf("errors.As(*BindError) = false for %v", err)
 	}
-	if bindErr.Field != "IDs" {
-		t.Errorf("Field = %q, want %q", bindErr.Field, "IDs")
-	}
-	if !strings.Contains(err.Error(), "index 1") {
-		t.Errorf("error %q does not identify the failing element", err)
+	if bindErr.Field != "IDs[1]" || bindErr.Name != "id[1]" {
+		t.Errorf("Field, Name = %q, %q, want %q, %q", bindErr.Field, bindErr.Name, "IDs[1]", "id[1]")
 	}
 }
 

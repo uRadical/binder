@@ -3,6 +3,7 @@
 package binder_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -135,7 +136,7 @@ func ExampleBindWithOptions() {
 	fmt.Println(err)
 	fmt.Println(errors.Is(err, binder.ErrUnknownField))
 	// Output:
-	// unknown field in request body: "typo"
+	// unknown field "typo" in request body
 	// true
 }
 
@@ -173,7 +174,7 @@ type signup struct {
 	Age int `body:"age"`
 }
 
-func (s signup) Validate() error {
+func (s signup) Validate(ctx context.Context) error {
 	if s.Age < 18 {
 		return errors.New("must be 18 or older")
 	}

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -122,8 +123,10 @@ func jsonKindName(k jsontext.Kind) string {
 // at all.
 //
 // It reports which fields were filled, so the caller can apply required to the
-// ones that were not, and the names of members nothing binds.
-func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool) (bodyData map[string]interface{}, bound []bool, unknown []string, err error) {
+// ones that were not, and the names of members nothing binds. A member that
+// cannot be converted is recorded in errs and the walk continues; only a
+// failure to read the JSON itself is returned.
+func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (bodyData map[string]interface{}, bound []bool, unknown []string, err error) {
 	_ = wanted // the walk consults info.bodyFields directly
 	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true))
 
@@ -159,9 +162,16 @@ func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[str
 			continue
 		}
 
+		// A conversion failure has already consumed the member's value, so
+		// the walk can carry on to the next one. The field counts as bound
+		// either way: it was present, so required must not report it again.
 		fi := info.fields[index]
 		if err := decodeJSONInto(dec, val.Field(fi.Index), fi); err != nil {
-			return nil, nil, nil, err
+			var failed conversionFailure
+			if !errors.As(err, &failed) {
+				return nil, nil, nil, err
+			}
+			errs.set(info, index, fieldFailures(fi, failed.err))
 		}
 		bound[index] = true
 	}
@@ -227,7 +237,7 @@ func decodeJSONInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) er
 	if fi.OmitEmpty && isEmptyValue(value) {
 		return nil
 	}
-	return conversionError(fi, setField(field, value))
+	return conversionError(setField(field, value))
 }
 
 // decodeNumberInto writes a numeric token into a predeclared numeric field.
@@ -248,7 +258,7 @@ func decodeNumberInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) 
 		if fi.OmitEmpty && number == 0 {
 			return nil
 		}
-		return conversionError(fi, setIntChecked(field, number))
+		return conversionError(setIntChecked(field, number))
 
 	case fastUint:
 		number, err := strconv.ParseUint(string(raw), 10, 64)
@@ -258,7 +268,7 @@ func decodeNumberInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) 
 		if fi.OmitEmpty && number == 0 {
 			return nil
 		}
-		return conversionError(fi, setUintChecked(field, number))
+		return conversionError(setUintChecked(field, number))
 
 	default: // fastFloat
 		number, err := strconv.ParseFloat(string(raw), 64)
@@ -268,7 +278,7 @@ func decodeNumberInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) 
 		if fi.OmitEmpty && number == 0 {
 			return nil
 		}
-		return conversionError(fi, setFloatChecked(field, number))
+		return conversionError(setFloatChecked(field, number))
 	}
 }
 
@@ -279,16 +289,20 @@ func setFieldFromNumber(field reflect.Value, raw jsontext.Value, fi fieldInfo) e
 	if fi.OmitEmpty && isEmptyValue(number) {
 		return nil
 	}
-	return conversionError(fi, setField(field, number))
+	return conversionError(setField(field, number))
 }
 
-// conversionError marks a failure to convert a decoded value as concerning one
-// field, so that it is reported as a BindError naming it rather than as a
+// conversionFailure marks a failure to convert a decoded value as concerning
+// one field, so that it is reported as a BindError naming it rather than as a
 // malformed body. A syntax error from the decoder is a different thing and
 // stays as it is.
-func conversionError(fi fieldInfo, err error) error {
+type conversionFailure struct{ err error }
+
+func (c conversionFailure) Error() string { return c.err.Error() }
+
+func conversionError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return newBindError(fi, fmt.Sprintf("error setting field %s: %v", fi.FieldType.Name, err), err)
+	return conversionFailure{err}
 }

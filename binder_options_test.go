@@ -123,7 +123,8 @@ func TestDisallowUnknownFields(t *testing.T) {
 		if err == nil {
 			t.Fatal("got nil error")
 		}
-		if !strings.Contains(err.Error(), `"alpha", "zeta"`) {
+		want := "unknown field \"alpha\" in request body\nunknown field \"zeta\" in request body"
+		if err.Error() != want {
 			t.Errorf("error %q does not list both keys in sorted order", err)
 		}
 	})

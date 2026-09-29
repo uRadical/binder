@@ -91,7 +91,7 @@ func TestNestedBindingErrorNamesField(t *testing.T) {
 	if err == nil {
 		t.Fatal("got nil error")
 	}
-	if !strings.Contains(err.Error(), "nested field N") {
+	if !strings.Contains(err.Error(), "field I.N") {
 		t.Errorf("error %q does not name the nested field", err)
 	}
 }

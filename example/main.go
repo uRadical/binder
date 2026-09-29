@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"uradical.io/go/binder"
@@ -22,7 +24,9 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// In-memory store for the example
+// In-memory store for the example. net/http serves requests concurrently, so
+// every access to users and nextID holds mu.
+var mu sync.Mutex
 var users = map[int]User{
 	1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, CreatedAt: time.Now().Add(-24 * time.Hour)},
 	2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, CreatedAt: time.Now().Add(-48 * time.Hour)},
@@ -53,11 +57,27 @@ type CreateUserRequest struct {
 	Tags   []string `body:"tags"`
 }
 
+// ValidationErrors is this application's error type for Validate: problems
+// keyed by the field name the client sent. A type of its own lets
+// writeBindError recognise it with errors.As.
+type ValidationErrors map[string]string
+
+func (v ValidationErrors) Error() string {
+	return fmt.Sprintf("%d fields failed validation", len(v))
+}
+
 // Validate implements the binder.Validator interface. Presence is handled by
 // the required tag, so validation is left for rules binding cannot express.
-func (r CreateUserRequest) Validate() error {
+func (r CreateUserRequest) Validate(ctx context.Context) error {
+	errs := ValidationErrors{}
 	if !strings.Contains(r.Email, "@") {
-		return fmt.Errorf("email %q is not a valid address", r.Email)
+		errs["email"] = "is not a valid address"
+	}
+	if len(r.Tags) > 5 {
+		errs["tags"] = "must have at most 5 entries"
+	}
+	if len(errs) > 0 {
+		return errs
 	}
 	return nil
 }
@@ -70,50 +90,55 @@ type UpdateUserRequest struct {
 	Tags   []string `body:"tags,omitempty"`
 }
 
-// bindRequest binds a request and, on failure, answers with a status matching
-// what went wrong. Not every binding failure is the client's fault, so they do
-// not all deserve a 400.
-func bindRequest(w http.ResponseWriter, r *http.Request, target interface{}, opts binder.BindOptions) bool {
-	err := binder.BindWithOptions(r, target, opts)
-	if err == nil {
-		return true
-	}
+// writeBindError answers a request that failed to bind. An application writes
+// this once; the response format and status codes are its own choice.
+func writeBindError(w http.ResponseWriter, err error) {
+	var bindErrs binder.BindErrors
+	var valErrs ValidationErrors
 
 	switch {
+	case errors.As(err, &bindErrs):
+		// Every field that failed, keyed by the name the client sent.
+		fields := map[string]string{}
+		for _, e := range bindErrs {
+			switch {
+			case errors.Is(e, binder.ErrMissingRequired):
+				fields[e.Name] = "required"
+			case errors.Is(e, binder.ErrUnknownField):
+				fields[e.Name] = "unknown field"
+			default:
+				fields[e.Name] = "invalid value"
+			}
+		}
+		respondJSON(w, map[string]interface{}{"errors": fields}, http.StatusBadRequest)
+
+	case errors.As(err, &valErrs):
+		respondJSON(w, map[string]interface{}{"errors": valErrs}, http.StatusUnprocessableEntity)
+
+	case errors.Is(err, binder.ErrBodyTooLarge):
+		respondError(w, "request body too large", http.StatusRequestEntityTooLarge)
+
 	case errors.Is(err, binder.ErrInvalidTarget):
-		// A programming error in this handler, not a bad request.
+		// A bug in this handler, not a bad request.
 		log.Printf("bind target is wrong: %v", err)
 		respondError(w, "internal server error", http.StatusInternalServerError)
 
-	case errors.Is(err, binder.ErrBodyTooLarge):
-		respondError(w, err.Error(), http.StatusRequestEntityTooLarge)
-
 	default:
-		// A BindError names the field and the input it came from, so the
-		// response can tell the client which part of the request to fix
-		// rather than handing back one opaque string.
-		var bindErr *binder.BindError
-		if errors.As(err, &bindErr) {
-			respondJSON(w, map[string]interface{}{
-				"error":     bindErr.Error(),
-				"field":     bindErr.Field,
-				"source":    bindErr.Source,
-				"parameter": bindErr.Name,
-			}, http.StatusBadRequest)
-			return false
-		}
 		respondError(w, err.Error(), http.StatusBadRequest)
 	}
-	return false
 }
 
 // HTTP Handlers
 
 func getUser(w http.ResponseWriter, r *http.Request) {
 	var req GetUserRequest
-	if !bindRequest(w, r, &req, binder.BindOptions{}) {
+	if err := binder.Bind(r, &req); err != nil {
+		writeBindError(w, err)
 		return
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	user, exists := users[req.ID]
 	if !exists {
@@ -126,7 +151,8 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 
 func listUsers(w http.ResponseWriter, r *http.Request) {
 	var req ListUsersRequest
-	if !bindRequest(w, r, &req, binder.BindOptions{}) {
+	if err := binder.Bind(r, &req); err != nil {
+		writeBindError(w, err)
 		return
 	}
 
@@ -143,6 +169,8 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 		limit = 10 // default limit
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	for _, user := range users {
 		// Filter by active status if provided
 		if req.Active != nil && user.Active != *req.Active {
@@ -177,9 +205,13 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		MaxBodySize:           64 << 10,
 		DisallowUnknownFields: true,
 	}
-	if !bindRequest(w, r, &req, opts) {
+	if err := binder.BindWithOptions(r, &req, opts); err != nil {
+		writeBindError(w, err)
 		return
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Create new user
 	user := User{
@@ -199,9 +231,13 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 
 func updateUser(w http.ResponseWriter, r *http.Request) {
 	var req UpdateUserRequest
-	if !bindRequest(w, r, &req, binder.BindOptions{}) {
+	if err := binder.Bind(r, &req); err != nil {
+		writeBindError(w, err)
 		return
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	user, exists := users[req.ID]
 	if !exists {
@@ -229,9 +265,13 @@ func updateUser(w http.ResponseWriter, r *http.Request) {
 
 func deleteUser(w http.ResponseWriter, r *http.Request) {
 	var req GetUserRequest
-	if !bindRequest(w, r, &req, binder.BindOptions{}) {
+	if err := binder.Bind(r, &req); err != nil {
+		writeBindError(w, err)
 		return
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	if _, exists := users[req.ID]; !exists {
 		respondError(w, "User not found", http.StatusNotFound)

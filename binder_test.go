@@ -2,7 +2,9 @@ package binder
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +35,7 @@ type ValidationStruct struct {
 	Value int `path:"value"`
 }
 
-func (v ValidationStruct) Validate() error {
+func (v ValidationStruct) Validate(context.Context) error {
 	if v.Value < 0 {
 		return fmt.Errorf("value must be positive")
 	}
@@ -826,4 +828,50 @@ func BenchmarkBindWithoutCache(b *testing.B) {
 		var p params
 		_ = Bind(req, &p)
 	}
+}
+
+type ctxKey struct{}
+
+type ctxValidated struct {
+	Owner string `query:"owner"`
+}
+
+func (v ctxValidated) Validate(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if user, _ := ctx.Value(ctxKey{}).(string); user != v.Owner {
+		return fmt.Errorf("owner %q is not the caller", v.Owner)
+	}
+	return nil
+}
+
+func TestBindValidatorContext(t *testing.T) {
+	newReq := func(ctx context.Context) *http.Request {
+		return httptest.NewRequest("GET", "/?owner=ann", nil).WithContext(ctx)
+	}
+
+	t.Run("receives request context", func(t *testing.T) {
+		var v ctxValidated
+		if err := Bind(newReq(context.WithValue(context.Background(), ctxKey{}, "ann")), &v); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+	})
+
+	t.Run("rule fails", func(t *testing.T) {
+		var v ctxValidated
+		err := Bind(newReq(context.WithValue(context.Background(), ctxKey{}, "bob")), &v)
+		if err == nil || !strings.HasPrefix(err.Error(), "validation failed: ") {
+			t.Fatalf("got %v, want a validation error", err)
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var v ctxValidated
+		if err := Bind(newReq(ctx), &v); !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	})
 }

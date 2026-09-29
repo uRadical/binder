@@ -6,7 +6,7 @@ A focused, zero-dependency library that does one thing well: binding HTTP reques
 
 ## Why Binder?
 
-In REST APIs, you constantly need to extract data from requests - path parameters, query strings, JSON bodies, forms, cookies. Binder handles this tedious work with minimal overhead and maximum clarity.
+In REST APIs, you constantly need to extract data from requests - path parameters, query strings, JSON bodies, forms, file uploads, cookies and headers. Binder handles this tedious work with minimal overhead and maximum clarity.
 
 ```go
 // Instead of writing this everywhere...
@@ -27,11 +27,11 @@ err := binder.Bind(r, &req)
 
 ## Design Philosophy
 
-**Do one thing, do it well.** Binder only binds data - it doesn't validate, it doesn't log, it doesn't transform. This focused approach means:
+**Do one thing, do it well.** Binder turns a request into a valid struct: it binds the data, then runs the validation your type defines. It ships no rule language and no validation tags, it doesn't log, and it doesn't transform. This focused approach means:
 
 - **Zero dependencies** - Just Go's standard library
-- **Tiny footprint** - ~600 lines of focused code
-- **Fast** - Sub-millisecond binding with caching
+- **Small API** - `Bind`, `BindWithOptions` and a handful of error types
+- **Fast** - About a microsecond for a typical request, with per-type tag caching
 - **Predictable** - No magic, no surprises
 - **Composable** - Works with your validator, your logger, your framework
 
@@ -46,9 +46,10 @@ err := binder.Bind(r, &req)
   - Cookies
   - Request headers
 - Support for primitive types, custom types, slices, and nested structs (arrays not supported - use slices)
-- Type conversion and validation
+- Type conversion
+- Validation through your own `Validate(ctx)` method, with the request context available to your rules
 - Support for required fields and omitempty behavior
-- Custom error handling and reporting
+- Every failing field reported at once, as typed errors a handler can inspect
 
 ## Installation
 
@@ -97,10 +98,10 @@ func main() {
 
 The library supports binding from multiple sources:
 
-- `path:"name"` - Binds from path parameters (requires a path parameter handler that supports named parameters)
+- `path:"name"` - Binds from path parameters via `r.PathValue`, as set by `http.ServeMux` patterns such as `/users/{id}` or by any router that calls `r.SetPathValue`
 - `query:"name"` - Binds from URL query parameters
 - `cookie:"name"` - Binds from HTTP cookies
-- `body:"name"` - Binds from request body (form data `x-www-form-urlencoded` or JSON)
+- `body:"name"` - Binds from the request body: JSON, `x-www-form-urlencoded` or `multipart/form-data`
 - `json:"name"` - Backwards compatibility with existing types
 - `header:"name"` - Binds from request headers, matched case-insensitively
 
@@ -173,15 +174,16 @@ commas: `?tags=a,b` is one value, `"a,b"`.
 
 ### Body vs JSON Tags
 
-The `body:` tag is the primary tag for binding request body data and automatically handles both JSON and form-encoded 
-data based on the request's Content-Type header.
+The `body:` tag is the primary tag for binding request body data. It handles
+JSON, form-encoded and multipart bodies, chosen by the request's Content-Type
+header.
 
 JSON is recognised by media type, including the RFC 6839 suffix form, so
 `application/json`, `text/json`, `application/vnd.api+json`,
 `application/hal+json` and `application/problem+json` are all parsed as JSON.
-A body whose Content-Type is neither JSON nor `application/x-www-form-urlencoded`
-is not parsed, and the request binds from its path, query, cookie and header
-values alone.
+A body whose Content-Type is none of JSON, `application/x-www-form-urlencoded`
+or `multipart/form-data` is not parsed, and the request binds from its path,
+query, cookie and header values alone.
 
 The `json:` tag serves as:
 - An alternative to `body:` when working specifically with JSON data
@@ -211,7 +213,8 @@ Add `,required` to return an error if the value is missing from its source:
 Email string `body:"email,required"`
 ```
 
-The error is a `*BindError` wrapping `ErrMissingRequired`. For `path` and
+The failure is a `*BindError` wrapping `ErrMissingRequired`, reported in
+`BindErrors` like any other field failure. For `path` and
 `query` an empty value counts as missing, since neither source distinguishes
 the two; a body key that is present but empty satisfies `required`.
 
@@ -283,7 +286,7 @@ if err := binder.BindWithOptions(r, &req, opts); err != nil {
 | Field | Default | Effect |
 |-------|---------|--------|
 | `MaxBodySize` | `0` | Overrides the package-level `binder.MaxBodySize` for this call. Zero leaves the package setting in force; a negative value removes the limit for this call alone. |
-| `DisallowUnknownFields` | `false` | Fails with `ErrUnknownField` when the body carries a top-level key that no field of the target binds. Keys nested inside objects are not inspected. |
+| `DisallowUnknownFields` | `false` | Reports each top-level body key that no field of the target binds, as a `BindErrors` entry wrapping `ErrUnknownField`. Keys nested inside objects are not inspected. |
 
 ### Request Size Limits
 
@@ -300,31 +303,57 @@ rejected with `ErrBodyTooLarge` rather than truncated.
 
 ## Error Handling
 
-Failures that concern a single field are of type `*binder.BindError`, which
-names the field and the input it came from:
+Binding does not stop at the first bad field. Every field is attempted, and
+when any fail, `Bind` returns `binder.BindErrors`, a list of `*BindError`, each
+naming the field and the input it came from. It has the same shape for one
+failure as for several:
 
 ```go
 if err := binder.Bind(r, &req); err != nil {
-    var bindErr *binder.BindError
-    if errors.As(err, &bindErr) {
-        fmt.Printf("field %s from %s %q: %v\n",
-            bindErr.Field, bindErr.Source, bindErr.Name, bindErr)
+    var errs binder.BindErrors
+    if errors.As(err, &errs) {
+        problems := map[string]string{}
+        for _, e := range errs {
+            if errors.Is(e, binder.ErrMissingRequired) {
+                problems[e.Name] = "required"
+            } else {
+                problems[e.Name] = "invalid value"
+            }
+        }
+        // respond with problems as a 400 body
+        return
     }
-    http.Error(w, err.Error(), http.StatusBadRequest)
-    return
+    // a request-level failure: see below
 }
 ```
 
-Failures that concern the request as a whole are reported with sentinel errors,
-so a handler can choose the right status code:
+Word client-facing messages from `Name`, `Source` and the sentinel an entry
+wraps, as above, rather than from `Message`: its text is not part of the
+compatibility promise, and it names Go fields and parser internals.
+
+Entries follow the order the struct declares its fields. A failure inside a
+nested struct or a slice is an entry of its own whose `Field` and `Name` give
+the path to it, such as `Address.Postcode` and `address.postcode`, or `Tags[2]`
+and `tags[2]`. With `DisallowUnknownFields` set, each unknown body member is
+an entry too, after the fields, with an empty `Field` and `Err` set to
+`ErrUnknownField`.
+
+`errors.Is` sees through the list, so `errors.Is(err, binder.ErrMissingRequired)`
+reports whether any field was missing.
+
+Failures that concern the request as a whole are reported with sentinel errors
+rather than `BindErrors`, so a handler can choose the right status code. They
+end binding at once, since nothing bound after them could be trusted:
 
 | Error | Meaning | Suggested status |
 |-------|---------|------------------|
 | `ErrMalformedBody` | The body could not be parsed as its `Content-Type` declares | 400 Bad Request |
-| `ErrMissingRequired` | A field tagged `required` had no value; wrapped by a `BindError` | 400 Bad Request |
-| `ErrUnknownField` | The body carried a key nothing binds, with `DisallowUnknownFields` set | 400 Bad Request |
 | `ErrBodyTooLarge` | The body exceeded `MaxBodySize` | 413 Content Too Large |
-| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct | 500 Internal Server Error |
+| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct, or the request was nil | 500 Internal Server Error |
+
+Two further sentinels are carried by individual `BindErrors` entries rather
+than returned alone: `ErrMissingRequired`, for a field tagged `required` that
+had no value, and `ErrUnknownField`.
 
 `ErrInvalidTarget` reports a programming error rather than a bad request, so it
 is the one case that should not be blamed on the client:
@@ -371,7 +400,7 @@ a handful of allocations. A JSON body costs more, since the body must be read
 and parsed before any field can be converted.
 
 `Bind` against `BindWithoutCache` measures the per-type tag cache: 1,250 ns and
-29 allocations with it warm, against 1,882 ns and 35 allocations when it is
+29 allocations with it warm, against 1,902 ns and 35 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
@@ -383,15 +412,6 @@ of magnitude dearer than the other formats, which is inherent to the encoding
 rather than to binding: the parser copies each part, and the file is held in
 memory rather than spilled to disk.
 
-## Performance Analysis
-
-* **Fastest binding:** BindPathOnly (0.000 ms/op)
-* **Slowest binding:** BindMixed/WithForm (0.004 ms/op)
-* **Lowest memory usage:** BindPathOnly (0.01 KB/op)
-* **Highest memory usage:** BindMixed/WithForm (9.75 KB/op)
-* **Fewest allocations:** BindPathOnly (1 allocs/op)
-* **Most allocations:** BindMixed/WithJSON (59 allocs/op)
-
 ## Production Ready
 
 This library has been designed with production use in mind:
@@ -399,9 +419,9 @@ This library has been designed with production use in mind:
 - **No panics** - An unusable target or an unsettable field is reported, not fatal
 - **Bounded reads** - Request bodies are capped, so one request cannot exhaust memory
 - **Errors are never swallowed** - A body that fails to parse is reported, not ignored
-- **Request body preservation** - Middleware-friendly, allows multiple reads
+- **Request body preservation** - The body is restored after binding, so later handlers can read it again
 - **Configurable per call** - `BindWithOptions` avoids reaching for package-level settings
-- **Well-tested** - Comprehensive test suite including edge cases
+- **Well-tested** - About 95% statement coverage, run under the race detector, with fuzz targets for the reflection paths
 
 ## When to Use Binder
 
@@ -412,69 +432,123 @@ This library has been designed with production use in mind:
 - Projects that need to minimize dependencies
 
 **Not suitable for:**
-- Complex validation requirements (use a separate validator)
+- Declarative, tag-driven validation (binder calls your `Validate` method; pair it with a rule library if you want tags)
 - Older Go versions (requires Go 1.27+)
 
 ## Validation
 
-For simple validation your types can implement a Validate function, this will be called as part of the binding:
+Your types can implement a `Validate` method, which binder calls once binding succeeds. A validation failure is returned from `Bind` prefixed with `validation failed:`, with your error wrapped so `errors.Is` and `errors.As` still reach it:
 
 ```go
-  type CreateUserRequest struct {
-      Name  string `body:"name"`
-      Email string `body:"email"`
-  }
+type CreateUserRequest struct {
+    Name  string `body:"name,required"`
+    Email string `body:"email,required"`
+    Age   int    `body:"age"`
+}
 
-  func (r CreateUserRequest) Validate() error {
-      if r.Name == "" {
-          return fmt.Errorf("name is required")
-      }
-      if r.Email == "" {
-          return fmt.Errorf("email is required")
+// ValidationErrors is the application's own error type: problems keyed by
+// the field name the client sent.
+type ValidationErrors map[string]string
+
+func (v ValidationErrors) Error() string {
+    return fmt.Sprintf("%d fields failed validation", len(v))
+}
+
+func (r CreateUserRequest) Validate(ctx context.Context) error {
+    errs := ValidationErrors{}
+    if !strings.Contains(r.Email, "@") {
+        errs["email"] = "is not a valid address"
+    }
+    if r.Age < 18 {
+        errs["age"] = "must be 18 or older"
+    }
+    if len(errs) > 0 {
+        return errs
+    }
+    return nil
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    var req CreateUserRequest
+    if err := binder.Bind(r, &req); err != nil {
+        var valErrs ValidationErrors
+        if errors.As(err, &valErrs) {
+            // respond with valErrs, e.g. as a 422 body
+            return
+        }
+        // binding failures: see Error Handling
+        return
+    }
+    // req is bound and validated
+}
+```
+
+Binder returns what `Validate` returned, wrapped with `%w`, so `errors.Is` and
+`errors.As` reach it. The shape is yours. Returning a type of your own, as
+above, lets a handler tell validation failures apart with `errors.As`; an
+`errors.Join` of plain errors is harder to recognise, since other errors, such
+as `ErrMalformedBody`, also wrap more than one error.
+
+`Validate` runs only once every field has bound. A field that failed to bind is
+left at its zero value, so running your rules over it would add a second,
+misleading error for the same input.
+
+Binder passes `r.Context()`, so a rule can use the authenticated user, a
+tenant, or the request's deadline for a lookup:
+
+```go
+  func (r CreateOrderRequest) Validate(ctx context.Context) error {
+      user, ok := auth.UserFrom(ctx)
+      if !ok || !user.CanOrder(r.SKU) {
+          return errors.New("sku not available to this account")
       }
       return nil
   }
-
-  func handler(w http.ResponseWriter, r *http.Request) {
-      var req CreateUserRequest
-
-      // Single step: bind + validate
-      if err := binder.Bind(r, &req); err != nil {
-          http.Error(w, err.Error(), http.StatusBadRequest)
-          return
-      }
-
-      // Process (req is already validated)
-      user := createUser(req)
-      json.NewEncoder(w).Encode(user)
-  }
-
 ```
 
-## Realistic Comparison
+If validation does I/O, a cancelled request surfaces as an error matching
+`errors.Is(err, context.Canceled)`.
 
-This comparison is based on actual analysis of each library's source code:
+## Comparison
 
-| Feature | Binder | Echo Binding | Gin Binding | Gorilla Schema |
-|---------|--------|--------------|-------------|----------------|
-| **Scope** | HTTP→struct binding only | Part of web framework | Part of web framework | Form values only |
-| **External Dependencies** | None | None* | validator/v10 | None |
-| **Lines of Code** | ~600 | ~500 | ~400 + validator | ~1,400 |
-| **Data Sources** | Path, Query, Body, Multipart, Cookie, Header | Path, Query, Body, Header | Path, Query, Body, Header | Query, Form only |
-| **Content Types** | JSON, Form | JSON, XML, Form, Multipart | JSON, XML, YAML, TOML, Protobuf, MsgPack | Form only |
-| **Built-in Validation** | Interface only | No | Yes (via validator) | No |
-| **Native PathValue** | Yes | No | No | N/A |
-| **Multipart/Files** | No | Yes | Yes | No |
-| **Custom Types** | TextUnmarshaler | BindUnmarshaler | Custom tags | Type converters |
-| **Performance** | 0.18-4.76ms | Not benchmarked | Not benchmarked | Not benchmarked |
+Features as of Echo v4.15, Gin v1.12 and gorilla/schema v1.4, checked against
+their source:
 
-*Echo framework has dependencies, but the binding package itself uses only standard library
+| Feature | Binder | Echo `DefaultBinder` | Gin `binding` | gorilla/schema |
+|---------|--------|----------------------|---------------|----------------|
+| **Scope** | Standalone binder | Part of the Echo framework | Part of the Gin framework | Decodes `url.Values` only |
+| **External dependencies** | None | Echo's | Gin's, including validator/v10 | None |
+| **Sources** | Path, query, body, header, cookie | Path, query, body, header | Path, query, body, header | Whatever `url.Values` you pass |
+| **Body formats** | JSON, form, multipart | JSON, XML, form, multipart | JSON, XML, form, multipart, YAML, TOML, Protobuf, MsgPack, BSON | N/A |
+| **File uploads** | Yes | Yes | Yes | No |
+| **Path values** | `http.ServeMux` / `r.PathValue` | Echo's router | Gin's router | N/A |
+| **Validation** | Your `Validate(ctx)` method, called by `Bind` | Pluggable `Validator`, called separately via `c.Validate` | validator/v10 tags, called by `ShouldBind` | No |
+| **Custom types** | `encoding.TextUnmarshaler` | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler` and `TextUnmarshaler` | Registered converters |
+| **Reports every bad field** | Yes, as `BindErrors` | No | No | Yes, as `MultiError` |
 
-### When to Choose Each:
+### Speed
 
-- **Binder**: You want a standalone, zero-dependency solution for Go 1.27+ REST APIs
+The [`benchmarks`](benchmarks) module times each library on the same requests,
+with a hand-written standard library version as the floor. Median ns/op of five
+runs on an Apple M-series laptop, Go 1.27:
+
+| Scenario | Binder | Echo | Gin | gorilla/schema | Stdlib by hand |
+|----------|-------:|-----:|----:|---------------:|---------------:|
+| Query string, 5 fields | 684 | 883 | 1,130 | 1,940 | 370 |
+| JSON body, 5 fields | 826 | 1,012 | 858 | - | 736 |
+| Path, query, body, header and cookie | 1,132 | 1,341 | 1,463 | - | - |
+
+Binder allocates more than Echo and Gin: 23 allocations for the JSON case
+against their 8, and 27 for the mixed case against 15 and 21. The libraries
+also do different amounts of work per call; `benchmarks/compare_test.go`
+explains what each benchmark asks of each library. Reproduce with
+`cd benchmarks && go test -bench . -benchmem`.
+
+### When to Choose Each
+
+- **Binder**: You use `net/http` and want one call that binds every source, with no dependencies
 - **Echo/Gin**: You're already using these frameworks and want integrated binding
-- **Gorilla Schema**: You only need form/query parameter decoding with more features
+- **gorilla/schema**: You only need form or query decoding into structs
 
 ## Compatibility
 
@@ -482,8 +556,8 @@ Binder follows [Semantic Versioning](https://semver.org/). Within a major
 version, the following are stable and will not change incompatibly:
 
 - The exported functions `Bind`, `BindWithOptions` and `BindStruct`.
-- The exported types `BindOptions`, `BindError` and `Validator`, and the
-  meaning of their fields.
+- The exported types `BindOptions`, `BindError`, `BindErrors` and `Validator`,
+  and the meaning of their fields.
 - The sentinel errors `ErrMalformedBody`, `ErrBodyTooLarge`,
   `ErrInvalidTarget`, `ErrMissingRequired` and `ErrUnknownField`. Match on
   these with `errors.Is` rather than on message text.
@@ -501,8 +575,9 @@ The following are **not** part of the contract and may change in any release:
 
 ### Go Version Support
 
-Binder requires the two most recent major Go releases. It currently requires
-Go 1.27, for the standard library `uuid` package and native path values.
+Binder supports the Go releases the Go project supports: the two most recent.
+It currently requires Go 1.27, for the standard library `uuid` package, so
+until Go 1.28 ships, 1.27 is the only supported release.
 Raising that minimum is a minor version bump, not a major one, in line with
 the wider Go ecosystem.
 
