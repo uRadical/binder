@@ -245,21 +245,42 @@ var ErrMissingRequired = errors.New("missing required value")
 // set and the request body carries a key that no field of the target binds.
 var ErrUnknownField = errors.New("unknown field in request body")
 
-// BindError describes a failure to bind one field of the target struct. It
-// carries the field alongside the source it was read from, so a handler can
-// report which input was at fault rather than only that something failed:
+// BindError describes one failure in binding the target struct: a field that
+// could not be bound, or a body member no field binds. It carries the input at
+// fault alongside the field, so a handler can say which part of the request to
+// fix rather than only that something failed.
 //
-//	var bindErr *binder.BindError
-//	if errors.As(err, &bindErr) {
-//	    fmt.Printf("field %s from %s %q: %v\n",
-//	        bindErr.Field, bindErr.Source, bindErr.Name, bindErr)
+// Key client-facing output on Name, the key the client sent, which is always
+// set. Field is the Go-side name, for logs and debugging, and is empty for an
+// unknown body member, since no field binds it.
+//
+//	var errs binder.BindErrors
+//	if errors.As(err, &errs) {
+//	    for _, e := range errs {
+//	        fmt.Printf("%s %q: %v\n", e.Source, e.Name, e.Err)
+//	    }
 //	}
 type BindError struct {
-	Field   string // name of the Go struct field
-	Source  string // tag source the value was read from, such as "query"
-	Name    string // key looked up in that source
-	Message string // complete description of what went wrong
-	Err     error  // underlying cause, reachable with errors.Is and errors.As
+	// Field is the Go struct field, as a path for a nested struct or slice
+	// element, such as Address.Postcode or Tags[2]. It is empty for a body
+	// member that no field binds, reported with DisallowUnknownFields.
+	Field string
+
+	// Source is the tag source the value was read from, such as "query".
+	Source string
+
+	// Name is the key the client sent in that source, as a path for a nested
+	// value, such as address.postcode or tags[2]. It is always set.
+	Name string
+
+	// Message is a complete description for logs. Its wording is not part of
+	// the compatibility promise and may change in any release.
+	Message string
+
+	// Err is the underlying cause, reachable with errors.Is and errors.As:
+	// ErrMissingRequired for a missing required value, ErrUnknownField for an
+	// unknown body member, and otherwise the conversion error.
+	Err error
 }
 
 func (e *BindError) Error() string {
