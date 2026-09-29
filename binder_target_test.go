@@ -26,7 +26,7 @@ func TestInvalidTargetReturnsError(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		target interface{}
+		target any
 	}{
 		{"nil interface", nil},
 		{"non-pointer struct", bindTarget{}},

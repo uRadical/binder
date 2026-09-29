@@ -41,12 +41,12 @@ func multipartBody(t *testing.T, fields map[string][]string, files map[string][]
 	return w.FormDataContentType(), buf.Bytes()
 }
 
-func bindMultipart(t *testing.T, target interface{}, fields map[string][]string, files map[string][]string) error {
+func bindMultipart(t *testing.T, target any, fields map[string][]string, files map[string][]string) error {
 	t.Helper()
 	return bindMultipartLimit(t, target, fields, files, DefaultMaxBodySize)
 }
 
-func bindMultipartLimit(t *testing.T, target interface{}, fields map[string][]string, files map[string][]string, limit int64) error {
+func bindMultipartLimit(t *testing.T, target any, fields map[string][]string, files map[string][]string, limit int64) error {
 	t.Helper()
 	ct, body := multipartBody(t, fields, files)
 	r := httptest.NewRequest("POST", "/upload", bytes.NewReader(body))

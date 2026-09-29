@@ -339,7 +339,7 @@ func (o BindOptions) maxBodySize() int64 {
 //   - The request body exceeds DefaultMaxBodySize (see ErrBodyTooLarge)
 //   - The request body cannot be parsed (see ErrMalformedBody)
 //   - Validation fails (if the struct implements Validator)
-func Bind(r *http.Request, i interface{}) error {
+func Bind(r *http.Request, i any) error {
 	return BindWithOptions(r, i, BindOptions{MaxBodySize: DefaultMaxBodySize})
 }
 
@@ -355,7 +355,7 @@ func Bind(r *http.Request, i interface{}) error {
 //	if err := binder.BindWithOptions(r, &req, opts); err != nil {
 //	    // Handle binding error
 //	}
-func BindWithOptions(r *http.Request, i interface{}, opts BindOptions) error {
+func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 	if r == nil {
 		return fmt.Errorf("%w: cannot bind from a nil request", ErrInvalidTarget)
 	}
@@ -478,7 +478,7 @@ func (e *fieldErrs) list() error {
 }
 
 // validate runs the target's Validator, if it has one.
-func validate(ctx context.Context, i interface{}) error {
+func validate(ctx context.Context, i any) error {
 	if v, ok := i.(Validator); ok {
 		if err := v.Validate(ctx); err != nil {
 			return fmt.Errorf("validation failed: %w", err)
@@ -491,7 +491,7 @@ func validate(ctx context.Context, i interface{}) error {
 // type and value to bind into. Bind's contract is a non-nil pointer to a
 // struct, and anything else is reported as ErrInvalidTarget rather than left
 // to panic inside the reflect package.
-func targetStruct(i interface{}) (reflect.Type, reflect.Value, error) {
+func targetStruct(i any) (reflect.Type, reflect.Value, error) {
 	if i == nil {
 		return nil, reflect.Value{}, fmt.Errorf("%w: target is nil", ErrInvalidTarget)
 	}
@@ -520,12 +520,12 @@ func targetStruct(i interface{}) (reflect.Type, reflect.Value, error) {
 // set, the members nothing binds; a field it could not fill is recorded in
 // errs. Every other format returns the map that binding reads from, and a nil
 // set.
-func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}, info *typeInfo, val reflect.Value, wantUnknown bool, errs *fieldErrs) (map[string]interface{}, []bool, []string, error) {
+func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}, info *typeInfo, val reflect.Value, wantUnknown bool, errs *fieldErrs) (map[string]any, []bool, []string, error) {
 	// Content-Length is not consulted here: a chunked request declares no
 	// length at all, so skipping on a non-positive Content-Length would drop
 	// its body entirely. Whether a body is empty is decided after reading.
 	if r.Body == nil || r.Body == http.NoBody {
-		return make(map[string]interface{}), nil, nil, nil
+		return make(map[string]any), nil, nil, nil
 	}
 
 	// Read the body once, refusing anything oversized
@@ -540,7 +540,7 @@ func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]stru
 	// An absent body is not a malformed one, so an empty read is reported as
 	// no data rather than handed to a parser that would reject it.
 	if len(bodyBytes) == 0 {
-		return make(map[string]interface{}), nil, nil, nil
+		return make(map[string]any), nil, nil, nil
 	}
 
 	// A JSON body is handled before the other formats: where the build allows
@@ -601,7 +601,7 @@ func readBody(r *http.Request, limit int64) ([]byte, error) {
 // unknownKeys returns the body keys that no field of the target binds. Only
 // top-level keys are considered, since nested values are bound by the nested
 // struct rather than by a tag on this one.
-func unknownKeys(info *typeInfo, bodyData map[string]interface{}) []string {
+func unknownKeys(info *typeInfo, bodyData map[string]any) []string {
 	var unknown []string
 	for name := range bodyData {
 		if _, found := info.bodyKeys[name]; !found {
@@ -651,7 +651,7 @@ func (q *queryCache) all(name string) []string { return q.ensure()[name] }
 
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request, recording in errs each field that fails.
-func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyData map[string]interface{}, bound []bool, errs *fieldErrs) {
+func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyData map[string]any, bound []bool, errs *fieldErrs) {
 	queries := queryCache{url: r.URL}
 
 	for index, fi := range info.fields {
@@ -689,7 +689,7 @@ func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyDa
 }
 
 // extractFieldValue gets the value for a field from the appropriate request source
-func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]interface{}, queries *queryCache) (interface{}, bool, error) {
+func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]any, queries *queryCache) (any, bool, error) {
 	switch fi.Source {
 	case path:
 		v := r.PathValue(fi.TagName)
@@ -745,7 +745,7 @@ func missingRequiredError(fi fieldInfo) *BindError {
 
 // bindFieldValue sets the value on a struct field, handling nested structs and
 // pointers.
-func bindFieldValue(fieldVal reflect.Value, value interface{}) error {
+func bindFieldValue(fieldVal reflect.Value, value any) error {
 	if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
 		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
 	}
@@ -865,40 +865,12 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 	return cached
 }
 
-// BindStruct recursively binds data from a map to a struct field, handling nested structures.
-//
-// This function is exported for advanced use cases where you need to bind nested
-// data manually. Most users should use Bind instead.
-//
-// Parameters:
-//   - field: The reflect.Value of the struct field to bind to
-//   - data: Map containing the data to bind
-//
-// The function handles both pointer and non-pointer fields, automatically
-// initializing nil pointers as needed.
-func BindStruct(field reflect.Value, data map[string]interface{}) error {
-	target := field
-	if field.Kind() == reflect.Ptr {
-		if field.IsNil() {
-			field.Set(reflect.New(field.Type().Elem()))
-		}
-		target = field.Elem()
-	}
-	if target.Kind() != reflect.Struct {
-		return fmt.Errorf("%w: target is %s, want a struct", ErrInvalidTarget, target.Kind())
-	}
-	return bindNestedFields(target, data)
-}
-
 // bindNestedFields binds map data into a struct's fields, matching each on its
-// body tag or the json alias. It is the one implementation behind BindStruct
-// and the struct case of setField, which previously carried a copy each and
-// drifted apart: only one of them allocated nil pointers, and neither skipped
-// fields reflection cannot set.
+// body tag or the json alias. It is the struct case of setField.
 //
 // Every field is attempted, and the failures are returned as BindErrors whose
 // paths are relative to target.
-func bindNestedFields(target reflect.Value, data map[string]interface{}) error {
+func bindNestedFields(target reflect.Value, data map[string]any) error {
 	var errs BindErrors
 	typ := target.Type()
 	for i := 0; i < typ.NumField(); i++ {
@@ -964,8 +936,8 @@ func isJSONContentType(ct string) bool {
 }
 
 // parseBody extracts and parses the request body into a map
-func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (map[string]interface{}, error) {
-	var reqBody map[string]interface{}
+func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (map[string]any, error) {
+	var reqBody map[string]any
 	ct := parseContentType(r.Header.Get("Content-Type"))
 
 	switch {
@@ -977,7 +949,7 @@ func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (ma
 		return reqBody, nil
 
 	case ct == "application/x-www-form-urlencoded":
-		reqBody = make(map[string]interface{})
+		reqBody = make(map[string]any)
 		err := r.ParseForm()
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid form data: %w", ErrMalformedBody, err)
@@ -992,7 +964,7 @@ func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (ma
 		return reqBody, nil
 	}
 
-	return make(map[string]interface{}), nil
+	return make(map[string]any), nil
 }
 
 // fileHeaderType and fileHeaderSliceType are the destinations an uploaded file
@@ -1008,7 +980,7 @@ var (
 // The whole body has already been read and bounded by the size limit, so the
 // parser is given that same allowance and never spills a part to a temporary
 // file. Raise BindOptions.MaxBodySize on an endpoint that accepts uploads.
-func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]interface{}, error) {
+func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]any, error) {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return nil, err
@@ -1027,7 +999,7 @@ func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]interf
 		return nil, err
 	}
 
-	reqBody := make(map[string]interface{}, len(form.Value)+len(form.File))
+	reqBody := make(map[string]any, len(form.Value)+len(form.File))
 	for name, values := range form.Value {
 		if len(values) == 1 {
 			reqBody[name] = values[0]
@@ -1048,7 +1020,7 @@ func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]interf
 // setFileHeader binds an uploaded file, or a set of them, to a field declared
 // as *multipart.FileHeader or []*multipart.FileHeader. Reports whether the
 // value was a file part at all.
-func setFileHeader(field reflect.Value, value interface{}) (bool, error) {
+func setFileHeader(field reflect.Value, value any) (bool, error) {
 	single, isSingle := value.(*multipart.FileHeader)
 	many, isMany := value.([]*multipart.FileHeader)
 	if !isSingle && !isMany {
@@ -1080,7 +1052,7 @@ func setFileHeader(field reflect.Value, value interface{}) (bool, error) {
 }
 
 // setField sets the appropriate value on the given reflect.Value field
-func setField(field reflect.Value, value interface{}) error {
+func setField(field reflect.Value, value any) error {
 	// Handle nil value
 	if value == nil {
 		return nil
@@ -1103,7 +1075,7 @@ func setField(field reflect.Value, value interface{}) error {
 
 // tryTextUnmarshaler attempts to use TextUnmarshaler interface if implemented
 // Returns (handled, error) where handled indicates if TextUnmarshaler was used
-func tryTextUnmarshaler(field reflect.Value, value interface{}) (bool, error) {
+func tryTextUnmarshaler(field reflect.Value, value any) (bool, error) {
 	if field.Type().Implements(textUnmarshalerType) {
 		// A nil pointer has nothing to unmarshal into, and UnmarshalText
 		// would dereference it. Give it a value first, as the kind-based
@@ -1135,7 +1107,7 @@ func tryTextUnmarshaler(field reflect.Value, value interface{}) (bool, error) {
 
 // unmarshalText returns the bytes to hand a TextUnmarshaler, for the value
 // kinds a request body can produce.
-func unmarshalText(value interface{}) ([]byte, bool) {
+func unmarshalText(value any) ([]byte, bool) {
 	switch v := value.(type) {
 	case string:
 		return []byte(v), true
@@ -1147,7 +1119,7 @@ func unmarshalText(value interface{}) ([]byte, bool) {
 }
 
 // setFieldByKind sets the field value based on its reflect.Kind
-func setFieldByKind(field reflect.Value, value interface{}) error {
+func setFieldByKind(field reflect.Value, value any) error {
 	switch field.Kind() {
 	case reflect.String:
 		return setString(field, value)
@@ -1185,7 +1157,7 @@ func setFieldByKind(field reflect.Value, value interface{}) error {
 }
 
 // setString sets a string value to a field
-func setString(field reflect.Value, value interface{}) error {
+func setString(field reflect.Value, value any) error {
 	str, err := toString(value)
 	if err != nil {
 		return err
@@ -1195,7 +1167,7 @@ func setString(field reflect.Value, value interface{}) error {
 }
 
 // toString converts various types to string
-func toString(value interface{}) (string, error) {
+func toString(value any) (string, error) {
 	switch v := value.(type) {
 	case string:
 		return v, nil
@@ -1238,7 +1210,7 @@ func setFloatChecked(field reflect.Value, n float64) error {
 }
 
 // setInt sets an integer value to a field
-func setInt(field reflect.Value, value interface{}) error {
+func setInt(field reflect.Value, value any) error {
 	switch v := value.(type) {
 	case int:
 		return setIntChecked(field, int64(v))
@@ -1277,7 +1249,7 @@ func setInt(field reflect.Value, value interface{}) error {
 }
 
 // setUint sets an unsigned integer value to a field
-func setUint(field reflect.Value, value interface{}) error {
+func setUint(field reflect.Value, value any) error {
 	switch v := value.(type) {
 	case uint:
 		return setUintChecked(field, uint64(v))
@@ -1323,7 +1295,7 @@ func setUint(field reflect.Value, value interface{}) error {
 }
 
 // setBool sets a boolean value to a field
-func setBool(field reflect.Value, value interface{}) error {
+func setBool(field reflect.Value, value any) error {
 	switch v := value.(type) {
 	case bool:
 		field.SetBool(v)
@@ -1350,7 +1322,7 @@ func setBool(field reflect.Value, value interface{}) error {
 }
 
 // setFloat sets a floating point value to a field
-func setFloat(field reflect.Value, value interface{}) error {
+func setFloat(field reflect.Value, value any) error {
 	switch v := value.(type) {
 	case float32:
 		return setFloatChecked(field, float64(v))
@@ -1378,18 +1350,18 @@ func setFloat(field reflect.Value, value interface{}) error {
 }
 
 // setSlice sets a slice value to a field
-func setSlice(field reflect.Value, value interface{}) error {
+func setSlice(field reflect.Value, value any) error {
 	// Repeated form fields, query parameters and headers arrive as []string.
 	// Widening them here lets one loop below cover every multi-valued source.
 	if strs, ok := value.([]string); ok {
-		elems := make([]interface{}, len(strs))
+		elems := make([]any, len(strs))
 		for i, sv := range strs {
 			elems[i] = sv
 		}
 		value = elems
 	}
 
-	if v, ok := value.([]interface{}); ok {
+	if v, ok := value.([]any); ok {
 		// Create a new slice with the same type as the field
 		s := reflect.MakeSlice(field.Type(), len(v), len(v))
 
@@ -1435,8 +1407,8 @@ func setSlice(field reflect.Value, value interface{}) error {
 }
 
 // setStruct sets a struct value to a field
-func setStruct(field reflect.Value, value interface{}) error {
-	structMap, ok := value.(map[string]interface{})
+func setStruct(field reflect.Value, value any) error {
+	structMap, ok := value.(map[string]any)
 	if !ok {
 		if reflect.TypeOf(value).Kind() == reflect.Map {
 			// A map of some other key or element type cannot be walked as
@@ -1449,7 +1421,7 @@ func setStruct(field reflect.Value, value interface{}) error {
 }
 
 // isEmptyValue checks if a value is empty or zero
-func isEmptyValue(v interface{}) bool {
+func isEmptyValue(v any) bool {
 	if v == nil {
 		return true
 	}

@@ -58,7 +58,7 @@ type fuzzSources struct {
 }
 
 // fuzzTarget returns a fresh binding destination chosen by the fuzzer.
-func fuzzTarget(which uint8) interface{} {
+func fuzzTarget(which uint8) any {
 	switch which % 4 {
 	case 0:
 		return &fuzzScalars{}
@@ -137,14 +137,14 @@ func FuzzBindWithOptions(f *testing.F) {
 	})
 }
 
-// FuzzBindStruct covers the exported nested-binding entry point directly.
-func FuzzBindStruct(f *testing.F) {
+// FuzzBindNested drives nested-struct binding directly with arbitrary members.
+func FuzzBindNested(f *testing.F) {
 	f.Add("k", "v")
 	f.Add("when", "2026-01-02T03:04:05Z")
 
 	f.Fuzz(func(t *testing.T, key, value string) {
 		var target fuzzNested
-		_ = BindStruct(reflect.ValueOf(&target).Elem(), map[string]interface{}{key: value})
+		_ = bindNestedFields(reflect.ValueOf(&target).Elem(), map[string]any{key: value})
 	})
 }
 

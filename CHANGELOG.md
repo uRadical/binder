@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry with `Field` and `Name` such as `Inner.A` and `inner.a`, or `IDs[1]`
   and `id[1]`.
 
+- **`BindStruct` is gone.** It exposed an internal detail of nested binding
+  through `reflect.Value`; `Bind` binds nested structs itself.
 - **The package-level `MaxBodySize` variable is gone.** Pass
   `BindOptions{MaxBodySize: n}` to `BindWithOptions` instead. A zero
   `MaxBodySize` now means `DefaultMaxBodySize` rather than the package

@@ -555,7 +555,7 @@ explains what each benchmark asks of each library. Reproduce with
 Binder follows [Semantic Versioning](https://semver.org/). Within a major
 version, the following are stable and will not change incompatibly:
 
-- The exported functions `Bind`, `BindWithOptions` and `BindStruct`.
+- The exported functions `Bind` and `BindWithOptions`.
 - The exported types `BindOptions`, `BindError`, `BindErrors` and `Validator`,
   and the meaning of their fields.
 - The sentinel errors `ErrMalformedBody`, `ErrBodyTooLarge`,

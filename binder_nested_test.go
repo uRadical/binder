@@ -1,9 +1,7 @@
 package binder
 
 import (
-	"errors"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -93,52 +91,6 @@ func TestNestedBindingErrorNamesField(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "field I.N") {
 		t.Errorf("error %q does not name the nested field", err)
-	}
-}
-
-// BindStruct is exported for manual nested binding; both a struct value and a
-// pointer to one are accepted.
-func TestBindStructAcceptsValueAndPointer(t *testing.T) {
-	type target struct {
-		A string `body:"a"`
-		B string `json:"b"`
-	}
-	data := map[string]interface{}{"a": "one", "b": "two"}
-
-	var direct target
-	if err := BindStruct(reflect.ValueOf(&direct).Elem(), data); err != nil {
-		t.Fatalf("struct value: got error %v, want nil", err)
-	}
-	if direct.A != "one" || direct.B != "two" {
-		t.Errorf("bound %+v, want both fields set", direct)
-	}
-
-	var viaPtr *target
-	field := reflect.ValueOf(&viaPtr).Elem()
-	if err := BindStruct(field, data); err != nil {
-		t.Fatalf("nil pointer: got error %v, want nil", err)
-	}
-	if viaPtr == nil {
-		t.Fatal("nil pointer was not allocated")
-	}
-	if viaPtr.A != "one" {
-		t.Errorf("A = %q, want %q", viaPtr.A, "one")
-	}
-}
-
-// BindStruct given something that is not a struct reports it rather than
-// panicking inside reflect.
-func TestBindStructRejectsNonStruct(t *testing.T) {
-	defer func() {
-		if p := recover(); p != nil {
-			t.Fatalf("BindStruct panicked: %v", p)
-		}
-	}()
-
-	var n int
-	err := BindStruct(reflect.ValueOf(&n).Elem(), map[string]interface{}{"a": "1"})
-	if !errors.Is(err, ErrInvalidTarget) {
-		t.Fatalf("got %v, want ErrInvalidTarget", err)
 	}
 }
 

@@ -17,14 +17,14 @@ import (
 // write into fields directly or skip the members nothing binds, so it returns
 // the map for the caller to bind from, as earlier releases did. The values it
 // produces are the same either way.
-func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (map[string]interface{}, []bool, []string, error) {
+func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (map[string]any, []bool, []string, error) {
 	_ = errs // fields are bound, and fail, after decoding
 	_ = info
 	_ = val
 	_ = wanted      // no selective decoding without jsontext
 	_ = wantUnknown // the caller checks the returned map instead
 
-	var out map[string]interface{}
+	var out map[string]any
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// Decode numbers as their literal text. Routing them through float64
 	// silently loses precision beyond 2^53, so an identifier such as
@@ -35,7 +35,7 @@ func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[str
 	}
 	if out == nil {
 		// A literal null body carries no members, and is not an error.
-		out = make(map[string]interface{})
+		out = make(map[string]any)
 	}
 	return out, nil, nil, nil
 }

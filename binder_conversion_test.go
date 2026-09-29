@@ -9,14 +9,14 @@ import (
 
 // settable returns an addressable zero Value of the given kind's type, so the
 // set* helpers can be exercised directly.
-func settable(v interface{}) reflect.Value {
+func settable(v any) reflect.Value {
 	return reflect.New(reflect.TypeOf(v)).Elem()
 }
 
 func TestSetIntFromEveryKind(t *testing.T) {
 	tests := []struct {
 		name    string
-		value   interface{}
+		value   any
 		want    int64
 		wantErr bool
 	}{
@@ -54,7 +54,7 @@ func TestSetIntFromEveryKind(t *testing.T) {
 func TestSetUintFromEveryKind(t *testing.T) {
 	tests := []struct {
 		name    string
-		value   interface{}
+		value   any
 		want    uint64
 		wantErr bool
 	}{
@@ -99,7 +99,7 @@ func TestSetUintFromEveryKind(t *testing.T) {
 func TestSetFloatFromEveryKind(t *testing.T) {
 	tests := []struct {
 		name    string
-		value   interface{}
+		value   any
 		want    float64
 		wantErr bool
 	}{
@@ -134,7 +134,7 @@ func TestSetFloatFromEveryKind(t *testing.T) {
 func TestSetBoolFromEveryKind(t *testing.T) {
 	tests := []struct {
 		name    string
-		value   interface{}
+		value   any
 		want    bool
 		wantErr bool
 	}{
@@ -168,12 +168,12 @@ func TestSetBoolFromEveryKind(t *testing.T) {
 
 func TestIsEmptyValueForEveryKind(t *testing.T) {
 	var nilPtr *int
-	var nilIface interface{}
+	var nilIface any
 	nonNil := 1
 
 	tests := []struct {
 		name  string
-		value interface{}
+		value any
 		want  bool
 	}{
 		{"nil", nil, true},
@@ -223,7 +223,7 @@ func (stringerValue) String() string { return "stringer" }
 func TestToStringFromEveryKind(t *testing.T) {
 	tests := []struct {
 		name  string
-		value interface{}
+		value any
 		want  string
 	}{
 		{"string", "a", "a"},
@@ -250,7 +250,7 @@ func TestToStringFromEveryKind(t *testing.T) {
 // Arrays are refused with an explanation rather than silently ignored.
 func TestSetFieldByKindUnsupported(t *testing.T) {
 	field := settable([2]int{})
-	if err := setFieldByKind(field, []interface{}{1, 2}); err == nil {
+	if err := setFieldByKind(field, []any{1, 2}); err == nil {
 		t.Error("array field: got nil error, want a refusal")
 	}
 

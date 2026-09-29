@@ -21,7 +21,7 @@ check:
 fuzz:
 	go test -run '^$$' -fuzz 'FuzzBind$$' -fuzztime=30s
 	go test -run '^$$' -fuzz 'FuzzBindWithOptions' -fuzztime=15s
-	go test -run '^$$' -fuzz 'FuzzBindStruct' -fuzztime=15s
+	go test -run '^$$' -fuzz 'FuzzBindNested' -fuzztime=15s
 
 test:
 	go test -race ./...

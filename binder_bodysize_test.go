@@ -20,7 +20,7 @@ func jsonBodyOfSize(size int) string {
 }
 
 // bindWithLimit binds with a per-call body size limit.
-func bindWithLimit(r *http.Request, target interface{}, limit int64) error {
+func bindWithLimit(r *http.Request, target any, limit int64) error {
 	return BindWithOptions(r, target, BindOptions{MaxBodySize: limit})
 }
 
@@ -106,9 +106,9 @@ func TestDefaultMaxBodySize(t *testing.T) {
 		t.Errorf("DefaultMaxBodySize = %d, want 10 MB", DefaultMaxBodySize)
 	}
 
-	binds := map[string]func(*http.Request, interface{}) error{
+	binds := map[string]func(*http.Request, any) error{
 		"Bind": Bind,
-		"BindWithOptions zero limit": func(r *http.Request, target interface{}) error {
+		"BindWithOptions zero limit": func(r *http.Request, target any) error {
 			return BindWithOptions(r, target, BindOptions{DisallowUnknownFields: true})
 		},
 	}

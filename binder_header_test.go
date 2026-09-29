@@ -58,7 +58,7 @@ func TestHeaderNameIsCaseInsensitive(t *testing.T) {
 	targets := []struct {
 		spelling string
 		trace    *string
-		target   interface{}
+		target   any
 	}{
 		{"X-Request-Id", &canonical.Trace, &canonical},
 		{"X-REQUEST-ID", &upper.Trace, &upper},

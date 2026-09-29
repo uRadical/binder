@@ -231,12 +231,12 @@ func TestBindJsonBody(t *testing.T) {
 		Tags   []string  `body:"tags"`
 	}
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"email":  "info@example.io",
 		"uid":    "f47ac10b-58cc-0372-8562-0b8e853961a1",
 		"active": true,
 		"amount": 99.99,
-		"nested": map[string]interface{}{
+		"nested": map[string]any{
 			"email": "nested@example.io",
 			"count": 42,
 		},
@@ -326,7 +326,7 @@ func TestBindFormBody(t *testing.T) {
 }
 
 func TestBindMultipleBodyReads(t *testing.T) {
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"name":   "Test User",
 		"email":  "test@example.com",
 		"age":    30,
@@ -472,7 +472,7 @@ func TestBindUnsupportedType(t *testing.T) {
 
 func TestBindSlicesExplicitly(t *testing.T) {
 	t.Run("IntSlice", func(t *testing.T) {
-		payload := map[string]interface{}{
+		payload := map[string]any{
 			"values": []int{1, 2, 3, 4, 5},
 		}
 
@@ -501,7 +501,7 @@ func TestBindSlicesExplicitly(t *testing.T) {
 	})
 
 	t.Run("StringSlice", func(t *testing.T) {
-		payload := map[string]interface{}{
+		payload := map[string]any{
 			"tags": []string{"tag1", "tag2", "tag3", "tag4", "tag5"},
 		}
 
@@ -530,8 +530,8 @@ func TestBindSlicesExplicitly(t *testing.T) {
 	})
 
 	t.Run("EmptySlice", func(t *testing.T) {
-		payload := map[string]interface{}{
-			"items": []interface{}{},
+		payload := map[string]any{
+			"items": []any{},
 		}
 
 		payloadBytes, err := json.Marshal(payload)
@@ -558,7 +558,7 @@ func TestBindSlicesExplicitly(t *testing.T) {
 	})
 
 	t.Run("BoolSlice", func(t *testing.T) {
-		payload := map[string]interface{}{
+		payload := map[string]any{
 			"flags": []bool{true, false, true, true, false},
 		}
 
@@ -587,7 +587,7 @@ func TestBindSlicesExplicitly(t *testing.T) {
 	})
 
 	t.Run("FloatSlice", func(t *testing.T) {
-		payload := map[string]interface{}{
+		payload := map[string]any{
 			"prices": []float64{1.99, 2.99, 3.99, 4.99},
 		}
 
@@ -637,7 +637,7 @@ func TestBindSlicesExplicitly(t *testing.T) {
 }
 
 func TestBindArrayNotSupported(t *testing.T) {
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"values": []int{1, 2, 3},
 	}
 
@@ -768,7 +768,7 @@ func BenchmarkBind(b *testing.B) {
 	}
 
 	// Create a sample HTTP request
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"email":  "test@example.com",
 		"active": true,
 		"uuid":   "f47ac10b-58cc-0372-8562-0b8e853961a1",
@@ -803,7 +803,7 @@ func BenchmarkBindWithoutCache(b *testing.B) {
 	}
 
 	// Create a sample HTTP request
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"email":  "test@example.com",
 		"active": true,
 		"uuid":   "f47ac10b-58cc-0372-8562-0b8e853961a1",

@@ -177,10 +177,10 @@ func writeBindError(w http.ResponseWriter, err error) {
                 fields[e.Name] = "invalid value"
             }
         }
-        respondJSON(w, map[string]interface{}{"errors": fields}, http.StatusBadRequest)
+        respondJSON(w, map[string]any{"errors": fields}, http.StatusBadRequest)
 
     case errors.As(err, &valErrs):
-        respondJSON(w, map[string]interface{}{"errors": valErrs}, http.StatusUnprocessableEntity)
+        respondJSON(w, map[string]any{"errors": valErrs}, http.StatusUnprocessableEntity)
 
     case errors.Is(err, binder.ErrBodyTooLarge):
         respondError(w, "request body too large", http.StatusRequestEntityTooLarge)

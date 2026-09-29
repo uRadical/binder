@@ -19,7 +19,7 @@ type decodeTarget struct {
 	Tags  []string `body:"tags"`
 }
 
-func bindJSON(t *testing.T, body string, target interface{}) error {
+func bindJSON(t *testing.T, body string, target any) error {
 	t.Helper()
 	r := httptest.NewRequest("POST", "/u", strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")

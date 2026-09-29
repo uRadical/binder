@@ -62,7 +62,7 @@ func resetBody(r *http.Request, body string) {
 // requireBound fails a benchmark whose target does not receive the value it
 // was set up to bind, so that a broken fixture is reported rather than
 // quietly measured.
-func requireBound(b *testing.B, field string, got, want interface{}) {
+func requireBound(b *testing.B, field string, got, want any) {
 	b.Helper()
 	if got != want {
 		b.Fatalf("fixture binds nothing: %s = %v, want %v", field, got, want)

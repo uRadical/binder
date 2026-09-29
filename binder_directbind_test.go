@@ -13,7 +13,7 @@ import (
 // through a map otherwise. Both must agree, so every case here runs under
 // GOEXPERIMENT=nojsonv2 as well; the suite passing both ways is the check.
 
-func bindBody(t *testing.T, body string, target interface{}) error {
+func bindBody(t *testing.T, body string, target any) error {
 	t.Helper()
 	r := httptest.NewRequest("POST", "/u", strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
@@ -335,7 +335,7 @@ func TestOverflowIsRefused(t *testing.T) {
 	cases := []struct {
 		name   string
 		body   string
-		target interface{}
+		target any
 	}{
 		{"int8 from body", `{"v":9999}`, &struct {
 			V int8 `body:"v"`

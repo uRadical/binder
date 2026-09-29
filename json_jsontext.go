@@ -15,15 +15,15 @@ import (
 )
 
 // decodeJSONValue reads one value, producing the types the set* helpers
-// expect: string, bool, json.Number, []interface{}, map[string]interface{}
+// expect: string, bool, json.Number, []any, map[string]any
 // and nil.
-func decodeJSONValue(dec *jsontext.Decoder) (interface{}, error) {
+func decodeJSONValue(dec *jsontext.Decoder) (any, error) {
 	switch dec.PeekKind() {
 	case '{':
 		if _, err := dec.ReadToken(); err != nil {
 			return nil, err
 		}
-		object := make(map[string]interface{})
+		object := make(map[string]any)
 		for dec.PeekKind() == '"' {
 			nameTok, err := dec.ReadToken()
 			if err != nil {
@@ -44,7 +44,7 @@ func decodeJSONValue(dec *jsontext.Decoder) (interface{}, error) {
 		if _, err := dec.ReadToken(); err != nil {
 			return nil, err
 		}
-		var array []interface{}
+		var array []any
 		for dec.PeekKind() != ']' {
 			value, err := decodeJSONValue(dec)
 			if err != nil {
@@ -116,7 +116,7 @@ func jsonKindName(k jsontext.Kind) string {
 // bindJSONBody fills a struct's body-sourced fields straight from the request
 // body, without first decoding it into a map.
 //
-// Going through map[string]interface{} costs an allocation per member for the
+// Going through map[string]any costs an allocation per member for the
 // interface value, plus the map itself, before any conversion happens. Walking
 // the tokens once and writing into the destination as each member is reached
 // avoids both, and lets a member no field binds be skipped without decoding it
@@ -126,7 +126,7 @@ func jsonKindName(k jsontext.Kind) string {
 // ones that were not, and the names of members nothing binds. A member that
 // cannot be converted is recorded in errs and the walk continues; only a
 // failure to read the JSON itself is returned.
-func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (bodyData map[string]interface{}, bound []bool, unknown []string, err error) {
+func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (bodyData map[string]any, bound []bool, unknown []string, err error) {
 	_ = wanted // the walk consults info.bodyFields directly
 	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true))
 
