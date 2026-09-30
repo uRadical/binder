@@ -29,7 +29,7 @@ func TestStringSourceKinds(t *testing.T) {
 		C   float32       `cookie:"ratio"`
 	}
 
-	r := httptest.NewRequest("GET", "/?s=hi&i=-7&i8=-8&u=7&u8=255&f=1.5&f32=2.5&b=true&p=3&d=9&t=2026-01-02T03:04:05Z", nil)
+	r := httptest.NewRequest("GET", "/?s=hi&i=-7&i8=-8&u=7&u8=255&f=1.5&f32=2.5&b=true&p=3&d=9ns&t=2026-01-02T03:04:05Z", nil)
 	r.Header.Set("X-Count", "65535")
 	r.AddCookie(&http.Cookie{Name: "ratio", Value: "0.25"})
 

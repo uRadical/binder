@@ -19,8 +19,8 @@ func resetStore(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	users = map[int]User{
-		1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, Credit: 2500, CreatedAt: time.Now()},
-		2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, TeamID: teamSupport, CreatedAt: time.Now()},
+		1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, Credit: 2500, CreatedAt: time.Now().Add(-24 * time.Hour)},
+		2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, TeamID: teamSupport, CreatedAt: time.Now().Add(-48 * time.Hour)},
 	}
 	nextID = 3
 }
@@ -124,6 +124,22 @@ func TestListUsers(t *testing.T) {
 	status, body = request(t, "GET", "/users?filter[password]=x", "", apiKey)
 	if status != http.StatusUnprocessableEntity || !reflect.DeepEqual(fieldErrors(t, body), map[string]any{"filter[password]": "is not a field that can be filtered"}) {
 		t.Errorf("bad filter: got %d %v, want 422 naming filter[password]", status, body)
+	}
+
+	// A time.Duration from text: Alice was created a day ago, Bob two.
+	status, body = request(t, "GET", "/users?created_within=36h", "", apiKey)
+	if status != http.StatusOK || !reflect.DeepEqual(names(body), []string{"Alice"}) {
+		t.Errorf("created_within: got %d %v, want 200 and only Alice", status, body)
+	}
+
+	status, body = request(t, "GET", "/users?created_within=36", "", apiKey)
+	if status != http.StatusBadRequest || !reflect.DeepEqual(fieldErrors(t, body), map[string]any{"created_within": "invalid value"}) {
+		t.Errorf("duration without a unit: got %d %v, want 400", status, body)
+	}
+
+	status, body = request(t, "GET", "/users?created_within=-1h", "", apiKey)
+	if status != http.StatusUnprocessableEntity || !reflect.DeepEqual(fieldErrors(t, body), map[string]any{"created_within": "must be a positive duration"}) {
+		t.Errorf("negative duration: got %d %v, want 422", status, body)
 	}
 
 	status, body = request(t, "GET", "/users?team="+teamSupport.String(), "", apiKey)

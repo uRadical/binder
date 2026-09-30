@@ -14,6 +14,7 @@ This example demonstrates how to use the Binder library to build a complete REST
 - **Embedded structs** - A shared `Paging` struct whose fields bind as if declared on the request
 - **Maps** - `/users?filter[name]=ali` filling a `map[string]string`
 - **Custom JSON decoding** - A `Money` type with its own `UnmarshalJSON`, from JSON and from a form
+- **Durations** - `/users?created_within=36h` into a `*time.Duration`
 - **Required fields** - Reporting a missing value rather than binding a zero one
 - **Per-call options** - `BindWithOptions` for body limits and unknown fields
 - **Validation** - Using the `Validator` interface
@@ -57,12 +58,14 @@ curl -b api_key=demo-key 'http://localhost:8080/users?page=2&limit=1'
 curl -b api_key=demo-key 'http://localhost:8080/users?team=0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70'
 # -g stops curl reading [ ] as a range pattern; a browser needs nothing
 curl -g -b api_key=demo-key 'http://localhost:8080/users?filter[name]=ali&filter[email]=example'
+curl -b api_key=demo-key 'http://localhost:8080/users?created_within=36h'
 ```
 
 **Binder features:**
 - `query:"active"` - Optional boolean filter into a `*bool`, nil when not given
 - `Paging` embedded - its `query:"page"` and `query:"limit"` fields are promoted, so any list endpoint gets paging by embedding one struct
 - `query:"team"` - Optional team filter into a `*uuid.UUID`, nil when not given
+- `query:"created_within"` - A `*time.Duration` parsed from text such as `36h` or `90m`; nil when not given, and `Validate` rejects zero or negative
 - `query:"filter"` - A `map[string]string` from `filter[field]=text` pairs, nil when none are sent; `Validate` rejects a field that cannot be filtered
 - `cookie:"api_key"` - API key from cookie; the demo middleware sets it on the response, so a browser sends it from the second request on
 
@@ -264,6 +267,7 @@ still binds into `Money`: a form carries text, which binder passes to
 8. **Embedded Structs** - `ListUsersRequest` embeds `Paging`; its fields are promoted as in `encoding/json`, and a bad `?page=` is reported as `page`
 9. **Maps** - `?filter[name]=ali` fills `Filter map[string]string`; the same `name[key]=value` form works in a form body, and a map of `int`, `bool` or `uuid.UUID` values converts each one
 10. **Custom JSON Decoding** - `Money` implements `UnmarshalJSON`, so binder hands it the JSON member; from a form post it receives the text as a JSON string, so `credit=3.10` works too
+11. **Durations** - `?created_within=36h` binds into a `*time.Duration` through `time.ParseDuration`; a number without a unit, `?created_within=36`, is reported as an invalid value
 
 ## Testing with Different Tools
 
@@ -284,6 +288,10 @@ http POST localhost:8080/users name=Eve email=eve@example.com active:=true tags:
 Try these to see error handling:
 
 ```bash
+# A duration without a unit
+curl -b api_key=demo-key 'http://localhost:8080/users?created_within=36'
+# 400 {"errors":{"created_within":"invalid value"}}
+
 # A filter on a field that cannot be filtered
 curl -g -b api_key=demo-key 'http://localhost:8080/users?filter[password]=x'
 # 422 {"errors":{"filter[password]":"is not a field that can be filtered"}}

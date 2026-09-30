@@ -129,6 +129,9 @@ type ListUsersRequest struct {
 	// A map binds from name[key]=value pairs: ?filter[name]=ali&filter[email]=example
 	// gives {"name": "ali", "email": "example"}. Nil when no filter is sent.
 	Filter map[string]string `query:"filter"`
+	// A duration binds from text: ?created_within=36h lists users created in
+	// the last 36 hours. A pointer, so no parameter means no filter.
+	CreatedWithin *time.Duration `query:"created_within"`
 }
 
 // filterFields are the user fields ?filter[...] can match, by substring.
@@ -141,6 +144,9 @@ var filterFields = map[string]func(User) string{
 // the client sent it, so a typo is reported rather than matching everyone.
 func (r ListUsersRequest) Validate(ctx context.Context) error {
 	errs := ValidationErrors{}
+	if r.CreatedWithin != nil && *r.CreatedWithin <= 0 {
+		errs["created_within"] = "must be a positive duration"
+	}
 	for key := range r.Filter {
 		if filterFields[key] == nil {
 			errs["filter["+key+"]"] = "is not a field that can be filtered"
@@ -303,6 +309,11 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 
 		// Filter by team, if given
 		if req.Team != nil && user.TeamID != *req.Team {
+			continue
+		}
+
+		// Filter by how recently the user was created, if given
+		if req.CreatedWithin != nil && time.Since(user.CreatedAt) > *req.CreatedWithin {
 			continue
 		}
 
@@ -483,6 +494,7 @@ func main() {
 	fmt.Println("  GET    http://localhost:8080/users?tags=admin&tags=user")
 	fmt.Println("  GET    http://localhost:8080/users?team=" + teamPlatform.String())
 	fmt.Println("  GET    http://localhost:8080/users?filter[name]=ali")
+	fmt.Println("  GET    http://localhost:8080/users?created_within=36h")
 	fmt.Println("  POST   http://localhost:8080/users")
 	fmt.Println("  PUT    http://localhost:8080/users/1")
 	fmt.Println("  DELETE http://localhost:8080/users/1")

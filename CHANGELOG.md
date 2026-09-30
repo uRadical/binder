@@ -62,11 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `false`, `0` or `""` even into a `*bool` or `*int`, so a PATCH setting a
   flag to false was silently dropped. A pointer already tells "not sent" (nil)
   from a zero value, so the option is now ignored on one.
+- **A `time.Duration` needs a unit in text.** A query, header, form or JSON
+  string value such as `9` used to bind as 9 nanoseconds; it is now an error
+  ("missing unit in duration"). Send `9ns`, or a JSON number, which is still
+  nanoseconds.
 - **Nested options apply.** `required` and `omitempty` inside a nested struct
   used to be ignored; they now behave as they do at the top level.
 
 ### Added
 
+- `time.Duration` binds from text such as `5s`, `1m30s` or `250ms`, from any
+  source including a JSON string, parsed with `time.ParseDuration`. A JSON
+  number is still nanoseconds, as `encoding/json` treats it.
 - `BindErrors`, the list of field failures Bind returns.
 
 ### Changed

@@ -39,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Tag constants
@@ -1935,6 +1936,9 @@ func setFieldByKind(field reflect.Value, value any) error {
 		return setString(field, value)
 
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if field.Type() == durationType {
+			return setDuration(field, value)
+		}
 		return setInt(field, value)
 
 	case reflect.Float32, reflect.Float64:
@@ -2014,6 +2018,26 @@ func jsonCompositeName(v any) string {
 		return "array"
 	}
 	return "object"
+}
+
+// durationType is time.Duration, which binds from text such as "5s".
+var durationType = reflect.TypeFor[time.Duration]()
+
+// setDuration sets a time.Duration. Text, from any source including a JSON
+// string, is parsed with time.ParseDuration, so "5s", "1m30s" and "250ms"
+// bind as written. A JSON number is a count of nanoseconds, as encoding/json
+// treats it, so a client already sending numbers keeps working.
+func setDuration(field reflect.Value, value any) error {
+	text, ok := value.(string)
+	if !ok {
+		return setInt(field, value)
+	}
+	d, err := time.ParseDuration(text)
+	if err != nil {
+		return err
+	}
+	field.SetInt(int64(d))
+	return nil
 }
 
 // setIntChecked writes an integer, refusing one the field cannot hold.

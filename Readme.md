@@ -48,6 +48,7 @@ err := binder.Bind(r, &req)
   - Cookies
   - Request headers
 - Support for primitive types, custom types, slices, maps, `any`, nested and embedded structs (arrays not supported - use slices)
+- `time.Duration` from text such as `5s` or `1m30s`
 - Type conversion
 - Validation through your own `Validate(ctx)` method, with the request context available to your rules
 - Support for required fields and omitempty behavior
