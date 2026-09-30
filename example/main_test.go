@@ -19,8 +19,8 @@ func resetStore(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	users = map[int]User{
-		1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, CreatedAt: time.Now()},
-		2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, CreatedAt: time.Now()},
+		1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, CreatedAt: time.Now()},
+		2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, TeamID: teamSupport, CreatedAt: time.Now()},
 	}
 	nextID = 3
 }
@@ -103,6 +103,27 @@ func TestListUsers(t *testing.T) {
 		t.Errorf("repeated tags: got %d %v, want 200 and only Alice", status, body)
 	}
 
+	// Page and Limit come from the embedded Paging struct.
+	status, body = request(t, "GET", "/users?page=2&limit=1", "", apiKey)
+	if status != http.StatusOK || !reflect.DeepEqual(names(body), []string{"Bob"}) || body["total"] != float64(2) {
+		t.Errorf("page 2 of 1: got %d %v, want 200, only Bob, total 2", status, body)
+	}
+
+	status, body = request(t, "GET", "/users?page=x", "", apiKey)
+	if status != http.StatusBadRequest || !reflect.DeepEqual(fieldErrors(t, body), map[string]any{"page": "invalid value"}) {
+		t.Errorf("bad page: got %d %v, want 400 and page invalid", status, body)
+	}
+
+	status, body = request(t, "GET", "/users?team="+teamSupport.String(), "", apiKey)
+	if status != http.StatusOK || !reflect.DeepEqual(names(body), []string{"Bob"}) {
+		t.Errorf("team filter: got %d %v, want 200 and only Bob", status, body)
+	}
+
+	status, body = request(t, "GET", "/users?team=not-a-uuid", "", apiKey)
+	if status != http.StatusBadRequest || !reflect.DeepEqual(fieldErrors(t, body), map[string]any{"team": "invalid value"}) {
+		t.Errorf("bad team: got %d %v, want 400 and team invalid", status, body)
+	}
+
 	if status, _ := request(t, "GET", "/users", ""); status != http.StatusUnauthorized {
 		t.Errorf("no API key: got %d, want 401", status)
 	}
@@ -117,8 +138,14 @@ func TestCreateUser(t *testing.T) {
 	}{
 		{
 			name:       "valid",
-			body:       `{"name":"Carol","email":"carol@example.com","tags":["user"]}`,
+			body:       `{"name":"Carol","email":"carol@example.com","tags":["user"],"team_id":"0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70"}`,
 			wantStatus: http.StatusCreated,
+		},
+		{
+			name:       "a team ID that is not a UUID",
+			body:       `{"name":"Carol","email":"carol@example.com","team_id":"platform"}`,
+			wantStatus: http.StatusBadRequest,
+			wantFields: map[string]any{"team_id": "invalid value"},
 		},
 		{
 			name:       "missing required fields are all reported",
@@ -162,8 +189,8 @@ func TestCreateUser(t *testing.T) {
 					t.Errorf("errors = %v, want %v", got, tt.wantFields)
 				}
 			}
-			if status == http.StatusCreated && (body["id"] != float64(3) || body["name"] != "Carol") {
-				t.Errorf("created %v, want user 3 named Carol", body)
+			if status == http.StatusCreated && (body["id"] != float64(3) || body["name"] != "Carol" || body["team_id"] != teamPlatform.String()) {
+				t.Errorf("created %v, want user 3 named Carol on the platform team", body)
 			}
 		})
 	}
@@ -179,6 +206,13 @@ func TestUpdateUser(t *testing.T) {
 	}
 	if body["name"] != "Alicia" || body["email"] != "alice@example.com" || body["active"] != true {
 		t.Errorf("updated %v, want only the name changed", body)
+	}
+
+	// false is an update, not an omission: Active is a pointer, so leaving it
+	// out and sending false are told apart.
+	status, body = request(t, "PUT", "/users/1", `{"active":false}`)
+	if status != http.StatusOK || body["active"] != false || body["name"] != "Alicia" {
+		t.Errorf("got %d %v, want active false and the name kept", status, body)
 	}
 
 	if status, _ := request(t, "PUT", "/users/99", `{"name":"X"}`); status != http.StatusNotFound {

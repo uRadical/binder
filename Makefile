@@ -7,9 +7,9 @@
 COVERAGE   := coverage.out
 CRAP_FLAGS := --exclude 'example/.*\.go' --threshold 30
 
-.PHONY: all test test-nojsonv2 cover crap crap-baseline bench vet fmt lint check fuzz mutants clean
+.PHONY: all test cover crap crap-baseline bench vet fmt lint check fuzz mutants clean
 
-all: fmt vet check test test-nojsonv2
+all: fmt vet check test
 
 # Static analysis and vulnerability scanning, as CI runs them.
 check:
@@ -22,15 +22,11 @@ fuzz:
 	go test -run '^$$' -fuzz 'FuzzBind$$' -fuzztime=30s
 	go test -run '^$$' -fuzz 'FuzzBindWithOptions' -fuzztime=15s
 	go test -run '^$$' -fuzz 'FuzzBindNested' -fuzztime=15s
+	go test -run '^$$' -fuzz 'FuzzQueryScan' -fuzztime=15s
+	go test -run '^$$' -fuzz 'FuzzCookieScan' -fuzztime=15s
 
 test:
 	go test -race ./...
-
-# The JSON body decoder has a fallback for toolchains built without the
-# jsonv2 experiment, where encoding/json/jsontext does not exist.
-test-nojsonv2:
-	GOEXPERIMENT=nojsonv2 go build ./...
-	GOEXPERIMENT=nojsonv2 go test ./...
 
 # Produce the coverage profile the CRAP scan reads. Running it here means the
 # scan does not have to run the suite a second time.
@@ -48,7 +44,7 @@ crap-baseline: cover
 	go-crap scan ./... $(CRAP_FLAGS) --coverage-profile=$(COVERAGE) -f json -o crap-baseline.json
 
 bench:
-	go test -run '^$$' -bench=. -benchmem ./...
+	go test -run '^$$' -bench=. -benchmem -benchtime=200ms -count=10 ./...
 
 vet:
 	go vet ./...

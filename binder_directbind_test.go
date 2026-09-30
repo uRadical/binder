@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// A JSON body is bound straight into fields where the build allows it, and
-// through a map otherwise. Both must agree, so every case here runs under
-// GOEXPERIMENT=nojsonv2 as well; the suite passing both ways is the check.
+// A JSON body is bound straight into fields by walking its tokens, with a
+// value the field's fast path cannot take decoded and converted instead. Both
+// routes must agree, which these cases check.
 
 func bindBody(t *testing.T, body string, target any) error {
 	t.Helper()

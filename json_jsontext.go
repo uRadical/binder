@@ -1,7 +1,5 @@
 // Copyright 2025 The binder Authors.
 
-//go:build goexperiment.jsonv2
-
 package binder
 
 import (
@@ -10,9 +8,51 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
+	"slices"
 	"strconv"
+	"sync"
 )
+
+// decodeOptions is resolved once rather than per call, since building an
+// Options value allocates.
+var decodeOptions = jsontext.AllowDuplicateNames(true)
+
+// pooledDecoder is a decoder kept for reuse together with the buffer it reads
+// from. A new decoder costs several allocations: its own state, a reader and
+// a read buffer. Reading from a bytes.Buffer, jsontext parses the bytes in
+// place rather than copying them into a buffer of its own, so a pooled
+// decoder holds no copy of an earlier request's body.
+type pooledDecoder struct {
+	buf bytes.Buffer
+	dec *jsontext.Decoder
+}
+
+var decoderPool = sync.Pool{
+	New: func() any {
+		p := new(pooledDecoder)
+		p.dec = jsontext.NewDecoder(&p.buf, decodeOptions)
+		return p
+	},
+}
+
+// getDecoder returns a decoder reading data. Release it with putDecoder once
+// nothing read from it is still in use.
+func getDecoder(data []byte) *pooledDecoder {
+	p := decoderPool.Get().(*pooledDecoder)
+	p.buf = *bytes.NewBuffer(data)
+	p.dec.Reset(&p.buf, decodeOptions)
+	return p
+}
+
+// putDecoder returns a decoder to the pool, first dropping its reference to
+// the body so that a pooled decoder never keeps a request's data alive.
+func putDecoder(p *pooledDecoder) {
+	p.buf = bytes.Buffer{}
+	p.dec.Reset(&p.buf, decodeOptions)
+	decoderPool.Put(p)
+}
 
 // decodeJSONValue reads one value, producing the types the set* helpers
 // expect: string, bool, json.Number, []any, map[string]any
@@ -122,42 +162,51 @@ func jsonKindName(k jsontext.Kind) string {
 // avoids both, and lets a member no field binds be skipped without decoding it
 // at all.
 //
-// It reports which fields were filled, so the caller can apply required to the
-// ones that were not, and the names of members nothing binds. A member that
+// It marks in bound, which the caller provides, the fields it filled, so the
+// caller can apply required to the ones it did not, and reports the names of
+// members nothing binds. A member that
 // cannot be converted is recorded in errs and the walk continues; only a
 // failure to read the JSON itself is returned.
-func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, errs *fieldErrs) (bodyData map[string]any, bound []bool, unknown []string, err error) {
+func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[string]struct{}, wantUnknown bool, bound []bool, errs *fieldErrs) (bodyData map[string]any, unknown []string, err error) {
 	_ = wanted // the walk consults info.bodyFields directly
-	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true))
+	pooled := getDecoder(data)
+	defer putDecoder(pooled)
+	dec := pooled.dec
 
 	tok, err := dec.ReadToken()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	switch tok.Kind() {
 	case 'n':
-		return nil, nil, nil, nil // a null body carries no members
+		// A null body carries no members.
+		return nil, nil, endOfBody(dec)
 	case '{':
 	default:
-		return nil, nil, nil, fmt.Errorf("cannot unmarshal %s into map[string]interface {}", jsonKindName(tok.Kind()))
+		return nil, nil, fmt.Errorf("cannot unmarshal %s into map[string]interface {}", jsonKindName(tok.Kind()))
 	}
 
-	bound = make([]bool, len(info.fields))
 	for dec.PeekKind() == '"' {
-		nameTok, err := dec.ReadToken()
+		// The name is looked up from its raw bytes, since a map lookup keyed
+		// by string(b) does not allocate, where making it a string first
+		// would, for every member. The bytes are voided by the next call on
+		// the decoder, so an unknown name is copied before moving on.
+		raw, err := dec.ReadValue()
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
-		// A Token is voided by the next call on the decoder.
-		name := nameTok.String()
+		name, err := memberName(raw)
+		if err != nil {
+			return nil, nil, err
+		}
 
-		index, isBound := info.bodyFields[name]
+		index, isBound := info.bodyFields[string(name)]
 		if !isBound {
-			if wantUnknown {
-				unknown = append(unknown, name)
+			if wantUnknown && !slices.Contains(unknown, string(name)) {
+				unknown = append(unknown, string(name))
 			}
 			if err := dec.SkipValue(); err != nil {
-				return nil, nil, nil, err
+				return nil, nil, err
 			}
 			continue
 		}
@@ -166,10 +215,10 @@ func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[str
 		// the walk can carry on to the next one. The field counts as bound
 		// either way: it was present, so required must not report it again.
 		fi := info.fields[index]
-		if err := decodeJSONInto(dec, val.Field(fi.Index), fi); err != nil {
+		if err := decodeJSONInto(dec, fieldByIndex(val, fi.Index), fi); err != nil {
 			var failed conversionFailure
 			if !errors.As(err, &failed) {
-				return nil, nil, nil, err
+				return nil, nil, err
 			}
 			errs.set(info, index, fieldFailures(fi, failed.err))
 		}
@@ -177,9 +226,32 @@ func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[str
 	}
 
 	if _, err := dec.ReadToken(); err != nil { // the closing brace
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return nil, bound, unknown, nil
+	return nil, unknown, endOfBody(dec)
+}
+
+// endOfBody reports anything after the body's one JSON value, such as a
+// second object, which would otherwise be ignored. Trailing whitespace is
+// allowed.
+func endOfBody(dec *jsontext.Decoder) error {
+	if dec.PeekKind() != 0 {
+		return errors.New("unexpected data after top-level value")
+	}
+	if _, err := dec.ReadToken(); err != io.EOF {
+		return fmt.Errorf("unexpected data after top-level value: %w", err)
+	}
+	return nil
+}
+
+// memberName returns an object member's name from its raw, quoted form. A name
+// without escapes is the bytes between the quotes, with nothing to allocate;
+// only one written with escapes, such as "\u0061ge", is decoded.
+func memberName(raw jsontext.Value) ([]byte, error) {
+	if bytes.IndexByte(raw, '\\') < 0 {
+		return raw[1 : len(raw)-1], nil
+	}
+	return jsontext.AppendUnquote(nil, raw)
 }
 
 // decodeJSONInto writes one JSON value into a struct field. Where the field is

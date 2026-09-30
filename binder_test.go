@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -701,22 +702,22 @@ func TestFieldCache(t *testing.T) {
 	// Tags are resolved, not stored raw: the name excludes its options and
 	// the options are recorded separately.
 	want := []fieldInfo{
-		{Index: 0, Source: path, TagName: "id"},
-		{Index: 1, Source: query, TagName: "name", OmitEmpty: true},
-		{Index: 2, Source: body, TagName: "email", Required: true},
+		{Index: []int{0}, Source: path, TagName: "id"},
+		{Index: []int{1}, Source: query, TagName: "name", OmitEmpty: true},
+		{Index: []int{2}, Source: body, TagName: "email", Required: true},
 	}
 	for i, w := range want {
 		got := info1[i]
-		if got.Index != w.Index || got.Source != w.Source || got.TagName != w.TagName ||
+		if !slices.Equal(got.Index, w.Index) || got.Source != w.Source || got.TagName != w.TagName ||
 			got.OmitEmpty != w.OmitEmpty || got.Required != w.Required {
-			t.Errorf("Entry %d = %+v, want Index=%d Source=%s TagName=%q OmitEmpty=%v Required=%v",
+			t.Errorf("Entry %d = %+v, want Index=%v Source=%s TagName=%q OmitEmpty=%v Required=%v",
 				i, got, w.Index, w.Source, w.TagName, w.OmitEmpty, w.Required)
 		}
 	}
 
 	// Entries must be ordered by field index so binding order is stable
 	for i := 1; i < len(info1); i++ {
-		if info1[i].Index <= info1[i-1].Index {
+		if slices.Compare(info1[i].Index, info1[i-1].Index) <= 0 {
 			t.Errorf("Entries are not in field order: %+v", info1)
 			break
 		}
@@ -747,6 +748,13 @@ func TestContentTypeParser(t *testing.T) {
 		{"text/plain; charset=iso-8859-1", "text/plain"},
 		{"", ""},
 		{"  application/json  ; charset=utf-8", "application/json"},
+		{"Application/JSON", "application/json"},
+		{"application/json;", "application/json"},
+		{";", ""},
+		{"charset=utf-8", ""},
+		{"a=1;b=2", ""},
+		{"charset=utf-8; application/json", "application/json"},
+		{"charset=utf-8;;text/plain", ""},
 	}
 
 	for _, tt := range tests {

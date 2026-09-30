@@ -1,6 +1,8 @@
 package binder
 
 import (
+	"encoding"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -93,5 +95,38 @@ func TestSplitTag(t *testing.T) {
 		if name != tt.wantName || opts != tt.wantOpts {
 			t.Errorf("splitTag(%q) = (%q, %q), want (%q, %q)", tt.tag, name, opts, tt.wantName, tt.wantOpts)
 		}
+	}
+}
+
+// As in encoding/json, json:"-" is not a binding tag: it used to bind a body
+// key literally named "-". An empty name binds under the Go field name, where
+// it used to bind the key "".
+func TestJSONTagDashAndEmptyName(t *testing.T) {
+	var got struct {
+		Secret string `json:"-"`
+		Name   string `json:",omitempty"`
+		Token  string `json:"-" header:"X-Token"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"-":"leaked","Name":"n","":"wrong"}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Token", "t")
+	if err := Bind(r, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Secret != "" || got.Name != "n" || got.Token != "t" {
+		t.Errorf("got Secret=%q Name=%q Token=%q, want \"\", n, t", got.Secret, got.Name, got.Token)
+	}
+}
+
+// A field whose type is an interface names nothing to bind into. It used to
+// panic when that interface was encoding.TextUnmarshaler.
+func TestInterfaceFieldIsAnErrorNotAPanic(t *testing.T) {
+	var got struct {
+		X encoding.TextUnmarshaler `query:"x"`
+	}
+	err := Bind(httptest.NewRequest("GET", "/?x=1", nil), &got)
+	var errs BindErrors
+	if !errors.As(err, &errs) || len(errs) != 1 || errs[0].Field != "X" {
+		t.Errorf("got %v, want one BindError for X", err)
 	}
 }

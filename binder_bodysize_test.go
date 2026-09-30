@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 type sizedRequest struct {
@@ -138,4 +139,135 @@ type trackingReader struct {
 func (t *trackingReader) Read(p []byte) (int, error) {
 	t.reads++
 	return t.Reader.Read(p)
+}
+
+// readBody reads into one buffer sized from Content-Length where it can. These
+// pin its edges: a length that overstates the body, reads that trickle in a
+// byte at a time past the initial buffer, data that arrives with io.EOF, and
+// a failure part way through.
+func TestReadBodyEdges(t *testing.T) {
+	bind := func(body io.Reader, contentLength, limit int64) (sizedRequest, error) {
+		r := httptest.NewRequest("POST", "/u", body)
+		r.Header.Set("Content-Type", "application/json")
+		r.ContentLength = contentLength
+		var got sizedRequest
+		err := bindWithLimit(r, &got, limit)
+		return got, err
+	}
+	large := jsonBodyOfSize(5000) // well past the 512 byte initial buffer
+
+	t.Run("overstated length", func(t *testing.T) {
+		got, err := bind(strings.NewReader(`{"data":"x"}`), 1000, 1024)
+		if err != nil || got.Data != "x" {
+			t.Fatalf("got %+v, %v; want the short body bound", got, err)
+		}
+	})
+
+	t.Run("byte at a time, no declared length", func(t *testing.T) {
+		got, err := bind(iotest.OneByteReader(strings.NewReader(large)), -1, 1<<20)
+		if err != nil || len(got.Data) != 5000-len(`{"data":""}`) {
+			t.Fatalf("got %d bytes, %v; want the whole body", len(got.Data), err)
+		}
+	})
+
+	t.Run("byte at a time, over the limit", func(t *testing.T) {
+		_, err := bind(iotest.OneByteReader(strings.NewReader(large)), -1, 1024)
+		if !errors.Is(err, ErrBodyTooLarge) {
+			t.Fatalf("got %v, want ErrBodyTooLarge", err)
+		}
+	})
+
+	t.Run("byte at a time, no limit", func(t *testing.T) {
+		got, err := bind(iotest.OneByteReader(strings.NewReader(large)), -1, -1)
+		if err != nil || len(got.Data) != 5000-len(`{"data":""}`) {
+			t.Fatalf("got %d bytes, %v; want the whole body", len(got.Data), err)
+		}
+	})
+
+	t.Run("data with EOF", func(t *testing.T) {
+		got, err := bind(iotest.DataErrReader(strings.NewReader(large)), int64(len(large)), 1<<20)
+		if err != nil || len(got.Data) != 5000-len(`{"data":""}`) {
+			t.Fatalf("got %d bytes, %v; want the whole body", len(got.Data), err)
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		boom := errors.New("connection reset")
+		_, err := bind(io.MultiReader(strings.NewReader(`{"data":`), iotest.ErrReader(boom)), -1, 1024)
+		if !errors.Is(err, boom) {
+			t.Fatalf("got %v, want the read error", err)
+		}
+		if errors.Is(err, ErrBodyTooLarge) || errors.Is(err, ErrMalformedBody) {
+			t.Errorf("a read failure was misreported as %v", err)
+		}
+	})
+}
+
+// The restored body can be read again in full, and closed.
+func TestBodyRestoredAfterBind(t *testing.T) {
+	const body = `{"data":"again"}`
+	r := httptest.NewRequest("POST", "/u", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+
+	var got sizedRequest
+	if err := Bind(r, &got); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := io.ReadAll(r.Body)
+	if err != nil || string(rest) != body {
+		t.Fatalf("restored body = %q, %v; want %q", rest, err, body)
+	}
+	if err := r.Body.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+// An oversized body used to be left part read, so a later reader saw only
+// what binder had not consumed. The body is put back whole.
+func TestBodyRestoredAfterTooLarge(t *testing.T) {
+	body := jsonBodyOfSize(100)
+	r := httptest.NewRequest("POST", "/u", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.ContentLength = -1 // undeclared, so the limit is found by reading
+
+	var got sizedRequest
+	if err := bindWithLimit(r, &got, 10); !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("got %v, want ErrBodyTooLarge", err)
+	}
+	rest, err := io.ReadAll(r.Body)
+	if err != nil || string(rest) != body {
+		t.Fatalf("restored body = %q, %v; want %q", rest, err, body)
+	}
+	if err := r.Body.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+// A target with no body field does not read the body, so it is neither
+// limited nor parsed: the handler gets it untouched.
+func TestBodyUnreadWithoutBodyFields(t *testing.T) {
+	var got struct {
+		ID string `header:"X-Id"`
+	}
+	const body = `{not json`
+	r := httptest.NewRequest("POST", "/u", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Id", "7")
+	if err := bindWithLimit(r, &got, 1); err != nil {
+		t.Fatalf("got %v, want nil", err)
+	}
+	if got.ID != "7" {
+		t.Errorf("ID = %q, want 7", got.ID)
+	}
+	rest, _ := io.ReadAll(r.Body)
+	if string(rest) != body {
+		t.Errorf("body = %q, want it unread", rest)
+	}
+
+	// Reporting unknown members needs the body, so it is still read then.
+	r = httptest.NewRequest("POST", "/u", strings.NewReader(`{"extra":1}`))
+	r.Header.Set("Content-Type", "application/json")
+	if err := BindWithOptions(r, &got, BindOptions{DisallowUnknownFields: true}); !errors.Is(err, ErrUnknownField) {
+		t.Errorf("got %v, want ErrUnknownField", err)
+	}
 }

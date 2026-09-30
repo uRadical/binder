@@ -27,9 +27,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"reflect"
 	"slices"
@@ -62,14 +64,126 @@ var bindSources = [...]string{path, query, body, jjson, cookie, header}
 // fieldTag returns the active binding tag for a struct field: the source it
 // binds from, the name to look up in that source, and the options that follow
 // the name. ok is false when the field carries no binding tag.
-func fieldTag(field reflect.StructField) (source, name, opts string, ok bool) {
-	for _, src := range bindSources {
-		if tag := field.Tag.Get(src); tag != "" {
-			name, opts = splitTag(tag)
+//
+// As in encoding/json, `json:"-"` is not a binding tag, and a tag with an empty
+// name, such as `json:",omitempty"`, binds under the Go field name.
+func fieldTag(field reflect.StructField, sources []string) (source, name, opts string, ok bool) {
+	for _, src := range sources {
+		if name, opts, ok = sourceTag(field, src); ok {
 			return src, name, opts, true
 		}
 	}
 	return "", "", "", false
+}
+
+// taggedField is a field that binds, found on a struct itself or promoted
+// from a struct it embeds.
+type taggedField struct {
+	index  []int  // path from the outer struct, as reflect.Value.FieldByIndex takes
+	goName string // Go name, through any embedded structs: Paging.Page
+	field  reflect.StructField
+	source string
+	name   string
+	opts   string
+}
+
+// taggedFields lists the fields of typ that bind from the given sources, in
+// declaration order. As in encoding/json, an embedded struct, or pointer to
+// one, that carries no binding tag of its own has its fields promoted; a
+// tagged one is an ordinary field. A key declared at more than one depth
+// binds only the shallowest field, and at the same depth, the first declared.
+func taggedFields(typ reflect.Type, sources []string) []taggedField {
+	type level struct {
+		typ   reflect.Type
+		index []int
+		path  string
+	}
+	var out []taggedField
+	seen := make(map[[2]string]bool)
+	visited := make(map[reflect.Type]bool)
+	for current := []level{{typ: typ}}; len(current) > 0; {
+		var next []level
+		var found []taggedField
+		for _, l := range current {
+			// A struct reached twice, as through a cycle of embedded
+			// pointers, has already given up its fields.
+			if visited[l.typ] {
+				continue
+			}
+			visited[l.typ] = true
+
+			for i := 0; i < l.typ.NumField(); i++ {
+				f := l.typ.Field(i)
+				index := append(slices.Clip(l.index), i)
+				source, name, opts, ok := fieldTag(f, sources)
+
+				if !ok && f.Anonymous {
+					t := f.Type
+					isPtr := t.Kind() == reflect.Ptr
+					if isPtr {
+						t = t.Elem()
+					}
+					// An unexported embedded pointer cannot be allocated,
+					// but an unexported embedded struct's exported fields
+					// can still be set.
+					if t.Kind() == reflect.Struct && (f.IsExported() || !isPtr) {
+						next = append(next, level{typ: t, index: index, path: l.path + f.Name + "."})
+					}
+					continue
+				}
+
+				// Unexported fields cannot be set through reflection, so they
+				// are ignored even when tagged, as encoding/json does.
+				if !ok || !f.IsExported() {
+					continue
+				}
+				found = append(found, taggedField{index: index, goName: l.path + f.Name, field: f, source: source, name: name, opts: opts})
+			}
+		}
+		for _, tf := range found {
+			key := [2]string{tf.source, tf.name}
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, tf)
+			}
+		}
+		current = next
+	}
+	slices.SortFunc(out, func(a, b taggedField) int { return slices.Compare(a.index, b.index) })
+	return out
+}
+
+// fieldByIndex returns the field at index, allocating any nil embedded pointer
+// on the way to it, as encoding/json does when it sets a promoted field. It is
+// called only once there is a value to set, so an embedded pointer none of
+// whose fields is sent stays nil.
+func fieldByIndex(v reflect.Value, index []int) reflect.Value {
+	if len(index) == 1 {
+		return v.Field(index[0])
+	}
+	for i, x := range index {
+		if i > 0 && v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			v = v.Elem()
+		}
+		v = v.Field(x)
+	}
+	return v
+}
+
+// sourceTag returns a field's tag for one source, split into name and options.
+func sourceTag(field reflect.StructField, src string) (name, opts string, ok bool) {
+	tag := field.Tag.Get(src)
+	if tag == "" || (src == jjson && tag == "-") {
+		return "", "", false
+	}
+	name, opts = splitTag(tag)
+	if name == "" {
+		name = field.Name
+	}
+	return name, opts, true
 }
 
 // hasOption reports whether a comma-separated tag option list contains opt.
@@ -102,14 +216,19 @@ func splitTag(tag string) (name, opts string) {
 // fieldInfo is one struct field's binding tag, resolved once per type. Holding
 // the parsed name and options here keeps tag parsing off the per-request path.
 type fieldInfo struct {
-	Index     int                 // position of the field within the struct
-	FieldType reflect.StructField // retained for error reporting
-	Source    string              // "path", "query", "body", "json", "cookie"
+	Index     []int               // path to the field, through any embedded structs
+	Name      string              // Go name for error reporting, such as Paging.Page
+	FieldType reflect.StructField // the field itself
+	Source    string              // "path", "query", "body", "json", "cookie", "header"
 	TagName   string              // key to look up in Source, without options
 	OmitEmpty bool
 	Required  bool
 	IsSlice   bool     // destination is a slice, so repeated values all bind
 	Fast      fastKind // set straight from a JSON token, skipping conversion
+	// HeaderKey is TagName in canonical form, for a header field. Resolving
+	// it once lets r.Header be indexed directly, where Header.Get
+	// canonicalises the name, allocating, on every request.
+	HeaderKey string
 }
 
 // fastKind names the destinations a JSON token can fill without going through
@@ -195,7 +314,8 @@ var fieldCacheMutex sync.RWMutex
 //
 // When a type implements Validator, Bind will call Validate after binding
 // and return any validation errors, wrapped so that errors.Is and errors.As
-// still reach them; a cancelled request matches context.Canceled.
+// still reach them. If Validate returns ctx.Err(), or an error wrapping it, a
+// cancelled request matches context.Canceled.
 type Validator interface {
 	Validate(ctx context.Context) error
 }
@@ -230,7 +350,7 @@ var ErrBodyTooLarge = errors.New("request body too large")
 var ErrMalformedBody = errors.New("malformed request body")
 
 // ErrInvalidTarget is returned by Bind when the destination is not a non-nil
-// pointer to a struct. Unlike ErrBodyTooLarge and ErrMalformedBody it reports
+// pointer to a struct, or the request is nil. Unlike ErrBodyTooLarge and ErrMalformedBody it reports
 // a programming error rather than a bad request, so a handler that sees it
 // should answer http.StatusInternalServerError rather than blaming the client.
 var ErrInvalidTarget = errors.New("invalid bind target")
@@ -303,9 +423,9 @@ type BindOptions struct {
 	// Zero applies DefaultMaxBodySize, and a negative value removes the limit.
 	MaxBodySize int64
 
-	// DisallowUnknownFields makes binding fail with ErrUnknownField when the
-	// request body carries a top-level key that no field of the target binds.
-	// Keys nested inside objects are not inspected.
+	// DisallowUnknownFields reports each top-level body key that no field of
+	// the target binds, as a BindErrors entry wrapping ErrUnknownField. Keys
+	// nested inside objects are not inspected.
 	DisallowUnknownFields bool
 }
 
@@ -353,12 +473,18 @@ func (o BindOptions) maxBodySize() int64 {
 // Fields that reflection cannot set, meaning unexported ones, are ignored even
 // when they carry a binding tag.
 //
+// The body is read only when a field binds from it, or when
+// BindOptions.DisallowUnknownFields needs to see it, and is restored afterwards
+// so a later handler can read it again.
+//
 // Returns an error if:
-//   - The target is not a non-nil pointer to a struct (see ErrInvalidTarget)
+//   - The target is not a non-nil pointer to a struct, or the request is nil
+//     (see ErrInvalidTarget)
 //   - Type conversion fails
 //   - Required fields are missing
 //   - The request body exceeds DefaultMaxBodySize (see ErrBodyTooLarge)
 //   - The request body cannot be parsed (see ErrMalformedBody)
+//   - The request body cannot be read, such as when the client disconnects
 //   - Validation fails (if the struct implements Validator)
 func Bind(r *http.Request, i any) error {
 	return BindWithOptions(r, i, BindOptions{MaxBodySize: DefaultMaxBodySize})
@@ -404,10 +530,28 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 	// bound after it could be trusted.
 	var errs fieldErrs
 
-	// Parse request body once
-	bodyData, bound, unknown, err := parseRequestBody(r, opts.maxBodySize(), wanted, info, val, opts.DisallowUnknownFields, &errs)
-	if err != nil {
-		return err
+	// Which fields the JSON walk filled, so the rest can be bound from other
+	// sources. A struct of up to 64 fields, which is nearly every request
+	// type, records them in an array on the stack rather than in a slice
+	// allocated per call.
+	var boundArr [64]bool
+	var bound []bool
+	if len(info.fields) <= len(boundArr) {
+		bound = boundArr[:len(info.fields)]
+	} else {
+		bound = make([]bool, len(info.fields))
+	}
+
+	// Parse request body once, and only when something reads it: a target
+	// with no body field leaves the body unread for the handler, unless
+	// unknown members must be reported, when every member is one.
+	var bodyData map[string]any
+	var unknown []string
+	if len(info.bodyKeys) > 0 || opts.DisallowUnknownFields {
+		bodyData, unknown, err = parseRequestBody(r, opts.maxBodySize(), wanted, info, val, opts.DisallowUnknownFields, bound, &errs)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Process each field in the struct
@@ -437,7 +581,11 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 //	var errs binder.BindErrors
 //	if errors.As(err, &errs) {
 //	    for _, e := range errs {
-//	        problems[e.Name] = e.Message
+//	        if errors.Is(e, binder.ErrMissingRequired) {
+//	            problems[e.Name] = "required"
+//	        } else {
+//	            problems[e.Name] = "invalid value"
+//	        }
 //	    }
 //	}
 //
@@ -536,87 +684,127 @@ func targetStruct(i any) (reflect.Type, reflect.Value, error) {
 // parseRequestBody reads and parses the request body, restoring it for other
 // readers.
 //
-// A JSON body is bound straight into the target where the build allows it,
-// which returns a nil map, the set of fields it filled and, when wantUnknown is
+// A JSON body is bound straight into the target, which returns a nil map, the set of fields it filled and, when wantUnknown is
 // set, the members nothing binds; a field it could not fill is recorded in
 // errs. Every other format returns the map that binding reads from, and a nil
 // set.
-func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}, info *typeInfo, val reflect.Value, wantUnknown bool, errs *fieldErrs) (map[string]any, []bool, []string, error) {
+func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}, info *typeInfo, val reflect.Value, wantUnknown bool, bound []bool, errs *fieldErrs) (map[string]any, []string, error) {
 	// Content-Length is not consulted here: a chunked request declares no
 	// length at all, so skipping on a non-positive Content-Length would drop
 	// its body entirely. Whether a body is empty is decided after reading.
 	if r.Body == nil || r.Body == http.NoBody {
-		return make(map[string]any), nil, nil, nil
+		return nil, nil, nil
 	}
 
-	// Read the body once, refusing anything oversized
+	// Read the body once, refusing anything oversized. A read that fails
+	// part way puts back what it consumed ahead of the rest, so the body a
+	// later handler sees is the one the client sent.
 	bodyBytes, err := readBody(r, maxBodySize)
 	if err != nil {
-		return nil, nil, nil, err
+		if len(bodyBytes) > 0 {
+			r.Body = &prefixedBody{Reader: io.MultiReader(bytes.NewReader(bodyBytes), r.Body), Closer: r.Body}
+		}
+		return nil, nil, err
 	}
 
 	// Restore the body for other potential readers
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	r.Body = newReplayBody(bodyBytes)
 
 	// An absent body is not a malformed one, so an empty read is reported as
 	// no data rather than handed to a parser that would reject it.
 	if len(bodyBytes) == 0 {
-		return make(map[string]any), nil, nil, nil
+		return nil, nil, nil
 	}
 
-	// A JSON body is handled before the other formats: where the build allows
-	// it, members go straight into their fields rather than through a map.
+	// A JSON body is handled before the other formats: its members go
+	// straight into their fields rather than through a map.
 	if isJSONContentType(parseContentType(r.Header.Get("Content-Type"))) {
 		// A failure to convert one member concerns that field and is
 		// recorded in errs; only a failure to read the body is returned.
-		bodyData, bound, unknown, err := jsonBodyInto(bodyBytes, info, val, wanted, wantUnknown, errs)
+		bodyData, unknown, err := jsonBodyInto(bodyBytes, info, val, wanted, wantUnknown, bound, errs)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
+			return nil, nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
 		}
-		return bodyData, bound, unknown, nil
+		return bodyData, unknown, nil
 	}
-
-	// Create a copy of the request with the new body for parsing
-	rCopy := *r
-	rCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	// Parse the body. A body that cannot be parsed is reported rather than
 	// discarded: binding would otherwise report success while every
 	// body-sourced field was silently left at its zero value.
-	bodyData, err := parseBody(rCopy, bodyBytes, wanted)
-	return bodyData, nil, nil, err
+	bodyData, err := parseBody(r.Header.Get("Content-Type"), bodyBytes)
+	return bodyData, nil, err
 }
 
-// readBody reads the whole request body, refusing bodies larger than
-// limit. The limit is enforced while reading rather than trusting
-// Content-Length, which the client controls and may understate. An oversized
-// body is reported as an error rather than truncated, so that a request is
-// never bound from a partial body.
-func readBody(r *http.Request, limit int64) ([]byte, error) {
-	if limit <= 0 {
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			return nil, fmt.Errorf("error reading request body: %w", err)
-		}
-		return bodyBytes, nil
-	}
+// replayBody is a request body restored from bytes already read, so that a
+// handler or middleware after Bind can read it again. It is one allocation,
+// where io.NopCloser around a bytes.Buffer is two.
+type replayBody struct{ bytes.Reader }
 
+func (*replayBody) Close() error { return nil }
+
+// prefixedBody is a request body whose first bytes were read and then put
+// back, closing the original body when it is closed.
+type prefixedBody struct {
+	io.Reader
+	io.Closer
+}
+
+func newReplayBody(b []byte) *replayBody {
+	rb := new(replayBody)
+	rb.Reset(b)
+	return rb
+}
+
+// readBody reads the whole request body, refusing bodies larger than limit,
+// or reading without bound when limit is zero or less. The limit is enforced
+// while reading rather than trusting Content-Length, which the client
+// controls and may understate. An oversized body is reported as an error
+// rather than truncated, so that a request is never bound from a partial
+// body. On failure it still returns the bytes it consumed, so that the caller
+// can put them back.
+//
+// It reads into one buffer rather than using io.ReadAll over io.LimitReader:
+// that saves the LimitReader, and a buffer sized from Content-Length, where
+// one is declared within the limit, is a single allocation of the right size
+// rather than 512 bytes grown by doubling. An understated length only means
+// the buffer grows; it cannot get past the limit.
+func readBody(r *http.Request, limit int64) ([]byte, error) {
 	// Reject an honestly declared oversized body without reading it at all.
-	if r.ContentLength > limit {
+	if limit > 0 && r.ContentLength > limit {
 		return nil, fmt.Errorf("%w: %d bytes declared, limit is %d", ErrBodyTooLarge, r.ContentLength, limit)
 	}
 
-	// Read one byte past the limit so an understated Content-Length is
-	// detected instead of silently truncating the body.
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	if err != nil {
-		return nil, fmt.Errorf("error reading request body: %w", err)
+	// One byte more than the declared length leaves room to see EOF without
+	// growing. Without a limit a declared length is not trusted as a size,
+	// since nothing bounds it.
+	size := 512
+	if limit > 0 && r.ContentLength > 0 {
+		size = int(r.ContentLength) + 1
 	}
-	if int64(len(bodyBytes)) > limit {
-		return nil, fmt.Errorf("%w: limit is %d bytes", ErrBodyTooLarge, limit)
-	}
+	buf := make([]byte, 0, size)
 
-	return bodyBytes, nil
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)] // grow, as io.ReadAll does
+		}
+		// Read at most one byte past the limit, which is enough to tell an
+		// oversized body from one exactly at the limit.
+		space := buf[len(buf):cap(buf)]
+		if limit > 0 && int64(len(space)) > limit+1-int64(len(buf)) {
+			space = space[:limit+1-int64(len(buf))]
+		}
+		n, err := r.Body.Read(space)
+		buf = buf[:len(buf)+n]
+		if limit > 0 && int64(len(buf)) > limit {
+			return buf, fmt.Errorf("%w: limit is %d bytes", ErrBodyTooLarge, limit)
+		}
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return buf, fmt.Errorf("error reading request body: %w", err)
+		}
+	}
 }
 
 // unknownKeys returns the body keys that no field of the target binds. Only
@@ -648,27 +836,100 @@ func unknownFieldErrors(unknown []string) []*BindError {
 	return errs
 }
 
-// queryCache parses a request's query string on first use and reuses it for
-// the rest of the call. net/url reparses on every call to URL.Query, so a
-// struct with several query tags would otherwise parse the whole string once
-// per field. Parsing is deferred so that a target binding from no query
-// parameter at all does not pay for it.
+// queryCache reads query parameters for one call to Bind.
+//
+// A short query is scanned for each parameter a field asks for, rather than
+// parsed into url.Values: building that map, with a slice per key, cost
+// several allocations to read a handful of values, where a scan costs none
+// for a value without escapes, which is a substring of RawQuery. A long query
+// is parsed once into url.Values instead, so that it costs one pass rather
+// than one per field, and so that net/url's own limit on the number of
+// parameters, urlmaxqueryparams, applies to it unchanged.
 type queryCache struct {
-	url    *url.URL
-	parsed url.Values
+	url     *url.URL
+	checked bool // whether short has been decided
+	short   bool
+	parsed  url.Values
 }
 
-func (q *queryCache) ensure() url.Values {
+// maxScanPairs is the most parameters a query may have for scanning, which
+// costs one pass per field, to be cheaper than parsing it once.
+const maxScanPairs = 64
+
+func (q *queryCache) scan() bool {
+	if !q.checked {
+		q.short = strings.Count(q.url.RawQuery, "&") < maxScanPairs
+		q.checked = true
+	}
+	return q.short
+}
+
+func (q *queryCache) values() url.Values {
 	if q.parsed == nil {
 		q.parsed = q.url.Query()
 	}
 	return q.parsed
 }
 
-func (q *queryCache) get(name string) string { return q.ensure().Get(name) }
+// get returns the first value of a parameter, as url.Values.Get does.
+func (q *queryCache) get(name string) string {
+	if !q.scan() {
+		return q.values().Get(name)
+	}
+	for query := q.url.RawQuery; query != ""; {
+		var value string
+		var ok bool
+		value, query, ok = nextQueryValue(query, name)
+		if ok {
+			return value
+		}
+	}
+	return ""
+}
 
 // all returns every value given for a parameter, for binding into a slice.
-func (q *queryCache) all(name string) []string { return q.ensure()[name] }
+func (q *queryCache) all(name string) []string {
+	if !q.scan() {
+		return q.values()[name]
+	}
+	var values []string
+	for query := q.url.RawQuery; query != ""; {
+		var value string
+		var ok bool
+		value, query, ok = nextQueryValue(query, name)
+		if ok {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+// nextQueryValue consumes the next pair from query and reports whether it
+// gives a value for name, returning the rest of the query. It skips exactly
+// the pairs url.ParseQuery skips, in the same order of checks: an empty one,
+// one containing a semicolon, and one whose key or value is not validly
+// escaped. QueryUnescape returns its argument unchanged, without allocating,
+// when there is nothing to unescape.
+//
+// Checking the key before the rest of the pair looks cheaper, since most pairs
+// are for another parameter, but measured slower: strings.ContainsAny to find
+// a key needing no unescape costs more than QueryUnescape's own tight loop.
+func nextQueryValue(query, name string) (value, rest string, ok bool) {
+	pair, rest, _ := strings.Cut(query, "&")
+	if pair == "" || strings.Contains(pair, ";") {
+		return "", rest, false
+	}
+	key, value, _ := strings.Cut(pair, "=")
+	key, err := url.QueryUnescape(key)
+	if err != nil || key != name {
+		return "", rest, false
+	}
+	value, err = url.QueryUnescape(value)
+	if err != nil {
+		return "", rest, false
+	}
+	return value, rest, true
+}
 
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request, recording in errs each field that fails.
@@ -677,7 +938,27 @@ func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyDa
 
 	for index, fi := range info.fields {
 		// A body field the JSON walk already filled needs nothing further.
-		if bound != nil && bound[index] {
+		if bound[index] {
+			continue
+		}
+
+		// A single value from the path, query, a header or a cookie is a
+		// string, and is set without passing through any: storing a string
+		// in an interface puts it on the heap, one allocation per field.
+		if isStringSource(fi) {
+			s, exists := stringValue(r, fi, &queries)
+			if !exists {
+				if fi.Required {
+					errs.set(info, index, []*BindError{missingRequiredError(fi)})
+				}
+				continue
+			}
+			if fi.OmitEmpty && s == "" {
+				continue
+			}
+			if err := setFromString(fieldByIndex(val, fi.Index), s, fi); err != nil {
+				errs.set(info, index, fieldFailures(fi, err))
+			}
 			continue
 		}
 
@@ -703,63 +984,220 @@ func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyDa
 		}
 
 		// Set the field value
-		if err := bindFieldValue(val.Field(fi.Index), value); err != nil {
+		if err := bindFieldValue(fieldByIndex(val, fi.Index), value); err != nil {
 			errs.set(info, index, fieldFailures(fi, err))
 		}
 	}
 }
 
-// extractFieldValue gets the value for a field from the appropriate request source
-func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]any, queries *queryCache) (any, bool, error) {
+// isStringSource reports whether a field binds from a single string: any
+// path or cookie field, and a query or header field that is not a slice, which
+// takes only the first value.
+func isStringSource(fi fieldInfo) bool {
+	switch fi.Source {
+	case path, cookie:
+		return true
+	case query, header:
+		return !fi.IsSlice
+	default:
+		return false
+	}
+}
+
+// stringValue gets the value for a field that binds from a single string, and
+// whether the request carried one. For path, query and header an empty value
+// counts as absent: path and query cannot tell the two apart, and a header is
+// treated the same way.
+func stringValue(r *http.Request, fi fieldInfo, queries *queryCache) (string, bool) {
 	switch fi.Source {
 	case path:
 		v := r.PathValue(fi.TagName)
-		return v, v != "", nil
+		return v, v != ""
 
 	case query:
-		if fi.IsSlice {
-			vs := queries.all(fi.TagName)
-			return vs, len(vs) > 0, nil
-		}
 		v := queries.get(fi.TagName)
-		return v, v != "", nil
+		return v, v != ""
+
+	case cookie:
+		return cookieValue(r, fi.TagName)
+
+	case header:
+		// HeaderKey is canonical, so `header:"x-request-id"` and
+		// `header:"X-Request-ID"` name the same header, as with Header.Get.
+		vs := r.Header[fi.HeaderKey]
+		if len(vs) == 0 {
+			return "", false
+		}
+		return vs[0], vs[0] != ""
+
+	default:
+		return "", false
+	}
+}
+
+// maxScanCookies is the most cookies a request may carry for cookieValue to
+// scan them itself rather than defer to r.Cookie.
+const maxScanCookies = 64
+
+// cookieValue returns the value of the named cookie, and whether the request
+// carried a valid one, exactly as r.Cookie does. r.Cookie parses every cookie
+// in the header into a *Cookie on each call, allocating; this finds the one
+// wanted, and returns its value as a substring of the header.
+//
+// It takes the same steps as net/http's readCookies, in the same order, and
+// takes the first valid match. A request with more than maxScanCookies
+// cookies is handed to r.Cookie itself, so that net/http's own limit on the
+// number of cookies, httpcookiemaxnum, applies to it unchanged.
+func cookieValue(r *http.Request, name string) (string, bool) {
+	lines := r.Header["Cookie"]
+	count := 0
+	for _, line := range lines {
+		count += strings.Count(line, ";") + 1
+	}
+	if count > maxScanCookies {
+		c, err := r.Cookie(name)
+		if err != nil {
+			return "", false
+		}
+		return c.Value, true
+	}
+
+	for _, line := range lines {
+		line = textproto.TrimString(line)
+		for len(line) > 0 {
+			var part string
+			part, line, _ = strings.Cut(line, ";")
+			part = textproto.TrimString(part)
+			if part == "" {
+				continue
+			}
+			key, value, _ := strings.Cut(part, "=")
+			key = textproto.TrimString(key)
+			if key != name || !isCookieName(key) {
+				continue
+			}
+			if value, ok := cookieValueBytes(value); ok {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// isCookieName reports whether a cookie name is a token as RFC 7230 defines
+// one, which is what net/http requires.
+func isCookieName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// cookieValueBytes strips one pair of surrounding double quotes from a raw
+// cookie value and reports whether what remains is a valid value, as
+// net/http's parseCookieValue does for a request.
+func cookieValueBytes(raw string) (string, bool) {
+	if len(raw) > 1 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		raw = raw[1 : len(raw)-1]
+	}
+	for i := 0; i < len(raw); i++ {
+		if b := raw[i]; b < 0x20 || b >= 0x7f || b == '"' || b == ';' || b == '\\' {
+			return "", false
+		}
+	}
+	return raw, true
+}
+
+// setFromString sets a field from a string. A predeclared destination is
+// parsed directly; anything else, such as a TextUnmarshaler or a pointer,
+// takes the general path, exactly as a value from the body would.
+func setFromString(field reflect.Value, s string, fi fieldInfo) error {
+	switch fi.Fast {
+	case fastString:
+		field.SetString(s)
+		return nil
+	case fastInt:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return err
+		}
+		return setIntChecked(field, n)
+	case fastUint:
+		n, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return err
+		}
+		return setUintChecked(field, n)
+	case fastFloat:
+		n, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err
+		}
+		return setFloatChecked(field, n)
+	case fastBool:
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return err
+		}
+		field.SetBool(b)
+		return nil
+	default:
+		return bindFieldValue(field, s)
+	}
+}
+
+// extractFieldValue gets the value for a field that isStringSource does not
+// cover: a body member, or every value of a repeated query parameter or
+// header for a slice.
+func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]any, queries *queryCache) (any, bool, error) {
+	switch fi.Source {
+	case query:
+		vs := queries.all(fi.TagName)
+		return vs, anyNonEmpty(vs), nil
 
 	case body, jjson:
 		v, exists := bodyData[fi.TagName]
 		return v, exists, nil
 
-	case cookie:
-		c, err := r.Cookie(fi.TagName)
-		if err == nil {
-			return c.Value, true, nil
-		}
-		return nil, false, nil
-
 	case header:
-		// Header.Get and Header.Values canonicalise the name, so
-		// `header:"x-request-id"` and `header:"X-Request-ID"` name the same
-		// header.
-		if fi.IsSlice {
-			vs := r.Header.Values(fi.TagName)
-			return vs, len(vs) > 0, nil
-		}
-		v := r.Header.Get(fi.TagName)
-		return v, v != "", nil
+		vs := r.Header[fi.HeaderKey]
+		return vs, anyNonEmpty(vs), nil
 
 	default:
 		return nil, false, nil
 	}
 }
 
+// anyNonEmpty reports whether a query parameter or header given for a slice
+// carries a value. Only empty values, such as ?tags=, count as absent, just
+// as an empty value does for a field that takes one.
+func anyNonEmpty(vs []string) bool {
+	for _, v := range vs {
+		if v != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // missingRequiredError reports a field tagged with the "required" option that
-// had no value in its source. For path and query parameters an empty value
-// counts as missing, since neither source distinguishes the two.
+// had no value in its source. For path, query and header values an empty value
+// counts as missing; an empty body value or cookie satisfies required.
 func missingRequiredError(fi fieldInfo) *BindError {
 	return &BindError{
-		Field:   fi.FieldType.Name,
+		Field:   fi.Name,
 		Source:  fi.Source,
 		Name:    fi.TagName,
-		Message: fmt.Sprintf("missing required field %s: no %s value named %q", fi.FieldType.Name, fi.Source, fi.TagName),
+		Message: fmt.Sprintf("missing required field %s: no %s value named %q", fi.Name, fi.Source, fi.TagName),
 		Err:     ErrMissingRequired,
 	}
 }
@@ -767,6 +1205,11 @@ func missingRequiredError(fi fieldInfo) *BindError {
 // bindFieldValue sets the value on a struct field, handling nested structs and
 // pointers.
 func bindFieldValue(fieldVal reflect.Value, value any) error {
+	// A JSON null sets nothing, so a pointer stays nil and "sent as null"
+	// stays distinguishable from "sent as zero".
+	if value == nil {
+		return nil
+	}
 	if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
 		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
 	}
@@ -780,9 +1223,9 @@ func bindFieldValue(fieldVal reflect.Value, value any) error {
 func fieldFailures(fi fieldInfo, err error) []*BindError {
 	var inner BindErrors
 	if errors.As(err, &inner) {
-		return nestFailures(fi.FieldType.Name, fi.TagName, fi.Source, inner)
+		return nestFailures(fi.Name, fi.TagName, fi.Source, inner)
 	}
-	return []*BindError{newBindError(fi.FieldType.Name, fi.Source, fi.TagName, err)}
+	return []*BindError{newBindError(fi.Name, fi.Source, fi.TagName, err)}
 }
 
 // nestFailures places failures reported by a nested struct or slice beneath
@@ -839,20 +1282,10 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 		return cached
 	}
 
-	info := make([]fieldInfo, 0, typ.NumField())
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-
-		// Unexported fields cannot be set through reflection, so they are
-		// ignored even when tagged, as encoding/json does.
-		if !field.IsExported() {
-			continue
-		}
-
-		source, name, opts, ok := fieldTag(field)
-		if !ok {
-			continue
-		}
+	tagged := taggedFields(typ, bindSources[:])
+	info := make([]fieldInfo, 0, len(tagged))
+	for _, tf := range tagged {
+		field, source, name, opts := tf.field, tf.source, tf.name, tf.opts
 
 		// A pointer to a slice takes many values just as a slice does.
 		fieldType := field.Type
@@ -860,15 +1293,22 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 			fieldType = fieldType.Elem()
 		}
 
+		var headerKey string
+		if source == header {
+			headerKey = http.CanonicalHeaderKey(name)
+		}
+
 		info = append(info, fieldInfo{
-			Index:     i,
+			Index:     tf.index,
+			Name:      tf.goName,
 			FieldType: field,
 			Source:    source,
 			TagName:   name,
 			OmitEmpty: hasOption(opts, optOmitEmpty),
 			Required:  hasOption(opts, optRequired),
-			IsSlice:   fieldType.Kind() == reflect.Slice,
+			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType),
 			Fast:      fastKindOf(field.Type),
+			HeaderKey: headerKey,
 		})
 	}
 
@@ -886,6 +1326,31 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 	return cached
 }
 
+// isTextUnmarshaler reports whether a type, or a pointer to it, unmarshals
+// itself from text. Such a type takes one value even when its kind is a slice,
+// as net.IP's is.
+func isTextUnmarshaler(t reflect.Type) bool {
+	return t.Implements(textUnmarshalerType) || reflect.PointerTo(t).Implements(textUnmarshalerType)
+}
+
+// nestedSources are the tags a nested struct's fields bind from: a nested
+// value comes from the body, so only body and its json alias apply.
+var nestedSources = []string{body, jjson}
+
+// nestedFieldCache holds the fields of each nested struct type, resolved once.
+var nestedFieldCache sync.Map // reflect.Type -> []taggedField
+
+// nestedFieldsFor returns the fields of a nested struct type that bind, with
+// those of untagged embedded structs promoted as at the top level.
+func nestedFieldsFor(typ reflect.Type) []taggedField {
+	if cached, ok := nestedFieldCache.Load(typ); ok {
+		return cached.([]taggedField)
+	}
+	fields := taggedFields(typ, nestedSources)
+	nestedFieldCache.Store(typ, fields)
+	return fields
+}
+
 // bindNestedFields binds map data into a struct's fields, matching each on its
 // body tag or the json alias. It is the struct case of setField.
 //
@@ -893,36 +1358,34 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 // paths are relative to target.
 func bindNestedFields(target reflect.Value, data map[string]any) error {
 	var errs BindErrors
-	typ := target.Type()
-	for i := 0; i < typ.NumField(); i++ {
-		fieldType := typ.Field(i)
+	for _, tf := range nestedFieldsFor(target.Type()) {
+		name, opts := tf.name, tf.opts
 
-		// Unexported fields cannot be set through reflection, so they are
-		// ignored even when tagged, as the top-level fields are.
-		if !fieldType.IsExported() {
-			continue
-		}
-
-		tag := fieldType.Tag.Get(body)
-		if tag == "" {
-			tag = fieldType.Tag.Get(jjson)
-		}
-		if tag == "" {
-			continue
-		}
-		name, _ := splitTag(tag)
-
+		// required and omitempty mean inside a nested struct what they mean
+		// at the top level.
 		nestedValue, ok := data[name]
 		if !ok {
+			if hasOption(opts, optRequired) {
+				errs = append(errs, &BindError{
+					Field:   tf.goName,
+					Source:  body,
+					Name:    name,
+					Message: fmt.Sprintf("missing required field %s: no %s value named %q", tf.goName, body, name),
+					Err:     ErrMissingRequired,
+				})
+			}
+			continue
+		}
+		if hasOption(opts, optOmitEmpty) && isEmptyValue(nestedValue) {
 			continue
 		}
 
-		if err := setField(target.Field(i), nestedValue); err != nil {
+		if err := setField(fieldByIndex(target, tf.index), nestedValue); err != nil {
 			var inner BindErrors
 			if errors.As(err, &inner) {
-				errs = append(errs, nestFailures(fieldType.Name, name, body, inner)...)
+				errs = append(errs, nestFailures(tf.goName, name, body, inner)...)
 			} else {
-				errs = append(errs, newBindError(fieldType.Name, body, name, err))
+				errs = append(errs, newBindError(tf.goName, body, name, err))
 			}
 		}
 	}
@@ -934,13 +1397,19 @@ func bindNestedFields(target reflect.Value, data map[string]any) error {
 
 // parseContentType extracts the content type from the Content-Type header
 func parseContentType(header string) string {
-	for _, part := range strings.Split(header, ";") {
+	// Cut walks the parameters without building a slice of them, which
+	// strings.Split would allocate on every request.
+	for rest := header; ; {
+		part, next, more := strings.Cut(rest, ";")
 		part = strings.TrimSpace(part)
 		if !strings.Contains(part, "=") {
 			return strings.ToLower(part)
 		}
+		if !more {
+			return ""
+		}
+		rest = next
 	}
-	return ""
 }
 
 // isJSONContentType reports whether a media type carries JSON. Besides
@@ -957,25 +1426,29 @@ func isJSONContentType(ct string) bool {
 }
 
 // parseBody extracts and parses the request body into a map
-func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (map[string]any, error) {
+func parseBody(contentType string, bodyBytes []byte) (map[string]any, error) {
 	var reqBody map[string]any
-	ct := parseContentType(r.Header.Get("Content-Type"))
+	ct := parseContentType(contentType)
 
 	switch {
 	case ct == "multipart/form-data":
-		reqBody, err := parseMultipartBody(r.Header.Get("Content-Type"), bodyBytes)
+		reqBody, err := parseMultipartBody(contentType, bodyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid multipart form: %w", ErrMalformedBody, err)
 		}
 		return reqBody, nil
 
 	case ct == "application/x-www-form-urlencoded":
-		reqBody = make(map[string]any)
-		err := r.ParseForm()
+		// The body is parsed from the bytes already read, not through
+		// Request.ParseForm: that applies its own 10 MB cap whatever
+		// MaxBodySize says, reads a body only for POST, PUT and PATCH, and
+		// fails on a malformed URL query as if the body were at fault.
+		form, err := url.ParseQuery(string(bodyBytes))
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid form data: %w", ErrMalformedBody, err)
 		}
-		for k, v := range r.PostForm {
+		reqBody = make(map[string]any, len(form))
+		for k, v := range form {
 			if len(v) == 1 {
 				reqBody[k] = v[0]
 			} else {
@@ -985,7 +1458,7 @@ func parseBody(r http.Request, bodyBytes []byte, wanted map[string]struct{}) (ma
 		return reqBody, nil
 	}
 
-	return make(map[string]any), nil
+	return nil, nil
 }
 
 // fileHeaderType and fileHeaderSliceType are the destinations an uploaded file
@@ -1084,6 +1557,12 @@ func setField(field reflect.Value, value any) error {
 		return err
 	}
 
+	// A repeated form field arrives as []string. A field that takes one value
+	// binds the first, as a repeated query parameter or header does.
+	if strs, ok := value.([]string); ok && len(strs) > 0 && takesOneValue(field.Type()) {
+		value = strs[0]
+	}
+
 	// Handle TextUnmarshaler interface
 	handled, err := tryTextUnmarshaler(field, value)
 	if handled {
@@ -1094,9 +1573,25 @@ func setField(field reflect.Value, value any) error {
 	return setFieldByKind(field, value)
 }
 
+// takesOneValue reports whether a destination binds a single value rather than
+// one per element: anything but a slice, or a slice that unmarshals itself from
+// text. A pointer is judged by what it points to.
+func takesOneValue(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Kind() != reflect.Slice || isTextUnmarshaler(t)
+}
+
 // tryTextUnmarshaler attempts to use TextUnmarshaler interface if implemented
 // Returns (handled, error) where handled indicates if TextUnmarshaler was used
 func tryTextUnmarshaler(field reflect.Value, value any) (bool, error) {
+	// A field of interface type names no concrete type to unmarshal into, so
+	// it is left to setFieldByKind to refuse, rather than calling a method on
+	// a nil interface.
+	if field.Kind() == reflect.Interface {
+		return false, nil
+	}
 	if field.Type().Implements(textUnmarshalerType) {
 		// A nil pointer has nothing to unmarshal into, and UnmarshalText
 		// would dereference it. Give it a value first, as the kind-based
@@ -1196,9 +1691,21 @@ func toString(value any) (string, error) {
 		return string(v), nil
 	case fmt.Stringer:
 		return v.String(), nil
+	case []any, map[string]any:
+		// A JSON array or object has no single text to take, and formatting
+		// one with %v would bind Go syntax such as "[a b]".
+		return "", fmt.Errorf("cannot convert a JSON %s to string", jsonCompositeName(v))
 	default:
 		return fmt.Sprintf("%v", v), nil
 	}
+}
+
+// jsonCompositeName names a decoded JSON array or object for an error message.
+func jsonCompositeName(v any) string {
+	if _, ok := v.([]any); ok {
+		return "array"
+	}
+	return "object"
 }
 
 // setIntChecked writes an integer, refusing one the field cannot hold.
@@ -1219,6 +1726,28 @@ func setUintChecked(field reflect.Value, n uint64) error {
 	}
 	field.SetUint(n)
 	return nil
+}
+
+// setIntFromFloat writes a float to an integer field, refusing one outside
+// int64's range before converting: Go's conversion of an out-of-range float is
+// implementation-defined, and would otherwise saturate or wrap unreported.
+func setIntFromFloat(field reflect.Value, f float64) error {
+	if math.IsNaN(f) || f < math.MinInt64 || f >= math.MaxInt64 {
+		return fmt.Errorf("%v overflows %s", f, field.Type())
+	}
+	return setIntChecked(field, int64(f))
+}
+
+// setUintFromFloat writes a float to an unsigned field, refusing a negative
+// one or one outside uint64's range before converting.
+func setUintFromFloat(field reflect.Value, f float64) error {
+	if f < 0 {
+		return fmt.Errorf("cannot convert negative float to uint")
+	}
+	if math.IsNaN(f) || f >= math.MaxUint64 {
+		return fmt.Errorf("%v overflows %s", f, field.Type())
+	}
+	return setUintChecked(field, uint64(f))
 }
 
 // setFloatChecked writes a float, refusing one the field cannot hold.
@@ -1244,9 +1773,9 @@ func setInt(field reflect.Value, value any) error {
 	case int64:
 		return setIntChecked(field, v)
 	case float32:
-		return setIntChecked(field, int64(v))
+		return setIntFromFloat(field, float64(v))
 	case float64:
-		return setIntChecked(field, int64(v))
+		return setIntFromFloat(field, v)
 	case json.Number:
 		if i, err := v.Int64(); err == nil {
 			return setIntChecked(field, i)
@@ -1257,7 +1786,7 @@ func setInt(field reflect.Value, value any) error {
 		if err != nil {
 			return err
 		}
-		return setIntChecked(field, int64(f))
+		return setIntFromFloat(field, f)
 	case string:
 		i, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
@@ -1288,10 +1817,7 @@ func setUint(field reflect.Value, value any) error {
 		}
 		return setUintChecked(field, uint64(v))
 	case float64:
-		if v < 0 {
-			return fmt.Errorf("cannot convert negative float to uint")
-		}
-		return setUintChecked(field, uint64(v))
+		return setUintFromFloat(field, v)
 	case json.Number:
 		if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
 			return setUintChecked(field, u)
@@ -1300,10 +1826,7 @@ func setUint(field reflect.Value, value any) error {
 		if err != nil {
 			return err
 		}
-		if f < 0 {
-			return fmt.Errorf("cannot convert negative float to uint")
-		}
-		return setUintChecked(field, uint64(f))
+		return setUintFromFloat(field, f)
 	case string:
 		i, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
@@ -1413,15 +1936,10 @@ func setSlice(field reflect.Value, value any) error {
 		return nil
 	}
 
-	// Handle single value that should be converted to a slice
-	if field.Type().Elem().Kind() == reflect.String {
-		if strVal, ok := value.(string); ok {
-			// It's a single string for a string slice
-			s := reflect.MakeSlice(field.Type(), 1, 1)
-			s.Index(0).SetString(strVal)
-			field.Set(s)
-			return nil
-		}
+	// A single value, such as a form field sent once or a JSON scalar, binds
+	// as a one-element slice. An object does not: it is not a list of one.
+	if _, isObject := value.(map[string]any); !isObject {
+		return setSlice(field, []any{value})
 	}
 
 	return fmt.Errorf("cannot convert %T to slice", value)

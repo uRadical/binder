@@ -151,3 +151,28 @@ func TestBodyRestoredAfterParseFailure(t *testing.T) {
 }
 
 var _ = http.MethodPost
+
+// Anything after the body's one JSON value used to be ignored, so
+// {"a":1}{"b":2} bound as if the second object were not there.
+func TestTrailingJSONDataIsMalformed(t *testing.T) {
+	for _, body := range []string{`{"a":"x"} trailing`, `{"a":"x"}{"b":2}`, `null {}`} {
+		var got struct {
+			A string `body:"a"`
+		}
+		r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		if err := Bind(r, &got); !errors.Is(err, ErrMalformedBody) {
+			t.Errorf("%s: got %v, want ErrMalformedBody", body, err)
+		}
+	}
+
+	// Trailing whitespace is not data.
+	var got struct {
+		A string `body:"a"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader("{\"a\":\"x\"}\n  \n"))
+	r.Header.Set("Content-Type", "application/json")
+	if err := Bind(r, &got); err != nil || got.A != "x" {
+		t.Errorf("got %v, A=%q; want nil, x", err, got.A)
+	}
+}

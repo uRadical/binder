@@ -33,6 +33,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BindOptions{MaxBodySize: n}` to `BindWithOptions` instead. A zero
   `MaxBodySize` now means `DefaultMaxBodySize` rather than the package
   setting, and a negative value still removes the limit.
+- **A target with no body field no longer reads the body.** Such a request
+  used to have its body read, size-checked and parsed anyway, so a malformed
+  or oversized body failed a bind that never used it. The body is now left
+  for the handler, unless `DisallowUnknownFields` is set.
+- **Empty values no longer fill a slice.** `?tags=` used to bind `[""]` and
+  satisfy `required`; a query parameter or header whose every value is empty
+  now counts as absent for a slice, as an empty value already did for a
+  field taking one.
+- **Trailing JSON is malformed.** A JSON body followed by anything but
+  whitespace, such as a second object, is now `ErrMalformedBody`; it used to
+  bind from the first value.
+- **`json:"-"` is not bound.** It used to bind a body key literally named `-`.
+  A tag with an empty name, such as `json:",omitempty"`, now binds under the
+  Go field name rather than the key `""`.
+- **Form bodies are parsed on every method.** A form-encoded body is parsed
+  from the bytes binder read rather than through `Request.ParseForm`, so it
+  binds on GET and DELETE as it does on POST, is limited by `MaxBodySize` alone
+  rather than also by `ParseForm`'s 10 MB cap, and a malformed URL query no
+  longer fails it as `ErrMalformedBody`.
+- **A JSON array or object into a string is an error.** It used to bind Go's
+  formatting of the value, such as `[a b]` or `map[k:1]`.
+- **JSON is always decoded with `encoding/json/jsontext`.** The fallback
+  decoder for toolchains built with `GOEXPERIMENT=nojsonv2` is gone, so binder
+  needs the jsonv2 experiment, which Go 1.27 enables by default. A toolchain
+  with it turned off will not build binder.
+- **Nested options apply.** `required` and `omitempty` inside a nested struct
+  used to be ignored; they now behave as they do at the top level.
 
 ### Added
 
@@ -44,6 +71,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller, a tenant or a deadline can run during binding.
 - Unknown fields are reported alongside field failures rather than ending
   binding.
+- **Far fewer allocations.** Against the comparison benchmarks, binding a JSON
+  body went from 23 allocations to 8, a query string from 14 to 1, and a
+  request using every source from 27 to 6, with memory per request down 79
+  to 90% and time down 23 to 50%. Path, query, header and cookie values are
+  now read without parsing the whole query or Cookie header, with differential
+  fuzz tests against `net/url` and `net/http` showing the results match.
+  A form body is parsed from the bytes already read rather than through
+  `Request.ParseForm`, which halves its allocations: 21 to 11 for the form
+  benchmark, and 24 to 11 for a form request using every source.
+
+### Fixed
+
+- Embedded structs were skipped without a word, so a request type embedding
+  a shared `Paging` bound nothing into it. An untagged embedded struct, or
+  pointer to one, now has its fields promoted as in `encoding/json`: they bind
+  from every source, an embedded pointer is allocated only when one of its
+  fields is sent, an outer field shadows a promoted one, and a failure names
+  the field by its path, such as `Paging.Limit`.
+- A form or multipart field sent more than once, bound into a field taking one
+  value, bound as the text `[x y]` into a string and failed for any other
+  type. It now takes the first value, as a query parameter or header does.
+- A single value bound only into a `[]string`. A form value or JSON scalar
+  now binds as a one-element slice of any element type.
+- A JSON number in float form beyond the range of `int64` or `uint64`, such
+  as `1e30`, bound as the type's maximum. It is now reported as an overflow.
+- `net.IP`, and any other slice type implementing `encoding.TextUnmarshaler`,
+  failed to bind from a query parameter or header. It now takes
+  one value like any other `TextUnmarshaler`.
+- A body over the size limit was left part read, so a later reader saw only
+  its unread remainder. The whole body is now restored.
+- A field whose type is an interface, such as `encoding.TextUnmarshaler`,
+  could panic. It is now reported as an unsupported type.
+- With `DisallowUnknownFields`, an unknown key sent twice was reported twice.
 
 - The documentation no longer says binder does not validate. It runs the
   validation a type defines; what it does not provide is a rule language.
@@ -79,7 +139,7 @@ it is written for those two codebases.
   first. Non-slice fields are unaffected.
 - **Go 1.27 is required.** The previous release declared `go 1.25.1`; the
   documentation's claim of 1.22+ was never accurate.
-- **`errors.As(err, &*json.SyntaxError{})` no longer matches** when built with
+- **`errors.As(err, new(*json.SyntaxError))` no longer matches** when built with
   Go 1.27, where `encoding/json` is implemented on json/v2 and returns
   different error types. Test for `ErrMalformedBody` instead.
 

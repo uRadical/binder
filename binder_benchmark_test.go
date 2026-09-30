@@ -32,6 +32,10 @@ type CookieOnlyStruct struct {
 	SessionID string `cookie:"session_id"`
 }
 
+type HeaderOnlyStruct struct {
+	RequestID string `header:"X-Request-Id"`
+}
+
 type MixedStruct struct {
 	ID        int      `path:"id"`
 	Name      string   `query:"name"`
@@ -190,6 +194,27 @@ func BenchmarkBindCookieOnly(b *testing.B) {
 		err := Bind(r, &s)
 		if err != nil {
 			b.Fatalf("Failed to bind cookies: %v", err)
+		}
+	}
+}
+
+// BenchmarkBindHeaderOnly benchmarks binding from headers only
+func BenchmarkBindHeaderOnly(b *testing.B) {
+	r := httptest.NewRequest("GET", "/users", nil)
+	r.Header.Set("X-Request-Id", "abc123")
+
+	var probe HeaderOnlyStruct
+	if err := Bind(r, &probe); err != nil {
+		b.Fatalf("Failed to bind headers: %v", err)
+	}
+	requireBound(b, "RequestID", probe.RequestID, "abc123")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var s HeaderOnlyStruct
+		err := Bind(r, &s)
+		if err != nil {
+			b.Fatalf("Failed to bind headers: %v", err)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package binder
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -182,5 +183,34 @@ func TestTextUnmarshalerAllocatesNilPointerDirectly(t *testing.T) {
 	}
 	if got.V != "HELLO" {
 		t.Errorf("V = %q, want %q", got.V, "HELLO")
+	}
+}
+
+// net.IP is a byte slice that unmarshals itself from text. It used to be
+// treated as a list, handing UnmarshalText a []string it could not use.
+func TestSliceKindTextUnmarshalerTakesOneValue(t *testing.T) {
+	var got struct {
+		Header net.IP `header:"X-Real-IP"`
+		Query  net.IP `query:"ip"`
+		Form   net.IP `body:"form"`
+	}
+	r := httptest.NewRequest("POST", "/s?ip=10.0.0.2&ip=10.0.0.9", strings.NewReader("form=10.0.0.3&form=10.0.0.4"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("X-Real-IP", "10.0.0.1")
+	if err := Bind(r, &got); err != nil {
+		t.Fatalf("got error %v, want nil", err)
+	}
+	if got.Header.String() != "10.0.0.1" || got.Query.String() != "10.0.0.2" || got.Form.String() != "10.0.0.3" {
+		t.Errorf("got %v %v %v, want 10.0.0.1 10.0.0.2 10.0.0.3", got.Header, got.Query, got.Form)
+	}
+
+	var ips struct {
+		IPs []net.IP `query:"ip"`
+	}
+	if err := Bind(httptest.NewRequest("GET", "/s?ip=10.0.0.1&ip=10.0.0.2", nil), &ips); err != nil {
+		t.Fatal(err)
+	}
+	if len(ips.IPs) != 2 || ips.IPs[1].String() != "10.0.0.2" {
+		t.Errorf("IPs = %v, want [10.0.0.1 10.0.0.2]", ips.IPs)
 	}
 }

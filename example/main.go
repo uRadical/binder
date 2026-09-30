@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"uradical.io/go/binder"
 )
@@ -21,15 +23,23 @@ type User struct {
 	Email     string    `json:"email"`
 	Active    bool      `json:"active"`
 	Tags      []string  `json:"tags"`
+	TeamID    uuid.UUID `json:"team_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// The teams users belong to. A team is named by a UUID, which binds from any
+// source because uuid.UUID implements encoding.TextUnmarshaler.
+var (
+	teamPlatform = uuid.MustParse("0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70")
+	teamSupport  = uuid.MustParse("0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a71")
+)
 
 // In-memory store for the example. net/http serves requests concurrently, so
 // every access to users and nextID holds mu.
 var mu sync.Mutex
 var users = map[int]User{
-	1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, CreatedAt: time.Now().Add(-24 * time.Hour)},
-	2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, CreatedAt: time.Now().Add(-48 * time.Hour)},
+	1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, CreatedAt: time.Now().Add(-24 * time.Hour)},
+	2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, TeamID: teamSupport, CreatedAt: time.Now().Add(-48 * time.Hour)},
 }
 var nextID = 3
 
@@ -41,12 +51,37 @@ type GetUserRequest struct {
 	TraceID string `header:"X-Request-ID"`
 }
 
+// Paging is shared by every endpoint that lists. A request type embeds it, and
+// binder promotes its fields as encoding/json does, so ?page=2&limit=5 binds
+// into Page and Limit without repeating the tags on each request type.
+type Paging struct {
+	Page  int `query:"page"`
+	Limit int `query:"limit"`
+}
+
+// offsets returns the slice bounds of the requested page within n items,
+// applying the defaults for a page or limit the client left out.
+func (p Paging) offsets(n int) (start, end, limit int) {
+	page, limit := max(p.Page, 1), p.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	start = min((page-1)*limit, n)
+	return start, min(start+limit, n), limit
+}
+
 type ListUsersRequest struct {
-	Active *bool  `query:"active,omitempty"`
-	Limit  int    `query:"limit,omitempty"`
+	Paging
+
+	// An absent or empty query value leaves a field alone: Active stays nil
+	// unless the client sends it.
+	Active *bool  `query:"active"`
 	APIKey string `cookie:"api_key"`
 	// A repeated parameter fills a slice: ?tags=admin&tags=user
-	Tags []string `query:"tags,omitempty"`
+	Tags []string `query:"tags"`
+	// A pointer tells "no filter" from a team: nil unless ?team= names one,
+	// and a value that is not a UUID is reported like any other bad value.
+	Team *uuid.UUID `query:"team"`
 }
 
 type CreateUserRequest struct {
@@ -55,6 +90,9 @@ type CreateUserRequest struct {
 	Email  string   `body:"email,required"`
 	Active bool     `body:"active"`
 	Tags   []string `body:"tags"`
+	// A JSON string such as "0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70" binds
+	// straight into a uuid.UUID.
+	TeamID uuid.UUID `body:"team_id"`
 }
 
 // ValidationErrors is this application's error type for Validate: problems
@@ -83,10 +121,12 @@ func (r CreateUserRequest) Validate(ctx context.Context) error {
 }
 
 type UpdateUserRequest struct {
-	ID     int      `path:"id"`
-	Name   string   `body:"name,omitempty"`
-	Email  string   `body:"email,omitempty"`
-	Active *bool    `body:"active,omitempty"`
+	ID    int    `path:"id"`
+	Name  string `body:"name,omitempty"`
+	Email string `body:"email,omitempty"`
+	// No omitempty: it would skip a JSON false as empty. The pointer alone
+	// tells "not sent" (nil) from false.
+	Active *bool    `body:"active"`
 	Tags   []string `body:"tags,omitempty"`
 }
 
@@ -162,15 +202,10 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result []User
-	count := 0
-	limit := req.Limit
-	if limit == 0 {
-		limit = 10 // default limit
-	}
-
 	mu.Lock()
 	defer mu.Unlock()
+
+	var result []User
 	for _, user := range users {
 		// Filter by active status if provided
 		if req.Active != nil && user.Active != *req.Active {
@@ -182,16 +217,24 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		result = append(result, user)
-		count++
-		if count >= limit {
-			break
+		// Filter by team, if given
+		if req.Team != nil && user.TeamID != *req.Team {
+			continue
 		}
+
+		result = append(result, user)
 	}
 
+	// Map order is random, so sort before paging for pages to be stable.
+	slices.SortFunc(result, func(a, b User) int { return a.ID - b.ID })
+	total := len(result)
+	start, end, limit := req.offsets(total)
+
 	respondJSON(w, map[string]any{
-		"users": result,
-		"count": len(result),
+		"users": result[start:end],
+		"count": end - start,
+		"total": total,
+		"page":  max(req.Page, 1),
 		"limit": limit,
 	}, http.StatusOK)
 }
@@ -220,6 +263,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		Email:     req.Email,
 		Active:    req.Active,
 		Tags:      req.Tags,
+		TeamID:    req.TeamID,
 		CreatedAt: time.Now(),
 	}
 
@@ -345,7 +389,9 @@ func main() {
 	fmt.Println("Try these examples:")
 	fmt.Println("  GET    http://localhost:8080/users/1")
 	fmt.Println("  GET    http://localhost:8080/users?active=true&limit=5")
+	fmt.Println("  GET    http://localhost:8080/users?page=2&limit=1")
 	fmt.Println("  GET    http://localhost:8080/users?tags=admin&tags=user")
+	fmt.Println("  GET    http://localhost:8080/users?team=" + teamPlatform.String())
 	fmt.Println("  POST   http://localhost:8080/users")
 	fmt.Println("  PUT    http://localhost:8080/users/1")
 	fmt.Println("  DELETE http://localhost:8080/users/1")

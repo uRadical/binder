@@ -57,13 +57,6 @@ jobs:
     - name: Run vet
       run: go vet ./...
 
-    # jsontext is gated behind the jsonv2 experiment, which is on by default.
-    # The fallback decoder used when it is off has to keep working.
-    - name: Build and test without the jsonv2 experiment
-      run: |
-        GOEXPERIMENT=nojsonv2 go build ./...
-        GOEXPERIMENT=nojsonv2 go test ./...
-
     - name: Staticcheck
       run: |
         go install honnef.co/go/tools/cmd/staticcheck@latest
@@ -80,6 +73,8 @@ jobs:
         go test -run '^$' -fuzz 'FuzzBind$' -fuzztime=30s
         go test -run '^$' -fuzz 'FuzzBindWithOptions' -fuzztime=15s
         go test -run '^$' -fuzz 'FuzzBindNested' -fuzztime=15s
+        go test -run '^$' -fuzz 'FuzzQueryScan' -fuzztime=15s
+        go test -run '^$' -fuzz 'FuzzCookieScan' -fuzztime=15s
 
   # go-crap needs a newer Go than the compatibility matrix above, and the score
   # does not vary by Go version, so it runs once in its own job.

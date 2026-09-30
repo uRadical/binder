@@ -10,6 +10,8 @@ This example demonstrates how to use the Binder library to build a complete REST
 - **Cookies** - API key authentication
 - **Headers** - Request tracing via `X-Request-ID`
 - **Repeated values** - `/users?tags=admin&tags=user` filling a slice
+- **UUIDs** - A `uuid.UUID` bound from a JSON body and a query string
+- **Embedded structs** - A shared `Paging` struct whose fields bind as if declared on the request
 - **Required fields** - Reporting a missing value rather than binding a zero one
 - **Per-call options** - `BindWithOptions` for body limits and unknown fields
 - **Validation** - Using the `Validator` interface
@@ -48,11 +50,14 @@ curl http://localhost:8080/users/1
 ```bash
 # Demonstrates query parameters, repeated values and cookies
 curl http://localhost:8080/users?active=true&limit=5
+curl http://localhost:8080/users?page=2&limit=1
+curl http://localhost:8080/users?team=0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70
 ```
 
 **Binder features:**
-- `query:"active,omitempty"` - Optional boolean filter
-- `query:"limit,omitempty"` - Optional integer limit
+- `query:"active"` - Optional boolean filter into a `*bool`, nil when not given
+- `Paging` embedded - its `query:"page"` and `query:"limit"` fields are promoted, so any list endpoint gets paging by embedding one struct
+- `query:"team"` - Optional team filter into a `*uuid.UUID`, nil when not given
 - `cookie:"api_key"` - API key from cookie (set automatically by middleware)
 
 ### 3. Create User
@@ -64,7 +69,8 @@ curl -X POST http://localhost:8080/users \
     "name": "Charlie",
     "email": "charlie@example.com",
     "active": true,
-    "tags": ["user", "premium"]
+    "tags": ["user", "premium"],
+    "team_id": "0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70"
   }'
 ```
 
@@ -73,6 +79,7 @@ curl -X POST http://localhost:8080/users \
 - `body:"email"` - Required field from JSON
 - `body:"active"` - Boolean from JSON
 - `body:"tags"` - Slice of strings from JSON
+- `body:"team_id"` - A JSON string parsed into a `uuid.UUID`
 - `Validate(ctx)` method - Custom validation after binding
 
 ### 4. Update User (Partial)
@@ -89,7 +96,7 @@ curl -X PUT http://localhost:8080/users/1 \
 **Binder features:**
 - `path:"id"` - User ID from URL
 - `body:"name,omitempty"` - Optional update to name
-- `body:"active,omitempty"` - Optional update to active status
+- `body:"active"` - Optional update to active status, into a `*bool` so that `false` is an update and leaving it out is not
 - Pointer fields (`*bool`) - Distinguish between false and not provided
 
 ### 5. Delete User
@@ -106,7 +113,7 @@ type UpdateUserRequest struct {
     ID     int      `path:"id"`                // From URL path
     Name   string   `body:"name,omitempty"`    // From JSON body, optional
     Email  string   `body:"email,omitempty"`   // From JSON body, optional
-    Active *bool    `body:"active,omitempty"`  // Pointer to distinguish false vs nil
+    Active *bool    `body:"active"`            // Pointer: nil when absent, so false still updates
     Tags   []string `body:"tags,omitempty"`    // Slice from JSON array
 }
 ```
@@ -239,10 +246,12 @@ Binder automatically detects the content type and parses accordingly.
 
 1. **Pointer Fields** - Using `*bool` to distinguish between `false` and "not provided"
 2. **Slice Binding** - Arrays from JSON become Go slices
-3. **Omitempty** - Fields marked `omitempty` are optional
+3. **Omitempty** - A body field marked `omitempty` keeps its current value when sent empty, as the update's `name` and `email` do
 4. **Multiple Sources** - Combining path, query, body, and cookie data in one struct
 5. **Content-Type Awareness** - Same handler works for JSON and form data
 6. **Custom Validation** - Implementing the `Validator` interface with an error type of your own
+7. **Text Types** - `uuid.UUID` binds from any source because it implements `encoding.TextUnmarshaler`; `time.Time` and `net.IP` bind the same way
+8. **Embedded Structs** - `ListUsersRequest` embeds `Paging`; its fields are promoted as in `encoding/json`, and a bad `?page=` is reported as `page`
 
 ## Testing with Different Tools
 
@@ -266,6 +275,10 @@ Try these to see error handling:
 # Invalid user ID (non-integer)
 curl http://localhost:8080/users/abc
 # 400 {"errors":{"id":"invalid value"}}
+
+# A team ID that is not a UUID
+curl http://localhost:8080/users?team=platform
+# 400 {"errors":{"team":"invalid value"}}
 
 # Missing required fields: both are reported
 curl -X POST http://localhost:8080/users \

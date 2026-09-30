@@ -2,8 +2,11 @@ package binder
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -257,5 +260,21 @@ func TestSetFieldByKindUnsupported(t *testing.T) {
 	ch := settable(make(chan int))
 	if err := setFieldByKind(ch, "x"); err == nil {
 		t.Error("channel field: got nil error, want a refusal")
+	}
+}
+
+// A JSON array or object into a string field used to bind its Go formatting,
+// such as "[a b]" or "map[k:1]". It is a conversion error.
+func TestJSONCompositeIntoStringIsAnError(t *testing.T) {
+	for _, body := range []string{`{"s":["a","b"]}`, `{"s":{"k":1}}`} {
+		var got struct {
+			S string `body:"s"`
+		}
+		r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		var errs BindErrors
+		if err := Bind(r, &got); !errors.As(err, &errs) || got.S != "" {
+			t.Errorf("%s: got %v, S=%q; want a BindErrors and S left empty", body, err, got.S)
+		}
 	}
 }

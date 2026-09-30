@@ -1,6 +1,7 @@
 package binder
 
 import (
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -137,5 +138,51 @@ func TestNestedUntaggedFieldIgnored(t *testing.T) {
 	}
 	if got.N.Untagged != "preexisting" {
 		t.Errorf("Untagged = %q, want it untouched", got.N.Untagged)
+	}
+}
+
+// required and omitempty used to be ignored inside a nested struct.
+func TestNestedTagOptions(t *testing.T) {
+	type Address struct {
+		City string `body:"city,omitempty"`
+		Zip  string `body:"zip,required"`
+	}
+	var got struct {
+		Address Address `body:"address"`
+	}
+	got.Address.City = "preset"
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"address":{"city":""}}`))
+	r.Header.Set("Content-Type", "application/json")
+	err := Bind(r, &got)
+
+	var errs BindErrors
+	if !errors.As(err, &errs) || len(errs) != 1 || !errors.Is(err, ErrMissingRequired) {
+		t.Fatalf("got %v, want one ErrMissingRequired", err)
+	}
+	if errs[0].Field != "Address.Zip" || errs[0].Name != "address.zip" {
+		t.Errorf("got Field=%q Name=%q, want Address.Zip, address.zip", errs[0].Field, errs[0].Name)
+	}
+	if got.Address.City != "preset" {
+		t.Errorf("City = %q, want the preset kept", got.Address.City)
+	}
+}
+
+// A JSON null left a pointer allocated at its zero value on the map-based
+// build, so null looked the same as 0. It leaves the pointer nil on both.
+func TestNullLeavesPointerNil(t *testing.T) {
+	type Address struct {
+		City string `body:"city"`
+	}
+	var got struct {
+		Retries *int     `body:"retries"`
+		Address *Address `body:"address"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"retries":null,"address":null}`))
+	r.Header.Set("Content-Type", "application/json")
+	if err := Bind(r, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Retries != nil || got.Address != nil {
+		t.Errorf("got Retries=%v Address=%v, want both nil", got.Retries, got.Address)
 	}
 }

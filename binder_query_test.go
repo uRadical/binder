@@ -1,7 +1,10 @@
 package binder
 
 import (
+	"fmt"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -109,16 +112,90 @@ func TestQueryAlongsideOtherSources(t *testing.T) {
 	}
 }
 
-// A target with no query tag must not pay to parse the query string.
-func TestQueryNotParsedWhenUnused(t *testing.T) {
-	q := queryCache{url: httptest.NewRequest("GET", "/s?a=1", nil).URL}
-	if q.parsed != nil {
-		t.Fatal("query parsed before any field asked for it")
+// A short query is scanned per field and never parsed into url.Values; a long
+// one is parsed once, when a field first asks, and reused.
+func TestQueryScannedOrParsedOnce(t *testing.T) {
+	short := queryCache{url: httptest.NewRequest("GET", "/s?a=1&b=2", nil).URL}
+	if got := short.get("b"); got != "2" {
+		t.Errorf("short get(b) = %q, want %q", got, "2")
 	}
-	if got := q.get("a"); got != "1" {
-		t.Errorf("get(a) = %q, want %q", got, "1")
+	if short.parsed != nil {
+		t.Error("short query was parsed into url.Values")
 	}
-	if q.parsed == nil {
-		t.Error("query not retained after first use")
+
+	pairs := make([]string, maxScanPairs+1)
+	for i := range pairs {
+		pairs[i] = fmt.Sprintf("k%d=%d", i, i)
 	}
+	long := queryCache{url: httptest.NewRequest("GET", "/s?"+strings.Join(pairs, "&"), nil).URL}
+	if long.parsed != nil {
+		t.Fatal("long query parsed before any field asked for it")
+	}
+	if got := long.get("k64"); got != "64" {
+		t.Errorf("long get(k64) = %q, want %q", got, "64")
+	}
+	parsed := long.parsed
+	if parsed == nil {
+		t.Fatal("long query not parsed on first use")
+	}
+	long.get("k1")
+	if reflect.ValueOf(long.parsed).Pointer() != reflect.ValueOf(parsed).Pointer() {
+		t.Error("long query parsed again rather than reused")
+	}
+}
+
+// queryScanAgrees checks that scanning raw for each key gives what
+// url.ParseQuery gives: the same first value and the same list of values.
+func queryScanAgrees(t *testing.T, raw string) {
+	t.Helper()
+	u := &url.URL{RawQuery: raw}
+	want := u.Query()
+	q := queryCache{url: u}
+
+	// Every key the standard library found, plus a few it may have dropped.
+	keys := []string{"a", "b", "a b", "a+b", "", ";", "%", "k"}
+	for k := range want {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		if got, w := q.get(k), want.Get(k); got != w {
+			t.Errorf("RawQuery %q: get(%q) = %q, url.Values says %q", raw, k, got, w)
+		}
+		if got, w := q.all(k), want[k]; !reflect.DeepEqual(got, w) {
+			t.Errorf("RawQuery %q: all(%q) = %q, url.Values says %q", raw, k, got, w)
+		}
+	}
+}
+
+// The scan must skip exactly what url.ParseQuery skips and unescape exactly
+// as it does.
+func TestQueryScanMatchesParseQuery(t *testing.T) {
+	for _, raw := range []string{
+		"",
+		"a=1",
+		"a=1&a=2&b=3",
+		"a=&a=2",          // an empty first value
+		"a",               // no equals sign
+		"a=1=2",           // equals inside the value
+		"&&a=1&&",         // empty pairs
+		"a=1;b=2&b=3",     // semicolon: the whole pair is dropped
+		"a=%zz&a=2",       // bad escape in the value: skipped, the next is first
+		"%zz=1&a=2",       // bad escape in the key
+		"a%20b=1&a+b=2",   // escaped keys
+		"a=x%20y&a=x+y",   // escaped values
+		"a=%E2%9C%93",     // UTF-8
+		"a=%",             // truncated escape
+		"b=1&a=2&b=3&a=4", // interleaved
+	} {
+		queryScanAgrees(t, raw)
+	}
+}
+
+func FuzzQueryScan(f *testing.F) {
+	for _, seed := range []string{"a=1&a=2", "a=%zz&a=2", "a;b=1", "a+b=%20", "&=&a"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		queryScanAgrees(t, raw)
+	})
 }

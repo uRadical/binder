@@ -3,8 +3,8 @@
 // Reading these fairly needs three caveats:
 //
 //   - The libraries do not do the same amount of work. Binder reads every
-//     source in one call; Echo's binder reads path, query and body; Gin needs
-//     a separate call per source; gorilla/schema decodes a url.Values and
+//     source in one call; Echo's Bind reads path and body, and the query
+//     only on GET, DELETE and HEAD; Gin needs a separate call per source; gorilla/schema decodes a url.Values and
 //     nothing else. Each benchmark says what it asked of each.
 //   - Framework setup is kept out of the timed loop wherever the library
 //     allows a context to be reused, since it is not binding. Echo caches the
@@ -328,9 +328,10 @@ func BenchmarkJSON_Stdlib(b *testing.B) {
 //
 // This is what binder is built for and what the others are not: filling one
 // struct from path, query, body, header and cookie. Binder does it in a
-// single call; Echo and Gin need one call per source plus manual reads for
-// the sources they do not bind, so the comparison is of the whole job rather
-// than of one method.
+// single call; Echo needs two bind calls and Gin three, plus manual reads of
+// the header and cookie (both could bind the header with a further call;
+// neither binds cookies), so the comparison is of the whole job rather than
+// of one method.
 
 const mixedQuery = "sort=name"
 const mixedBody = `{"email":"alice@example.com","age":30}`

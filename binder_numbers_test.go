@@ -193,3 +193,29 @@ func TestFormNumbersUnaffected(t *testing.T) {
 		t.Errorf("ID = %d, want 9007199254740993", got.ID)
 	}
 }
+
+// A number in float form beyond int64 or uint64 used to saturate silently,
+// binding 1e30 as the type's maximum. It is refused like any other overflow.
+func TestFloatFormOverflowRejected(t *testing.T) {
+	for _, body := range []string{`{"n":1e30}`, `{"n":-1e30}`, `{"n":9.3e18}`, `{"u":1e30}`, `{"u":1.9e19}`} {
+		var got struct {
+			N int64  `body:"n"`
+			U uint64 `body:"u"`
+		}
+		if err := Bind(numReq(t, body), &got); err == nil {
+			t.Errorf("%s bound N=%d U=%d, want an overflow error", body, got.N, got.U)
+		}
+	}
+
+	// The largest float below each limit still binds.
+	var got struct {
+		N int64  `body:"n"`
+		U uint64 `body:"u"`
+	}
+	if err := Bind(numReq(t, `{"n":9.2e18,"u":1.8e19}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.N != 9.2e18 || got.U != 1.8e19 {
+		t.Errorf("got N=%d U=%d", got.N, got.U)
+	}
+}

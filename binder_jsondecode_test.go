@@ -2,6 +2,7 @@ package binder
 
 import (
 	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -196,5 +197,58 @@ func TestArrayOfObjects(t *testing.T) {
 	}
 	if got.Items[0].A != 1 || got.Items[1].B != "two" {
 		t.Errorf("Items = %+v, want [{A:1} {B:two}]", got.Items)
+	}
+}
+
+// A member name written with escapes names the same member as its plain
+// spelling, and an unknown one is reported decoded.
+func TestEscapedMemberNames(t *testing.T) {
+	var got struct {
+		Age  int    `body:"age"`
+		Name string `body:"na\"me"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"age":30,"na\"me":"Ann","xtra":1}`))
+	r.Header.Set("Content-Type", "application/json")
+
+	err := BindWithOptions(r, &got, BindOptions{DisallowUnknownFields: true})
+	if got.Age != 30 || got.Name != "Ann" {
+		t.Errorf("got %+v, want escaped names bound", got)
+	}
+	var errs BindErrors
+	if !errors.As(err, &errs) || len(errs) != 1 || errs[0].Name != "xtra" {
+		t.Errorf("got %v, want one unknown member named xtra", err)
+	}
+}
+
+// JSON is parsed in place from the bytes that also back the restored body, so
+// decoding, escapes included, must leave those bytes as they arrived.
+func TestJSONDecodingLeavesBodyIntact(t *testing.T) {
+	const body = `{"name":"A\"nn\\n","age":30,"tags":["x",1e3],"inner":{"k":"😀"},"extra":{"z":[null,true]}}`
+	var got struct {
+		Name  string   `body:"name"`
+		Age   int      `body:"age"`
+		Tags  []string `body:"tags"`
+		Inner struct {
+			K string `body:"k"`
+		} `body:"inner"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+
+	for i := range 3 { // a second bind reads the restored body, on a reused decoder
+		if err := Bind(r, &got); err != nil && i == 0 {
+			t.Fatalf("Bind: %v", err)
+		}
+		rest, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(rest) != body {
+			t.Fatalf("bind %d: restored body = %s\nwant %s", i, rest, body)
+		}
+		r.Body = io.NopCloser(strings.NewReader(string(rest)))
+	}
+	if got.Name != `A"nn\n` || got.Inner.K != "😀" {
+		t.Errorf("decoded %+v", got)
 	}
 }

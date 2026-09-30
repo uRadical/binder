@@ -193,3 +193,17 @@ func TestBindErrorMessageFallbacks(t *testing.T) {
 		t.Errorf("Error() = %q, want %q", got, "bind error")
 	}
 }
+
+// A duplicated unknown member is one unknown field.
+func TestDuplicateUnknownFieldReportedOnce(t *testing.T) {
+	var got struct {
+		A string `body:"a"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"x":1,"x":2}`))
+	r.Header.Set("Content-Type", "application/json")
+	err := BindWithOptions(r, &got, BindOptions{DisallowUnknownFields: true})
+	var errs BindErrors
+	if !errors.As(err, &errs) || len(errs) != 1 || !errors.Is(err, ErrUnknownField) {
+		t.Errorf("got %v, want one ErrUnknownField entry", err)
+	}
+}

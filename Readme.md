@@ -2,7 +2,7 @@
 
 [Docs](https://gobinder.dev) · [API reference](https://pkg.go.dev/uradical.io/go/binder) · [Source](https://github.com/uRadical/binder)
 
-A focused, zero-dependency library that does one thing well: binding HTTP request data to Go structs. Built for Go 1.27+, using its native path parameter support and standard library UUID type.
+A focused, zero-dependency library that does one thing well: binding HTTP request data to Go structs. Built for Go 1.27+, on `net/http`'s own path parameters.
 
 ## Why Binder?
 
@@ -10,17 +10,19 @@ In REST APIs, you constantly need to extract data from requests - path parameter
 
 ```go
 // Instead of writing this everywhere...
-id := r.PathValue("id")
+id, _ := strconv.Atoi(r.PathValue("id"))
 name := r.URL.Query().Get("name")
-var body RequestBody
+var body struct {
+    Email string `json:"email"`
+}
 json.NewDecoder(r.Body).Decode(&body)
 // ...plus error handling for each
 
 // Just do this:
 var req struct {
-    ID   int    `path:"id"`
-    Name string `query:"name"`
-    Body RequestBody `body:"data"`
+    ID    int    `path:"id"`
+    Name  string `query:"name"`
+    Email string `body:"email"`
 }
 err := binder.Bind(r, &req)
 ```
@@ -31,7 +33,7 @@ err := binder.Bind(r, &req)
 
 - **Zero dependencies** - Just Go's standard library
 - **Small API** - `Bind`, `BindWithOptions` and a handful of error types
-- **Fast** - About a microsecond for a typical request, with per-type tag caching
+- **Fast and frugal** - Well under a microsecond for a typical request, with as few allocations as the framework binders or fewer, and a fraction of the memory
 - **Predictable** - No magic, no surprises
 - **Composable** - Works with your validator, your logger, your framework
 
@@ -108,8 +110,12 @@ The library supports binding from multiple sources:
 Bodies are parsed as JSON, form-encoded data or a multipart form, chosen by the
 request's `Content-Type`. The `body:` tag reads from whichever it is.
 
-When a field carries more than one of these, the first in the order above wins:
+When a field carries more than one of these, the first in this order wins:
 `path`, `query`, `body`, `json`, `cookie`, `header`.
+
+A tag with an empty name, such as `query:",required"`, binds under the Go
+field name, matched exactly. As in `encoding/json`, `json:"-"` is not a binding
+tag.
 
 ### Headers
 
@@ -193,6 +199,12 @@ In most cases, you should prefer using the `body:` tag as it provides content-ty
 
 **Note:** Avoid using both `body:` and `json:` tags on the same field as this creates redundancy.
 
+The `json:` tag follows `encoding/json`'s naming where it matters for a shared
+type: `json:"-"` fields are never bound, and an empty name means the field
+name. Unlike `encoding/json`, names match exactly rather than
+case-insensitively, and binder's own options (`required`, `omitempty`) are read
+from the tag.
+
 **Note:** Binder's options travel in whichever tag it reads. On a `json:` tag
 that means writing options `encoding/json` does not define, and linters such as
 staticcheck will flag `json:"email,required"` as an unknown tag option. Nothing
@@ -201,11 +213,18 @@ for fields whose tag is shared with serialisation.
 
 ## Options
 
-Add `,omitempty` to skip binding if the value is empty:
+Add `,omitempty` to skip binding if the value is present but empty, leaving
+the field as it was:
 
 ```go
 Email string `body:"email,omitempty"`
 ```
+
+A JSON value is empty when it is an empty string, zero, false, null, or an
+empty array or object. Every other source carries text, so there only the
+empty string is empty. On `path`, `query` and `header` the option changes
+nothing, since an empty value there already counts as absent. An absent value
+never touches the field, so set defaults on the struct before binding.
 
 Add `,required` to return an error if the value is missing from its source:
 
@@ -214,9 +233,9 @@ Email string `body:"email,required"`
 ```
 
 The failure is a `*BindError` wrapping `ErrMissingRequired`, reported in
-`BindErrors` like any other field failure. For `path` and
-`query` an empty value counts as missing, since neither source distinguishes
-the two; a body key that is present but empty satisfies `required`.
+`BindErrors` like any other field failure. For `path`, `query` and `header`
+an empty value counts as missing, so `?q=` is treated as no `q`. A body key or
+a cookie that is present but empty satisfies `required`.
 
 ## Advanced Usage
 
@@ -267,6 +286,29 @@ type User struct {
 }
 ```
 
+### Embedded Structs
+
+An embedded struct with no tag of its own has its fields promoted, as in
+`encoding/json`, so request types can share a set of parameters:
+
+```go
+type Paging struct {
+    Page  int `query:"page"`
+    Limit int `query:"limit"`
+}
+
+type ListOrders struct {
+    Paging          // ?page=2&limit=20 fills Page and Limit
+    *Audit          // allocated only if one of its fields is sent
+    Status string `query:"status"`
+}
+```
+
+Promoted fields bind from every source and take every option. A failure names
+the field by its path, such as `Paging.Limit`. An outer field shadows a
+promoted one with the same key, and an embedded struct that does carry a tag,
+such as `` Audit `body:"audit"` ``, is an ordinary nested object.
+
 ### Configuration Options
 
 `BindWithOptions` is `Bind` with per-call configuration. The zero `BindOptions`
@@ -299,7 +341,11 @@ binder.BindWithOptions(r, &req, binder.BindOptions{MaxBodySize: 2 << 20}) // 2 M
 
 A `MaxBodySize` of zero applies the default, so setting only another option
 never removes the cap. A negative value removes the limit. An oversized body is
-rejected with `ErrBodyTooLarge` rather than truncated.
+rejected with `ErrBodyTooLarge` rather than truncated, and put back whole for
+later readers.
+
+A target with no `body` or `json` field does not read the body at all, so it is
+neither limited nor parsed, unless `DisallowUnknownFields` is set.
 
 ## Error Handling
 
@@ -353,7 +399,9 @@ end binding at once, since nothing bound after them could be trusted:
 
 Two further sentinels are carried by individual `BindErrors` entries rather
 than returned alone: `ErrMissingRequired`, for a field tagged `required` that
-had no value, and `ErrUnknownField`.
+had no value, and `ErrUnknownField`. A body that could not be read at all,
+such as when a client disconnects mid-upload, also ends binding, and returns the
+I/O error wrapped rather than a sentinel.
 
 `ErrInvalidTarget` reports a programming error rather than a bad request, so it
 is the one case that should not be blamed on the client:
@@ -380,32 +428,37 @@ figures; it costs more memory than the binding itself.
 
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
-| BindPathOnly | 105 | 72 | 3 |
-| BindCookieOnly | 181 | 280 | 5 |
-| BindNoQueryParams | 181 | 280 | 5 |
-| BindQueryOnly | 227 | 496 | 6 |
-| BindOmitEmpty | 250 | 528 | 6 |
-| BindParallel | 677 | 2,600 | 25 |
-| BindBodyOnly/JSONBody | 890 | 1,824 | 31 |
-| BindManyQueryParams | 903 | 832 | 20 |
-| BindBodyOnly/FormBody | 1,036 | 2,600 | 25 |
-| Bind | 1,250 | 2,152 | 29 |
-| BindMixed/WithJSON | 1,302 | 2,544 | 39 |
-| BindMixed/WithForm | 1,632 | 3,712 | 36 |
-| BindWithoutCache | 1,902 | 3,464 | 35 |
-| BindMultipart | 8,850 | 38,069 | 91 |
+| BindHeaderOnly | 59 | 16 | 1 |
+| BindPathOnly | 69 | 8 | 1 |
+| BindQueryOnly | 83 | 16 | 1 |
+| BindCookieOnly | 95 | 16 | 1 |
+| BindNoQueryParams | 96 | 16 | 1 |
+| BindOmitEmpty | 117 | 48 | 1 |
+| BindParallel | 259 | 552 | 11 |
+| BindBodyOnly/FormBody | 525 | 552 | 11 |
+| BindBodyOnly/JSONBody | 630 | 420 | 17 |
+| Bind | 670 | 336 | 7 |
+| BindMixed/WithForm | 706 | 616 | 11 |
+| BindMixed/WithJSON | 797 | 476 | 17 |
+| BindManyQueryParams | 874 | 128 | 1 |
+| BindWithoutCache | 1,536 | 2,048 | 15 |
+| BindMultipart | 7,769 | 31,654 | 78 |
 
-Binding from path, query, cookie or header costs a few hundred nanoseconds and
-a handful of allocations. A JSON body costs more, since the body must be read
-and parsed before any field can be converted.
+The one allocation in the path, query, cookie and header benchmarks is the
+target itself escaping to the heap once it is passed as `any`: binding from
+those sources allocates nothing of its own. Values are parsed straight into
+their fields, and a value without escapes is a substring of the request
+rather than a copy. A JSON body costs more, since the body must be read and
+parsed before any field can be converted. A form body is parsed into a map
+first, and costs about the same as JSON.
 
-`Bind` against `BindWithoutCache` measures the per-type tag cache: 1,250 ns and
-29 allocations with it warm, against 1,902 ns and 35 allocations when it is
+`Bind` against `BindWithoutCache` measures the per-type tag cache: 670 ns and
+7 allocations with it warm, against 1,536 ns and 15 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
-binds none, showing that the query string is parsed once per call and only when
-a field asks for it.
+binds none. Neither parses the query into `url.Values`: each field's parameter
+is found by scanning the raw query, which allocates nothing.
 
 `BindMultipart` carries two text fields and a 4 KB file. Multipart is an order
 of magnitude dearer than the other formats, which is inherent to the encoding
@@ -416,7 +469,7 @@ memory rather than spilled to disk.
 
 This library has been designed with production use in mind:
 
-- **No panics** - An unusable target or an unsettable field is reported, not fatal
+- **No panics** - An unusable target is reported as an error, and an unexported field is skipped
 - **Bounded reads** - Request bodies are capped, so one request cannot exhaust memory
 - **Errors are never swallowed** - A body that fails to parse is reported, not ignored
 - **Request body preservation** - The body is restored after binding, so later handlers can read it again
@@ -497,13 +550,13 @@ Binder passes `r.Context()`, so a rule can use the authenticated user, a
 tenant, or the request's deadline for a lookup:
 
 ```go
-  func (r CreateOrderRequest) Validate(ctx context.Context) error {
-      user, ok := auth.UserFrom(ctx)
-      if !ok || !user.CanOrder(r.SKU) {
-          return errors.New("sku not available to this account")
-      }
-      return nil
-  }
+func (r CreateOrderRequest) Validate(ctx context.Context) error {
+    user, ok := auth.UserFrom(ctx)
+    if !ok || !user.CanOrder(r.SKU) {
+        return errors.New("sku not available to this account")
+    }
+    return nil
+}
 ```
 
 If validation does I/O, a cancelled request surfaces as an error matching
@@ -523,26 +576,34 @@ their source:
 | **File uploads** | Yes | Yes | Yes | No |
 | **Path values** | `http.ServeMux` / `r.PathValue` | Echo's router | Gin's router | N/A |
 | **Validation** | Your `Validate(ctx)` method, called by `Bind` | Pluggable `Validator`, called separately via `c.Validate` | validator/v10 tags, called by `ShouldBind` | No |
-| **Custom types** | `encoding.TextUnmarshaler` | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler` and `TextUnmarshaler` | Registered converters |
-| **Reports every bad field** | Yes, as `BindErrors` | No | No | Yes, as `MultiError` |
+| **Custom types** | `encoding.TextUnmarshaler` | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler`, and `TextUnmarshaler` with a `parser` tag option | Registered converters and `TextUnmarshaler` |
+| **Reports every bad field** | Yes, as `BindErrors` | No | Validation failures only; conversion stops at the first | Yes, as `MultiError` |
 
-### Speed
+### Speed and Allocations
 
 The [`benchmarks`](benchmarks) module times each library on the same requests,
-with a hand-written standard library version as the floor. Median ns/op of five
-runs on an Apple M-series laptop, Go 1.27:
+with a hand-written standard library version as the floor. Medians of ten runs
+on an Apple M-series laptop, Go 1.27:
 
 | Scenario | Binder | Echo | Gin | gorilla/schema | Stdlib by hand |
 |----------|-------:|-----:|----:|---------------:|---------------:|
-| Query string, 5 fields | 684 | 883 | 1,130 | 1,940 | 370 |
-| JSON body, 5 fields | 826 | 1,012 | 858 | - | 736 |
-| Path, query, body, header and cookie | 1,132 | 1,341 | 1,463 | - | - |
+| Query string, 5 fields | 522 ns | 884 ns | 1,124 ns | 1,984 ns | 371 ns |
+| | 64 B, 1 alloc | 544 B, 8 allocs | 608 B, 9 allocs | 1,367 B, 46 allocs | 480 B, 7 allocs |
+| JSON body, 5 fields | 554 ns | 830 ns | 865 ns | - | 745 ns |
+| | 256 B, 8 allocs | 681 B, 8 allocs | 681 B, 8 allocs | - | 681 B, 8 allocs |
+| Path, query, body, header and cookie | 568 ns | 1,333 ns | 1,488 ns | - | - |
+| | 248 B, 6 allocs | 1,202 B, 15 allocs | 1,644 B, 21 allocs | - | - |
 
-Binder allocates more than Echo and Gin: 23 allocations for the JSON case
-against their 8, and 27 for the mixed case against 15 and 21. The libraries
-also do different amounts of work per call; `benchmarks/compare_test.go`
-explains what each benchmark asks of each library. Reproduce with
-`cd benchmarks && go test -bench . -benchmem`.
+Every binding library's figures include 1 allocation for the target escaping
+to the heap once it is passed as `any` (the hand-written query version returns
+its struct by value and avoids it), and the body benchmarks 2 more for re-arming
+the request body each iteration, which no library can avoid. Binder also
+restores `r.Body` after reading it, so later handlers can read it again; that
+costs it 1 allocation the others don't pay.
+
+The libraries do different amounts of work per call;
+`benchmarks/compare_test.go` explains what each benchmark asks of each
+library. Reproduce with `cd benchmarks && go test -bench . -benchmem`.
 
 ### When to Choose Each
 
@@ -576,8 +637,10 @@ The following are **not** part of the contract and may change in any release:
 ### Go Version Support
 
 Binder supports the Go releases the Go project supports: the two most recent.
-It currently requires Go 1.27, for the standard library `uuid` package, so
-until Go 1.28 ships, 1.27 is the only supported release.
+It currently requires Go 1.27, so until Go 1.28 ships, 1.27 is the only
+supported release. JSON is decoded with `encoding/json/jsontext`, so the
+toolchain's jsonv2 experiment must be on, as it is by default;
+`GOEXPERIMENT=nojsonv2` will not build binder.
 Raising that minimum is a minor version bump, not a major one, in line with
 the wider Go ecosystem.
 
