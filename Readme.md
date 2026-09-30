@@ -47,7 +47,7 @@ err := binder.Bind(r, &req)
   - Multipart forms, including file uploads
   - Cookies
   - Request headers
-- Support for primitive types, custom types, slices, and nested structs (arrays not supported - use slices)
+- Support for primitive types, custom types, slices, maps, `any`, nested and embedded structs (arrays not supported - use slices)
 - Type conversion
 - Validation through your own `Validate(ctx)` method, with the request context available to your rules
 - Support for required fields and omitempty behavior
@@ -226,6 +226,10 @@ empty string is empty. On `path`, `query` and `header` the option changes
 nothing, since an empty value there already counts as absent. An absent value
 never touches the field, so set defaults on the struct before binding.
 
+On a pointer field `omitempty` has no effect. The pointer already tells a value
+that was not sent (nil) from one sent as zero, so `{"active": false}` sets a
+`*bool` to false, as a PATCH needs.
+
 Add `,required` to return an error if the value is missing from its source:
 
 ```go
@@ -257,6 +261,23 @@ type Request struct {
     ID UserID `path:"id"`
 }
 ```
+
+A type with its own JSON decoding, `UnmarshalJSON` or json/v2's
+`UnmarshalJSONFrom`, decodes itself from a JSON body, as with `encoding/json`.
+That covers money and decimal types, custom enums and `json.RawMessage`:
+
+```go
+type Order struct {
+    Total   Money           `body:"total"`   // Money has UnmarshalJSON
+    Payload json.RawMessage `body:"payload"` // kept as the client sent it
+}
+```
+
+A top-level body member is handed over exactly as sent; one inside a nested
+struct, slice or map is encoded again first. A JSON string goes to
+`UnmarshalText` when the type has that too, so a value reads the same from a
+body as from a query string; a type with only `UnmarshalJSON` is given text
+from other sources as a JSON string.
 
 ### Slices
 
@@ -428,21 +449,21 @@ figures; it costs more memory than the binding itself.
 
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
-| BindHeaderOnly | 59 | 16 | 1 |
+| BindHeaderOnly | 61 | 16 | 1 |
 | BindPathOnly | 69 | 8 | 1 |
-| BindQueryOnly | 83 | 16 | 1 |
-| BindCookieOnly | 95 | 16 | 1 |
-| BindNoQueryParams | 96 | 16 | 1 |
-| BindOmitEmpty | 117 | 48 | 1 |
-| BindParallel | 259 | 552 | 11 |
-| BindBodyOnly/FormBody | 525 | 552 | 11 |
-| BindBodyOnly/JSONBody | 630 | 420 | 17 |
-| Bind | 670 | 336 | 7 |
-| BindMixed/WithForm | 706 | 616 | 11 |
-| BindMixed/WithJSON | 797 | 476 | 17 |
-| BindManyQueryParams | 874 | 128 | 1 |
-| BindWithoutCache | 1,536 | 2,048 | 15 |
-| BindMultipart | 7,769 | 31,654 | 78 |
+| BindQueryOnly | 86 | 16 | 1 |
+| BindCookieOnly | 97 | 16 | 1 |
+| BindNoQueryParams | 97 | 16 | 1 |
+| BindOmitEmpty | 120 | 48 | 1 |
+| BindParallel | 264 | 552 | 11 |
+| BindBodyOnly/FormBody | 541 | 552 | 11 |
+| BindBodyOnly/JSONBody | 693 | 420 | 17 |
+| BindMixed/WithForm | 725 | 616 | 11 |
+| Bind | 729 | 336 | 7 |
+| BindManyQueryParams | 865 | 128 | 1 |
+| BindMixed/WithJSON | 870 | 476 | 17 |
+| BindWithoutCache | 2,006 | 3,249 | 17 |
+| BindMultipart | 7,875 | 31,648 | 78 |
 
 The one allocation in the path, query, cookie and header benchmarks is the
 target itself escaping to the heap once it is passed as `any`: binding from
@@ -452,8 +473,8 @@ rather than a copy. A JSON body costs more, since the body must be read and
 parsed before any field can be converted. A form body is parsed into a map
 first, and costs about the same as JSON.
 
-`Bind` against `BindWithoutCache` measures the per-type tag cache: 670 ns and
-7 allocations with it warm, against 1,536 ns and 15 allocations when it is
+`Bind` against `BindWithoutCache` measures the per-type tag cache: 729 ns and
+7 allocations with it warm, against 2,006 ns and 17 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
@@ -576,7 +597,7 @@ their source:
 | **File uploads** | Yes | Yes | Yes | No |
 | **Path values** | `http.ServeMux` / `r.PathValue` | Echo's router | Gin's router | N/A |
 | **Validation** | Your `Validate(ctx)` method, called by `Bind` | Pluggable `Validator`, called separately via `c.Validate` | validator/v10 tags, called by `ShouldBind` | No |
-| **Custom types** | `encoding.TextUnmarshaler` | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler`, and `TextUnmarshaler` with a `parser` tag option | Registered converters and `TextUnmarshaler` |
+| **Custom types** | `encoding.TextUnmarshaler`, and `UnmarshalJSON` for body values | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler`, and `TextUnmarshaler` with a `parser` tag option | Registered converters and `TextUnmarshaler` |
 | **Reports every bad field** | Yes, as `BindErrors` | No | Validation failures only; conversion stops at the first | Yes, as `MultiError` |
 
 ### Speed and Allocations

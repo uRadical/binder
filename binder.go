@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -93,6 +94,10 @@ type taggedField struct {
 // tagged one is an ordinary field. A key declared at more than one depth
 // binds only the shallowest field, and at the same depth, the first declared.
 func taggedFields(typ reflect.Type, sources []string) []taggedField {
+	if !embedsStruct(typ) {
+		return flatTaggedFields(typ, sources)
+	}
+
 	type level struct {
 		typ   reflect.Type
 		index []int
@@ -151,6 +156,47 @@ func taggedFields(typ reflect.Type, sources []string) []taggedField {
 	}
 	slices.SortFunc(out, func(a, b taggedField) int { return slices.Compare(a.index, b.index) })
 	return out
+}
+
+// embedsStruct reports whether typ has an untagged embedded field whose
+// fields could be promoted, so that taggedFields must walk into it.
+func embedsStruct(typ reflect.Type) bool {
+	for i := 0; i < typ.NumField(); i++ {
+		if f := typ.Field(i); f.Anonymous {
+			return true
+		}
+	}
+	return false
+}
+
+// flatTaggedFields is taggedFields for a struct that embeds nothing, which is
+// most of them. It keeps the walk's maps and sort off the path, with every
+// index sharing one backing array, so resolving a new type stays cheap.
+func flatTaggedFields(typ reflect.Type, sources []string) []taggedField {
+	n := typ.NumField()
+	indexes := make([]int, n)
+	out := make([]taggedField, 0, n)
+	for i := 0; i < n; i++ {
+		f := typ.Field(i)
+		source, name, opts, ok := fieldTag(f, sources)
+		if !ok || !f.IsExported() || declared(out, source, name) {
+			continue
+		}
+		indexes[i] = i
+		out = append(out, taggedField{index: indexes[i : i+1 : i+1], goName: f.Name, field: f, source: source, name: name, opts: opts})
+	}
+	return out
+}
+
+// declared reports whether a key is already bound by one of fields. A linear
+// scan suits the handful of fields a request type has.
+func declared(fields []taggedField, source, name string) bool {
+	for _, tf := range fields {
+		if tf.source == source && tf.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // fieldByIndex returns the field at index, allocating any nil embedded pointer
@@ -225,6 +271,9 @@ type fieldInfo struct {
 	Required  bool
 	IsSlice   bool     // destination is a slice, so repeated values all bind
 	Fast      fastKind // set straight from a JSON token, skipping conversion
+	// JSON is set when the field's type decodes itself from JSON, so a body
+	// member can be handed to it as the raw bytes the client sent.
+	JSON bool
 	// HeaderKey is TagName in canonical form, for a header field. Resolving
 	// it once lets r.Header be indexed directly, where Header.Get
 	// canonicalises the name, allocating, on every request.
@@ -1304,10 +1353,11 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 			FieldType: field,
 			Source:    source,
 			TagName:   name,
-			OmitEmpty: hasOption(opts, optOmitEmpty),
+			OmitEmpty: omitsEmpty(field.Type, opts),
 			Required:  hasOption(opts, optRequired),
 			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType),
 			Fast:      fastKindOf(field.Type),
+			JSON:      unmarshalsJSON(field.Type),
 			HeaderKey: headerKey,
 		})
 	}
@@ -1324,6 +1374,14 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields}
 	fieldCache[typ] = cached
 	return cached
+}
+
+// omitsEmpty reports whether a field skips an empty value. omitempty has no
+// effect on a pointer: the pointer already tells "not sent" (nil) from a zero
+// value, and skipping a JSON false or 0 would silently lose the update the
+// pointer exists to carry.
+func omitsEmpty(t reflect.Type, opts string) bool {
+	return t.Kind() != reflect.Ptr && hasOption(opts, optOmitEmpty)
 }
 
 // isTextUnmarshaler reports whether a type, or a pointer to it, unmarshals
@@ -1376,7 +1434,7 @@ func bindNestedFields(target reflect.Value, data map[string]any) error {
 			}
 			continue
 		}
-		if hasOption(opts, optOmitEmpty) && isEmptyValue(nestedValue) {
+		if omitsEmpty(tf.field.Type, opts) && isEmptyValue(nestedValue) {
 			continue
 		}
 
@@ -1563,6 +1621,15 @@ func setField(field reflect.Value, value any) error {
 		value = strs[0]
 	}
 
+	// A type that decodes itself from JSON does so, as with encoding/json,
+	// except that a string goes to UnmarshalText when the type has it too, so
+	// a value reads the same from a JSON body as from a query string or form.
+	if unmarshalsJSON(field.Type()) {
+		if _, isString := value.(string); !isString || !isTextUnmarshaler(field.Type()) {
+			return unmarshalJSONValue(field, value)
+		}
+	}
+
 	// Handle TextUnmarshaler interface
 	handled, err := tryTextUnmarshaler(field, value)
 	if handled {
@@ -1571,6 +1638,69 @@ func setField(field reflect.Value, value any) error {
 
 	// Handle based on field kind
 	return setFieldByKind(field, value)
+}
+
+// jsonUnmarshalerTypes are the interfaces through which a type decodes itself
+// from JSON: encoding/json's, and json/v2's streaming form.
+var jsonUnmarshalerTypes = [...]reflect.Type{
+	reflect.TypeFor[json.Unmarshaler](),
+	reflect.TypeFor[jsonv2.UnmarshalerFrom](),
+}
+
+// unmarshalsJSONCache holds unmarshalsJSON's answer per type: setField asks
+// for every value it sets, and Implements is too slow to ask each time.
+var unmarshalsJSONCache sync.Map // reflect.Type -> bool
+
+// unmarshalsJSON reports whether a type, or a pointer to it, decodes itself
+// from JSON.
+func unmarshalsJSON(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Interface:
+		return false
+	case reflect.String, reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Float32, reflect.Float64:
+		// A predeclared type has no methods, and is the common case.
+		if t.PkgPath() == "" {
+			return false
+		}
+	case reflect.Slice, reflect.Map, reflect.Array:
+		// Nor does an unnamed one such as []string.
+		if t.Name() == "" {
+			return false
+		}
+	}
+	if cached, ok := unmarshalsJSONCache.Load(t); ok {
+		return cached.(bool)
+	}
+	found := false
+	for _, u := range jsonUnmarshalerTypes {
+		if t.Implements(u) || reflect.PointerTo(t).Implements(u) {
+			found = true
+			break
+		}
+	}
+	unmarshalsJSONCache.Store(t, found)
+	return found
+}
+
+// unmarshalJSONValue hands a decoded value to a type's own JSON decoding. A
+// value inside a nested struct, slice or map was decoded on the way in, so it
+// is encoded again first; numbers are json.Number and keep their digits.
+func unmarshalJSONValue(field reflect.Value, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return unmarshalJSONRaw(field, raw)
+}
+
+// unmarshalJSONRaw hands raw JSON to a type's own decoding. json/v2 calls
+// UnmarshalJSON or UnmarshalJSONFrom, whichever the type has.
+func unmarshalJSONRaw(field reflect.Value, raw []byte) error {
+	if !field.CanAddr() {
+		return fmt.Errorf("cannot decode JSON into unaddressable %s", field.Type())
+	}
+	return jsonv2.Unmarshal(raw, field.Addr().Interface())
 }
 
 // takesOneValue reports whether a destination binds a single value rather than
@@ -1654,6 +1784,20 @@ func setFieldByKind(field reflect.Value, value any) error {
 
 	case reflect.Slice:
 		return setSlice(field, value)
+
+	case reflect.Map:
+		return setMap(field, value)
+
+	case reflect.Interface:
+		// An empty interface, such as any, takes the value as decoded, as
+		// encoding/json does; numbers stay json.Number, as with UseNumber,
+		// so a large integer keeps its precision. An interface with methods
+		// names no concrete type to fill.
+		if field.NumMethod() == 0 {
+			field.Set(reflect.ValueOf(value))
+			return nil
+		}
+		return fmt.Errorf("unsupported type: %s", field.Type())
 
 	case reflect.Array:
 		return fmt.Errorf("arrays are not supported, use slices instead")
@@ -1943,6 +2087,47 @@ func setSlice(field reflect.Value, value any) error {
 	}
 
 	return fmt.Errorf("cannot convert %T to slice", value)
+}
+
+// setMap fills a map from a JSON object. Each key is converted to the map's
+// key type, which may be a string, an integer or a TextUnmarshaler, and each
+// value as a field of the element type would be. The map is replaced rather
+// than merged into, as a slice is. Every entry is attempted, and the failures
+// are returned as BindErrors named by key: Meta["a"] and meta.a.
+func setMap(field reflect.Value, value any) error {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("cannot convert %T to map", value)
+	}
+
+	typ := field.Type()
+	m := reflect.MakeMapWithSize(typ, len(obj))
+	var errs BindErrors
+	for k, v := range obj {
+		key := reflect.New(typ.Key()).Elem()
+		if err := setField(key, k); err != nil {
+			errs = append(errs, newBindError("["+strconv.Quote(k)+"]", "", k, fmt.Errorf("invalid key: %w", err)))
+			continue
+		}
+		elem := reflect.New(typ.Elem()).Elem()
+		if err := bindFieldValue(elem, v); err != nil {
+			var inner BindErrors
+			if errors.As(err, &inner) {
+				errs = append(errs, nestFailures("["+strconv.Quote(k)+"]", k, "", inner)...)
+			} else {
+				errs = append(errs, newBindError("["+strconv.Quote(k)+"]", "", k, err))
+			}
+			continue
+		}
+		m.SetMapIndex(key, elem)
+	}
+	if len(errs) > 0 {
+		// Map order is random; report in key order so the result is stable.
+		slices.SortFunc(errs, func(a, b *BindError) int { return strings.Compare(a.Name, b.Name) })
+		return errs
+	}
+	field.Set(m)
+	return nil
 }
 
 // setStruct sets a struct value to a field

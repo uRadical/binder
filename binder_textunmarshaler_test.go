@@ -116,7 +116,8 @@ func TestNonTextValueIntoTextUnmarshaler(t *testing.T) {
 	if err == nil {
 		t.Fatal("got nil error, want a conversion failure")
 	}
-	if !strings.Contains(err.Error(), "not a string") {
+	// time.Time decodes JSON itself, so the message is its own.
+	if !strings.Contains(err.Error(), "JSON number") {
 		t.Errorf("error %q does not explain the mismatch", err)
 	}
 	var bindErr *BindError

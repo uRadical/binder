@@ -58,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoder for toolchains built with `GOEXPERIMENT=nojsonv2` is gone, so binder
   needs the jsonv2 experiment, which Go 1.27 enables by default. A toolchain
   with it turned off will not build binder.
+- **`omitempty` has no effect on pointer fields.** It used to skip a JSON
+  `false`, `0` or `""` even into a `*bool` or `*int`, so a PATCH setting a
+  flag to false was silently dropped. A pointer already tells "not sent" (nil)
+  from a zero value, so the option is now ignored on one.
 - **Nested options apply.** `required` and `omitempty` inside a nested struct
   used to be ignored; they now behave as they do at the top level.
 
@@ -83,6 +87,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A type with its own JSON decoding was refused, such as a money type with
+  `UnmarshalJSON` ("cannot set struct field with value of type json.Number")
+  or `json.RawMessage`. A type implementing `json.Unmarshaler` or json/v2's
+  `UnmarshalerFrom` now decodes its value itself, at any depth; a top-level
+  member is handed over exactly as sent. A JSON string still goes to
+  `UnmarshalText` when the type has both.
+- Maps were refused as an unsupported type, so a `map[string]string` of
+  metadata could not be bound. A JSON object now binds into any map whose key
+  is a string, an integer or a `TextUnmarshaler`, with each value converted as
+  a field of the element type would be and a bad entry reported by key. A
+  field of type `any` takes the decoded value, numbers as `json.Number`.
 - Embedded structs were skipped without a word, so a request type embedding
   a shared `Paging` bound nothing into it. An untagged embedded struct, or
   pointer to one, now has its fields promoted as in `encoding/json`: they bind

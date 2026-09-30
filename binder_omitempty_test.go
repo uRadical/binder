@@ -121,3 +121,34 @@ func TestOmitEmptyAlongsideRequired(t *testing.T) {
 		t.Errorf("Email = %q, want the value left untouched by omitempty", got.Email)
 	}
 }
+
+// omitempty used to skip a JSON false or 0 even on a pointer field, so a PATCH
+// setting a flag to false was silently lost. On a pointer it has no effect:
+// absent stays nil, and a zero value is set.
+func TestOmitEmptyIgnoredOnPointers(t *testing.T) {
+	type Inner struct {
+		On *bool `body:"on,omitempty"`
+	}
+	var got struct {
+		Active *bool   `body:"active,omitempty"`
+		Count  *int    `body:"count,omitempty"`
+		Name   *string `body:"name,omitempty"`
+		Absent *bool   `body:"absent,omitempty"`
+		Page   *int    `query:"page,omitempty"`
+		Inner  Inner   `body:"inner"`
+	}
+	r := httptest.NewRequest("POST", "/?page=0", strings.NewReader(`{"active":false,"count":0,"name":"","inner":{"on":false}}`))
+	r.Header.Set("Content-Type", "application/json")
+	if err := Bind(r, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Active == nil || *got.Active || got.Count == nil || *got.Count != 0 || got.Name == nil || *got.Name != "" {
+		t.Errorf("got Active=%v Count=%v Name=%v, want each set to its zero value", got.Active, got.Count, got.Name)
+	}
+	if got.Page == nil || *got.Page != 0 || got.Inner.On == nil || *got.Inner.On {
+		t.Errorf("got Page=%v Inner.On=%v, want both set", got.Page, got.Inner.On)
+	}
+	if got.Absent != nil {
+		t.Errorf("Absent = %v, want nil", *got.Absent)
+	}
+}

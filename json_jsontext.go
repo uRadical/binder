@@ -261,6 +261,19 @@ func memberName(raw jsontext.Value) ([]byte, error) {
 func decodeJSONInto(dec *jsontext.Decoder, field reflect.Value, fi fieldInfo) error {
 	kind := dec.PeekKind()
 
+	// A type that decodes itself from JSON is handed the member exactly as
+	// sent. A null sets nothing, as for any field, and a string goes to
+	// UnmarshalText when the type has it, as setField does; omitempty needs
+	// the value decoded to judge it, so it takes the general path too.
+	if fi.JSON && !fi.OmitEmpty && kind != 'n' && (kind != '"' || !isTextUnmarshaler(field.Type())) {
+		raw, err := dec.ReadValue()
+		if err != nil {
+			return err
+		}
+		// The decoder reuses raw's memory, and a type may keep what it is given.
+		return conversionError(unmarshalJSONRaw(field, bytes.Clone(raw)))
+	}
+
 	switch fi.Fast {
 	case fastString:
 		if kind == '"' {
