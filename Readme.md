@@ -178,6 +178,29 @@ type Request struct {
 A single value still binds as a one-element slice. Values are never split on
 commas: `?tags=a,b` is one value, `"a,b"`.
 
+### Maps
+
+A map field binds from a JSON object, and from a query string or form body
+written as `name[key]=value` pairs, the style OpenAPI calls `deepObject`:
+
+```go
+type Search struct {
+    Filter map[string]string   `query:"filter"` // ?filter[status]=open&filter[team]=core
+    Min    map[string]int      `query:"min"`    // ?min[price]=10
+    Flags  map[string]bool     `query:"flag"`   // ?flag[draft]=false
+    Tags   map[string][]string `query:"tags"`   // ?tags[any]=a&tags[any]=b
+}
+```
+
+Keys convert to the map's key type, a string, an integer or a
+`TextUnmarshaler`, and values as a field of the element type would, so
+`map[string]time.Time` or `map[string]uuid.UUID` work too. A repeated key fills
+a slice value and otherwise binds its first value. An empty value counts as
+absent, and a map with no entries is left nil, so `required` reports it. A bad
+entry is reported under the name the client sent, such as `min[price]`. Only
+one level of brackets is read: `filter[a][b]` has no agreed meaning. The map is
+replaced, not merged into.
+
 ### Body vs JSON Tags
 
 The `body:` tag is the primary tag for binding request body data. It handles
@@ -273,8 +296,9 @@ type Order struct {
 }
 ```
 
-A top-level body member is handed over exactly as sent; one inside a nested
-struct, slice or map is encoded again first. A JSON string goes to
+A top-level body member is handed over exactly as sent, unless the field has
+`omitempty`, which needs the value decoded to judge it; one inside a nested
+struct, slice or map is encoded again first. A JSON `null` sets nothing. A JSON string goes to
 `UnmarshalText` when the type has that too, so a value reads the same from a
 body as from a query string; a type with only `UnmarshalJSON` is given text
 from other sources as a JSON string.
@@ -320,15 +344,17 @@ type Paging struct {
 
 type ListOrders struct {
     Paging          // ?page=2&limit=20 fills Page and Limit
-    *Audit          // allocated only if one of its fields is sent
+    *Audit          // allocated only if one of its fields is sent a value
     Status string `query:"status"`
 }
 ```
 
 Promoted fields bind from every source and take every option. A failure names
 the field by its path, such as `Paging.Limit`. An outer field shadows a
-promoted one with the same key, and an embedded struct that does carry a tag,
-such as `` Audit `body:"audit"` ``, is an ordinary nested object.
+promoted one with the same key, `body:` and `json:` counting as the same key,
+and at the same depth the first declared wins. An embedded struct tagged with
+a name, such as `` Audit `body:"audit"` ``, is an ordinary nested object; one
+tagged `` `json:"-"` `` is left out entirely.
 
 ### Configuration Options
 
@@ -563,9 +589,9 @@ above, lets a handler tell validation failures apart with `errors.As`; an
 `errors.Join` of plain errors is harder to recognise, since other errors, such
 as `ErrMalformedBody`, also wrap more than one error.
 
-`Validate` runs only once every field has bound. A field that failed to bind is
-left at its zero value, so running your rules over it would add a second,
-misleading error for the same input.
+`Validate` runs only once every field has bound. A field that failed to bind
+holds whatever was left in it, so running your rules over it would add a
+second, misleading error for the same input.
 
 Binder passes `r.Context()`, so a rule can use the authenticated user, a
 tenant, or the request's deadline for a lookup:

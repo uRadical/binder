@@ -179,3 +179,81 @@ func TestEmbeddedCycleTerminates(t *testing.T) {
 		t.Errorf("got V=%q Cyclic=%+v", got.V, got.Cyclic)
 	}
 }
+
+// body and json name the same body member, so they are one key: an outer
+// body field shadows a promoted json one, and in a flat struct the first
+// declared wins, whatever the body's format.
+func TestBodyAndJSONTagsShareKeys(t *testing.T) {
+	type inner struct {
+		Name string `json:"name"`
+	}
+	var got struct {
+		Name string `body:"name"`
+		inner
+	}
+	if err := Bind(embedRequest("/", `{"name":"j"}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "j" || got.inner.Name != "" {
+		t.Errorf("got outer %q, promoted %q; want outer j", got.Name, got.inner.Name)
+	}
+
+	var flat struct {
+		A string `body:"x"`
+		B string `json:"x"`
+	}
+	if err := Bind(embedRequest("/", `{"x":"v"}`), &flat); err != nil {
+		t.Fatal(err)
+	}
+	if flat.A != "v" || flat.B != "" {
+		t.Errorf("got A=%q B=%q, want A=v", flat.A, flat.B)
+	}
+}
+
+// As in encoding/json, an embed tagged json:"-" is excluded, and one whose
+// tag gives no name is still promoted.
+func TestEmbeddedTagRules(t *testing.T) {
+	var excluded struct {
+		Paging `json:"-"`
+		Audit  `json:",omitempty"`
+	}
+	if err := Bind(embedRequest("/?page=3&limit=1", `{"by":"ada"}`), &excluded); err != nil {
+		t.Fatal(err)
+	}
+	if excluded.Page != 0 || excluded.By != "ada" {
+		t.Errorf("got Page=%d By=%q, want Paging excluded and Audit promoted", excluded.Page, excluded.By)
+	}
+}
+
+type EmbeddedID string
+
+// An embedded type that is not a struct has nothing to promote; with a tag it
+// binds as an ordinary field, under its name when the tag gives none.
+func TestTaggedNonStructEmbedBinds(t *testing.T) {
+	var got struct {
+		EmbeddedID `query:",required"`
+	}
+	if err := Bind(httptest.NewRequest("GET", "/?EmbeddedID=7", nil), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.EmbeddedID != "7" {
+		t.Errorf("EmbeddedID = %q, want 7", got.EmbeddedID)
+	}
+	err := Bind(httptest.NewRequest("GET", "/", nil), &got)
+	if !errors.Is(err, ErrMissingRequired) {
+		t.Errorf("got %v, want ErrMissingRequired", err)
+	}
+}
+
+// A null for a promoted field sets nothing, so its embedded pointer stays nil.
+func TestNullDoesNotAllocateEmbeddedPointer(t *testing.T) {
+	var got struct {
+		*Audit
+	}
+	if err := Bind(embedRequest("/", `{"by":null}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Audit != nil {
+		t.Errorf("Audit = %+v, want nil", got.Audit)
+	}
+}

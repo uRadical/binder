@@ -21,9 +21,9 @@ This example demonstrates how to use the Binder library to build a complete REST
 ## Running the Example
 
 ```bash
-# From the example directory
+# From the binder repository root
 cd example
-go run main.go
+go run .
 ```
 
 The server will start on `http://localhost:8080`
@@ -48,17 +48,18 @@ curl http://localhost:8080/users/1
 
 ### 2. List Users with Filters
 ```bash
-# Demonstrates query parameters, repeated values and cookies
-curl http://localhost:8080/users?active=true&limit=5
-curl http://localhost:8080/users?page=2&limit=1
-curl http://localhost:8080/users?team=0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70
+# Demonstrates query parameters, repeated values and cookies. The list needs
+# the api_key cookie: a browser gets it from its first response, curl needs -b.
+curl -b api_key=demo-key 'http://localhost:8080/users?active=true&limit=5'
+curl -b api_key=demo-key 'http://localhost:8080/users?page=2&limit=1'
+curl -b api_key=demo-key 'http://localhost:8080/users?team=0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70'
 ```
 
 **Binder features:**
 - `query:"active"` - Optional boolean filter into a `*bool`, nil when not given
 - `Paging` embedded - its `query:"page"` and `query:"limit"` fields are promoted, so any list endpoint gets paging by embedding one struct
 - `query:"team"` - Optional team filter into a `*uuid.UUID`, nil when not given
-- `cookie:"api_key"` - API key from cookie (set automatically by middleware)
+- `cookie:"api_key"` - API key from cookie; the demo middleware sets it on the response, so a browser sends it from the second request on
 
 ### 3. Create User
 ```bash
@@ -265,7 +266,7 @@ http POST localhost:8080/users name=Eve email=eve@example.com active:=true tags:
 ### Postman
 - Import the endpoints as a collection
 - Set Content-Type to application/json for POST/PUT requests
-- The cookie will be set automatically by the middleware
+- The middleware sets the api_key cookie on the first response, so list requests work from the second one on
 
 ## Error Scenarios
 
@@ -277,7 +278,7 @@ curl http://localhost:8080/users/abc
 # 400 {"errors":{"id":"invalid value"}}
 
 # A team ID that is not a UUID
-curl http://localhost:8080/users?team=platform
+curl -b api_key=demo-key 'http://localhost:8080/users?team=platform'
 # 400 {"errors":{"team":"invalid value"}}
 
 # Missing required fields: both are reported

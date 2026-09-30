@@ -122,7 +122,13 @@ func taggedFields(typ reflect.Type, sources []string) []taggedField {
 				index := append(slices.Clip(l.index), i)
 				source, name, opts, ok := fieldTag(f, sources)
 
-				if !ok && f.Anonymous {
+				// As in encoding/json, `json:"-"` excludes an embedded struct
+				// entirely, and one whose tag gives no name, such as
+				// `json:",omitempty"`, is still promoted.
+				if f.Anonymous && !ok && f.Tag.Get(jjson) == "-" {
+					continue
+				}
+				if f.Anonymous && (!ok || !namedInTag(f, source)) {
 					t := f.Type
 					isPtr := t.Kind() == reflect.Ptr
 					if isPtr {
@@ -131,10 +137,17 @@ func taggedFields(typ reflect.Type, sources []string) []taggedField {
 					// An unexported embedded pointer cannot be allocated,
 					// but an unexported embedded struct's exported fields
 					// can still be set.
-					if t.Kind() == reflect.Struct && (f.IsExported() || !isPtr) {
-						next = append(next, level{typ: t, index: index, path: l.path + f.Name + "."})
+					if t.Kind() == reflect.Struct {
+						if f.IsExported() || !isPtr {
+							next = append(next, level{typ: t, index: index, path: l.path + f.Name + "."})
+						}
+						continue
 					}
-					continue
+					// An embedded type that is not a struct has nothing to
+					// promote; with a tag it binds as an ordinary field.
+					if !ok {
+						continue
+					}
 				}
 
 				// Unexported fields cannot be set through reflection, so they
@@ -146,7 +159,7 @@ func taggedFields(typ reflect.Type, sources []string) []taggedField {
 			}
 		}
 		for _, tf := range found {
-			key := [2]string{tf.source, tf.name}
+			key := [2]string{bindKeySource(tf.source), tf.name}
 			if !seen[key] {
 				seen[key] = true
 				out = append(out, tf)
@@ -158,8 +171,8 @@ func taggedFields(typ reflect.Type, sources []string) []taggedField {
 	return out
 }
 
-// embedsStruct reports whether typ has an untagged embedded field whose
-// fields could be promoted, so that taggedFields must walk into it.
+// embedsStruct reports whether typ has an embedded field, so that
+// taggedFields must take the walk that handles promotion.
 func embedsStruct(typ reflect.Type) bool {
 	for i := 0; i < typ.NumField(); i++ {
 		if f := typ.Field(i); f.Anonymous {
@@ -191,18 +204,28 @@ func flatTaggedFields(typ reflect.Type, sources []string) []taggedField {
 // declared reports whether a key is already bound by one of fields. A linear
 // scan suits the handful of fields a request type has.
 func declared(fields []taggedField, source, name string) bool {
+	source = bindKeySource(source)
 	for _, tf := range fields {
-		if tf.source == source && tf.name == name {
+		if bindKeySource(tf.source) == source && tf.name == name {
 			return true
 		}
 	}
 	return false
 }
 
+// bindKeySource names the space a key belongs to: body and its json alias
+// read the same body members, so `body:"x"` and `json:"x"` are one key.
+func bindKeySource(source string) string {
+	if source == jjson {
+		return body
+	}
+	return source
+}
+
 // fieldByIndex returns the field at index, allocating any nil embedded pointer
 // on the way to it, as encoding/json does when it sets a promoted field. It is
-// called only once there is a value to set, so an embedded pointer none of
-// whose fields is sent stays nil.
+// called only once a field has a value to set, not for an absent one or a
+// null, so an embedded pointer none of whose fields is sent stays nil.
 func fieldByIndex(v reflect.Value, index []int) reflect.Value {
 	if len(index) == 1 {
 		return v.Field(index[0])
@@ -217,6 +240,13 @@ func fieldByIndex(v reflect.Value, index []int) reflect.Value {
 		v = v.Field(x)
 	}
 	return v
+}
+
+// namedInTag reports whether a field's tag for source spells out a name, as
+// `json:"x"` does and `json:",omitempty"` does not.
+func namedInTag(f reflect.StructField, source string) bool {
+	name, _ := splitTag(f.Tag.Get(source))
+	return name != ""
 }
 
 // sourceTag returns a field's tag for one source, split into name and options.
@@ -270,6 +300,7 @@ type fieldInfo struct {
 	OmitEmpty bool
 	Required  bool
 	IsSlice   bool     // destination is a slice, so repeated values all bind
+	IsMap     bool     // destination is a map, filled from name[key]=value pairs
 	Fast      fastKind // set straight from a JSON token, skipping conversion
 	// JSON is set when the field's type decodes itself from JSON, so a body
 	// member can be handed to it as the raw bytes the client sent.
@@ -331,6 +362,9 @@ var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(
 type typeInfo struct {
 	fields   []fieldInfo
 	bodyKeys map[string]struct{}
+	// bodyMaps names the body fields that are maps, whose members a form body
+	// sends as name[key] fields.
+	bodyMaps map[string]struct{}
 	// bodyFields indexes fields by the body member they bind, so a token walk
 	// can find the destination without a second pass.
 	bodyFields map[string]int
@@ -613,8 +647,8 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 		errs.unknown = unknownFieldErrors(unknown)
 	}
 
-	// Validate runs only on a fully bound target: a field that failed is
-	// left at its zero value, and rules checking it would report a second,
+	// Validate runs only on a fully bound target: a field that failed holds
+	// whatever was left in it, and rules checking it would report a second,
 	// misleading failure for the same input.
 	if err := errs.list(); err != nil {
 		return err
@@ -862,9 +896,18 @@ func readBody(r *http.Request, limit int64) ([]byte, error) {
 func unknownKeys(info *typeInfo, bodyData map[string]any) []string {
 	var unknown []string
 	for name := range bodyData {
-		if _, found := info.bodyKeys[name]; !found {
-			unknown = append(unknown, name)
+		if _, found := info.bodyKeys[name]; found {
+			continue
 		}
+		// A form field such as meta[a] belongs to a map field named meta.
+		if i := strings.IndexByte(name, '['); i > 0 {
+			if _, found := info.bodyMaps[name[:i]]; found {
+				if _, ok := bracketKey(name, name[:i]); ok {
+					continue
+				}
+			}
+		}
+		unknown = append(unknown, name)
 	}
 	return unknown
 }
@@ -953,6 +996,101 @@ func (q *queryCache) all(name string) []string {
 	return values
 }
 
+// group gathers the name[key]=value pairs of a query into a map for binding
+// into a map field: ?filter[status]=open&filter[tag]=a&filter[tag]=b gives
+// {"status": "open", "tag": ["a", "b"]}, the shape a form body produces. It
+// is the bracket form OpenAPI calls deepObject. An empty value counts as
+// absent, as elsewhere in the query, and a pair the query parser would skip
+// is skipped.
+func (q *queryCache) group(name string) map[string]any {
+	var out map[string]any
+	if !q.scan() {
+		for key, vs := range q.values() {
+			if sub, ok := bracketKey(key, name); ok {
+				for _, v := range vs {
+					out = addGrouped(out, sub, v)
+				}
+			}
+		}
+		return out
+	}
+	for query := q.url.RawQuery; query != ""; {
+		var pair string
+		pair, query, _ = strings.Cut(query, "&")
+		if pair == "" || strings.Contains(pair, ";") {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		key, err := url.QueryUnescape(key)
+		if err != nil {
+			continue
+		}
+		sub, ok := bracketKey(key, name)
+		if !ok {
+			continue
+		}
+		if value, err = url.QueryUnescape(value); err != nil {
+			continue
+		}
+		out = addGrouped(out, sub, value)
+	}
+	return out
+}
+
+// groupFormValues gathers a form body's name[key]=value fields into a map, as
+// group does for a query. File parts are not text, and are left out.
+func groupFormValues(bodyData map[string]any, name string) map[string]any {
+	var out map[string]any
+	for key, v := range bodyData {
+		sub, ok := bracketKey(key, name)
+		if !ok {
+			continue
+		}
+		switch v := v.(type) {
+		case string:
+			out = addGrouped(out, sub, v)
+		case []string:
+			for _, s := range v {
+				out = addGrouped(out, sub, s)
+			}
+		}
+	}
+	return out
+}
+
+// bracketKey reports whether key is name[sub] and returns sub. Only one level
+// is recognised: name[a][b] has no agreed meaning, so it is not matched.
+func bracketKey(key, name string) (string, bool) {
+	if len(key) < len(name)+3 || !strings.HasPrefix(key, name) || key[len(name)] != '[' || key[len(key)-1] != ']' {
+		return "", false
+	}
+	sub := key[len(name)+1 : len(key)-1]
+	if strings.ContainsAny(sub, "[]") {
+		return "", false
+	}
+	return sub, true
+}
+
+// addGrouped adds one value under a key, keeping a repeated key's values in a
+// []string as a repeated form field is kept. An empty value is skipped.
+func addGrouped(out map[string]any, key, value string) map[string]any {
+	if value == "" {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]any)
+	}
+	switch prev := out[key].(type) {
+	case nil:
+		out[key] = value
+	case string:
+		out[key] = []string{prev, value}
+	case []string:
+		out[key] = append(prev, value)
+	}
+	return out
+}
+
 // nextQueryValue consumes the next pair from query and reports whether it
 // gives a value for name, returning the rest of the query. It skips exactly
 // the pairs url.ParseQuery skips, in the same order of checks: an empty one,
@@ -1019,7 +1157,7 @@ func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyDa
 		}
 
 		// A missing value is an error when the field is tagged required,
-		// and is otherwise simply left at its zero value.
+		// and otherwise leaves the field as it was.
 		if !exists {
 			if fi.Required {
 				errs.set(info, index, []*BindError{missingRequiredError(fi)})
@@ -1047,7 +1185,7 @@ func isStringSource(fi fieldInfo) bool {
 	case path, cookie:
 		return true
 	case query, header:
-		return !fi.IsSlice
+		return !fi.IsSlice && !fi.IsMap
 	default:
 		return false
 	}
@@ -1210,11 +1348,21 @@ func setFromString(field reflect.Value, s string, fi fieldInfo) error {
 func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]any, queries *queryCache) (any, bool, error) {
 	switch fi.Source {
 	case query:
+		if fi.IsMap {
+			m := queries.group(fi.TagName)
+			return m, len(m) > 0, nil
+		}
 		vs := queries.all(fi.TagName)
 		return vs, anyNonEmpty(vs), nil
 
 	case body, jjson:
 		v, exists := bodyData[fi.TagName]
+		// A form body spells a map as name[key]=value pairs, as a query does.
+		if !exists && fi.IsMap {
+			if m := groupFormValues(bodyData, fi.TagName); len(m) > 0 {
+				return m, true, nil
+			}
+		}
 		return v, exists, nil
 
 	case header:
@@ -1355,7 +1503,8 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 			TagName:   name,
 			OmitEmpty: omitsEmpty(field.Type, opts),
 			Required:  hasOption(opts, optRequired),
-			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType),
+			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType),
+			IsMap:     fieldType.Kind() == reflect.Map && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType),
 			Fast:      fastKindOf(field.Type),
 			JSON:      unmarshalsJSON(field.Type),
 			HeaderKey: headerKey,
@@ -1371,7 +1520,17 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 		}
 	}
 
-	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields}
+	var maps map[string]struct{}
+	for _, fi := range info {
+		if fi.IsMap && (fi.Source == body || fi.Source == jjson) {
+			if maps == nil {
+				maps = make(map[string]struct{})
+			}
+			maps[fi.TagName] = struct{}{}
+		}
+	}
+
+	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields, bodyMaps: maps}
 	fieldCache[typ] = cached
 	return cached
 }
@@ -1687,11 +1846,14 @@ func unmarshalsJSON(t reflect.Type) bool {
 // value inside a nested struct, slice or map was decoded on the way in, so it
 // is encoded again first; numbers are json.Number and keep their digits.
 func unmarshalJSONValue(field reflect.Value, value any) error {
-	raw, err := json.Marshal(value)
-	if err != nil {
+	// An Encoder, unlike Marshal, can leave <, > and & as they were sent.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
 		return err
 	}
-	return unmarshalJSONRaw(field, raw)
+	return unmarshalJSONRaw(field, bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
 }
 
 // unmarshalJSONRaw hands raw JSON to a type's own decoding. json/v2 calls
@@ -1700,7 +1862,9 @@ func unmarshalJSONRaw(field reflect.Value, raw []byte) error {
 	if !field.CanAddr() {
 		return fmt.Errorf("cannot decode JSON into unaddressable %s", field.Type())
 	}
-	return jsonv2.Unmarshal(raw, field.Addr().Interface())
+	// The body walk accepts duplicate member names, so a value it accepted
+	// must not be refused here for the same reason.
+	return jsonv2.Unmarshal(raw, field.Addr().Interface(), decodeOptions)
 }
 
 // takesOneValue reports whether a destination binds a single value rather than
@@ -1710,7 +1874,7 @@ func takesOneValue(t reflect.Type) bool {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	return t.Kind() != reflect.Slice || isTextUnmarshaler(t)
+	return t.Kind() != reflect.Slice || isTextUnmarshaler(t) || unmarshalsJSON(t)
 }
 
 // tryTextUnmarshaler attempts to use TextUnmarshaler interface if implemented
@@ -2093,7 +2257,8 @@ func setSlice(field reflect.Value, value any) error {
 // key type, which may be a string, an integer or a TextUnmarshaler, and each
 // value as a field of the element type would be. The map is replaced rather
 // than merged into, as a slice is. Every entry is attempted, and the failures
-// are returned as BindErrors named by key: Meta["a"] and meta.a.
+// are returned as BindErrors named by key: Meta["a"] and meta[a], the name a
+// query or form spells it with.
 func setMap(field reflect.Value, value any) error {
 	obj, ok := value.(map[string]any)
 	if !ok {
@@ -2105,17 +2270,18 @@ func setMap(field reflect.Value, value any) error {
 	var errs BindErrors
 	for k, v := range obj {
 		key := reflect.New(typ.Key()).Elem()
+		field, name := "["+strconv.Quote(k)+"]", "["+k+"]"
 		if err := setField(key, k); err != nil {
-			errs = append(errs, newBindError("["+strconv.Quote(k)+"]", "", k, fmt.Errorf("invalid key: %w", err)))
+			errs = append(errs, newBindError(field, "", name, fmt.Errorf("invalid key: %w", err)))
 			continue
 		}
 		elem := reflect.New(typ.Elem()).Elem()
 		if err := bindFieldValue(elem, v); err != nil {
 			var inner BindErrors
 			if errors.As(err, &inner) {
-				errs = append(errs, nestFailures("["+strconv.Quote(k)+"]", k, "", inner)...)
+				errs = append(errs, nestFailures(field, name, "", inner)...)
 			} else {
-				errs = append(errs, newBindError("["+strconv.Quote(k)+"]", "", k, err))
+				errs = append(errs, newBindError(field, "", name, err))
 			}
 			continue
 		}

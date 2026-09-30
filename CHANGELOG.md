@@ -94,16 +94,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member is handed over exactly as sent. A JSON string still goes to
   `UnmarshalText` when the type has both.
 - Maps were refused as an unsupported type, so a `map[string]string` of
-  metadata could not be bound. A JSON object now binds into any map whose key
-  is a string, an integer or a `TextUnmarshaler`, with each value converted as
-  a field of the element type would be and a bad entry reported by key. A
-  field of type `any` takes the decoded value, numbers as `json.Number`.
+  metadata could not be bound. A map now binds from a JSON object, and from a
+  query string or form body written as `name[key]=value` pairs (OpenAPI's
+  `deepObject` style). Keys may be strings, integers or `TextUnmarshaler`s,
+  each value converts as a field of the element type would, and a bad entry is
+  reported under the name the client sent, such as `min[price]`. A field of
+  type `any` takes the decoded value, numbers as `json.Number`.
 - Embedded structs were skipped without a word, so a request type embedding
   a shared `Paging` bound nothing into it. An untagged embedded struct, or
   pointer to one, now has its fields promoted as in `encoding/json`: they bind
   from every source, an embedded pointer is allocated only when one of its
-  fields is sent, an outer field shadows a promoted one, and a failure names
-  the field by its path, such as `Paging.Limit`.
+  fields is sent a value, an outer field shadows a promoted one, and a failure
+  names the field by its path, such as `Paging.Limit`. An embed tagged
+  `json:"-"` is left out.
+- `body:"x"` and `json:"x"` on two fields were treated as different keys,
+  though both read the body member `x`: a JSON body filled only the later
+  field and a form body filled both. They are now one key, and the first
+  declared field binds it.
 - A form or multipart field sent more than once, bound into a field taking one
   value, bound as the text `[x y]` into a string and failed for any other
   type. It now takes the first value, as a query parameter or header does.

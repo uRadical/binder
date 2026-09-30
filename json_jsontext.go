@@ -215,6 +215,17 @@ func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wanted map[str
 		// the walk can carry on to the next one. The field counts as bound
 		// either way: it was present, so required must not report it again.
 		fi := info.fields[index]
+
+		// A null sets nothing, so a promoted field's embedded pointer is not
+		// allocated for one.
+		if len(fi.Index) > 1 && dec.PeekKind() == 'n' {
+			if err := dec.SkipValue(); err != nil {
+				return nil, nil, err
+			}
+			bound[index] = true
+			continue
+		}
+
 		if err := decodeJSONInto(dec, fieldByIndex(val, fi.Index), fi); err != nil {
 			var failed conversionFailure
 			if !errors.As(err, &failed) {

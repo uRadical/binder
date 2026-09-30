@@ -396,6 +396,9 @@ func main() {
 	fmt.Println("  PUT    http://localhost:8080/users/1")
 	fmt.Println("  DELETE http://localhost:8080/users/1")
 	fmt.Println()
+	fmt.Println("GET /users needs the api_key cookie: a browser gets it from its first")
+	fmt.Println("response; with curl, add -b api_key=demo-key and quote the URL.")
+	fmt.Println()
 	fmt.Println("See example/README.md for detailed usage instructions")
 
 	log.Fatal(http.ListenAndServe(":8080", handler))

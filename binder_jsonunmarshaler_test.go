@@ -144,3 +144,36 @@ func TestJSONOnlyTypeFromTextSource(t *testing.T) {
 		t.Errorf("Level = %d, want 1", got.Level)
 	}
 }
+
+// A slice type that decodes itself from JSON takes one value from a query
+// string or form, given as a JSON string, rather than a JSON array of them.
+func TestJSONSliceTypeFromTextSource(t *testing.T) {
+	var got struct {
+		Raw json.RawMessage `query:"raw"`
+	}
+	if err := Bind(httptest.NewRequest("GET", "/?raw=x&raw=y", nil), &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Raw) != `"x"` {
+		t.Errorf("Raw = %s, want \"x\"", got.Raw)
+	}
+}
+
+// The body walk accepts duplicate member names, and so does a member handed
+// to a type's own decoding. Nested values keep <, > and & unescaped.
+func TestRawMemberAcceptsWhatTheBodyDoes(t *testing.T) {
+	var got struct {
+		Top    json.RawMessage `body:"top"`
+		Nested struct {
+			Raw json.RawMessage `body:"raw"`
+		} `body:"nested"`
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"top":{"a":1,"a":2},"nested":{"raw":"<b>&"}}`))
+	r.Header.Set("Content-Type", "application/json")
+	if err := Bind(r, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Top) != `{"a":1,"a":2}` || string(got.Nested.Raw) != `"<b>&"` {
+		t.Errorf("got Top=%s Nested.Raw=%s", got.Top, got.Nested.Raw)
+	}
+}
