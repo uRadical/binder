@@ -38,7 +38,9 @@ func serveChunked(t *testing.T, contentType, body string, handle func(*http.Requ
 	if err != nil {
 		t.Fatalf("sending request: %v", err)
 	}
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("closing response: %v", err)
+	}
 
 	if !sawChunked {
 		t.Fatal("request did not arrive chunked, so this test proves nothing")

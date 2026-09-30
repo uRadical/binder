@@ -195,7 +195,9 @@ func TestConcurrentBindingThroughServer(t *testing.T) {
 					t.Errorf("request failed: %v", err)
 					return
 				}
-				resp.Body.Close()
+				if err := resp.Body.Close(); err != nil {
+					t.Errorf("closing response: %v", err)
+				}
 				if resp.StatusCode != http.StatusOK {
 					t.Errorf("status %d, want 200", resp.StatusCode)
 					return

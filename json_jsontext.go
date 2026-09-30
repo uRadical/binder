@@ -402,7 +402,7 @@ func planFor(t reflect.Type) *decodePlan {
 	}
 	p := &decodePlan{typ: t, fast: fastKindOf(t), json: unmarshalsJSON(t), text: isTextUnmarshaler(t)}
 	base := t
-	for i := 0; base.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+	for i := 0; base.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 		base = base.Elem()
 	}
 	// A file upload arrives only in a multipart form; a JSON object must not
@@ -446,7 +446,7 @@ func decodeWithPlan(dec *jsonDecoder, v reflect.Value, p *decodePlan) error {
 	if p.direct == 0 || p.direct != kind {
 		return decodeScalarInto(dec, v, p, kind)
 	}
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))
 		}
@@ -527,7 +527,7 @@ func decodeUnlessEmpty(dec *jsonDecoder, p *decodePlan, target func() reflect.Va
 			return err
 		}
 		v := target()
-		for v.Kind() == reflect.Ptr {
+		for v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				v.Set(reflect.New(v.Type().Elem()))
 			}
@@ -600,7 +600,7 @@ func skipMismatch(dec *jsonDecoder, t reflect.Type, kind jsontext.Kind) (bool, e
 		return false, nil
 	}
 	base := t
-	for i := 0; base.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+	for i := 0; base.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 		base = base.Elem()
 	}
 	if err := dec.SkipValue(); err != nil {
@@ -615,7 +615,7 @@ func skipMismatch(dec *jsonDecoder, t reflect.Type, kind jsontext.Kind) (bool, e
 // takesAnyValue reports whether t, through any pointers, is an empty
 // interface such as any, which takes whatever JSON value it is given.
 func takesAnyValue(t reflect.Type) bool {
-	for i := 0; t.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+	for i := 0; t.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 		t = t.Elem()
 	}
 	return t.Kind() == reflect.Interface && t.NumMethod() == 0
@@ -628,7 +628,7 @@ func setJSONValue(v reflect.Value, value any) error {
 	if text, ok := value.(string); ok {
 		// A []byte behind pointers, such as *[]byte, is still a []byte.
 		target := v
-		for i := 0; target.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+		for i := 0; target.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 			if target.IsNil() {
 				target.Set(reflect.New(target.Type().Elem()))
 			}

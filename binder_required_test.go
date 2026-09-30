@@ -33,8 +33,7 @@ func TestRequiredMissingReturnsError(t *testing.T) {
 				// binder's options. encoding/json does not define "required",
 				// which is why linters flag the tag below.
 				var s struct {
-					//lint:ignore SA5008 binder option on binder's json alias
-					Nick string `json:"nick,required"`
+					Nick string `json:"nick,required"` //nolint:staticcheck // SA5008: a binder option on binder's json alias, which this test is about
 				}
 				return Bind(r, &s)
 			},

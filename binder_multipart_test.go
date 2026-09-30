@@ -105,7 +105,11 @@ func TestMultipartSingleFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening upload: %v", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("closing upload: %v", err)
+		}
+	}()
 	content, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatalf("reading upload: %v", err)

@@ -178,6 +178,10 @@ func TestEmbeddedCycleTerminates(t *testing.T) {
 	if got.V != "a" || got.Cyclic == nil || got.W != "b" {
 		t.Errorf("got V=%q Cyclic=%+v", got.V, got.Cyclic)
 	}
+	// An unexported embedded pointer cannot be allocated, so it stays nil.
+	if got.cyclic != nil {
+		t.Errorf("unexported embed allocated: %+v", got.cyclic)
+	}
 }
 
 // body and json name the same body member, so they are one key: an outer

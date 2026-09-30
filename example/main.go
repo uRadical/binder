@@ -454,13 +454,18 @@ func hasAnyTag(u User, tags []string) bool {
 func respondJSON(w http.ResponseWriter, data any, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	// The status is already sent, so a failure here can only be logged.
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("writing response: %v", err)
+	}
 }
 
 func respondError(w http.ResponseWriter, message string, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": message}); err != nil {
+		log.Printf("writing response: %v", err)
+	}
 }
 
 // Middleware to set API key cookie for demo purposes

@@ -142,7 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such as `"01"` and `"1"` into a `map[int]int`, are one entry, and a failure
   in either stands, from JSON, query and form alike.
 - A multipart name sent as both text and a file had its text dropped without
-  a word. The body is now `ErrMalformedBody`.
+  a word. A field that binds such a name now reports it; a name nothing binds
+  is ignored, like any other member.
 - A large body allocated about five times its size while being read, the
   buffer growing by a quarter at a time; it now doubles, about twice.
 - With `DisallowUnknownFields`, each unknown JSON member was checked against

@@ -135,7 +135,7 @@ func taggedFields(typ reflect.Type, sources []string) []taggedField {
 				}
 				if f.Anonymous && (!ok || !namedInTag(f, source)) {
 					t := f.Type
-					isPtr := t.Kind() == reflect.Ptr
+					isPtr := t.Kind() == reflect.Pointer
 					if isPtr {
 						t = t.Elem()
 					}
@@ -245,7 +245,7 @@ func fieldByIndex(v reflect.Value, index []int) reflect.Value {
 		return v.Field(index[0])
 	}
 	for i, x := range index {
-		if i > 0 && v.Kind() == reflect.Ptr {
+		if i > 0 && v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				v.Set(reflect.New(v.Type().Elem()))
 			}
@@ -814,7 +814,7 @@ func throughNilPointer(val reflect.Value, index []int) bool {
 		if val.Kind() == reflect.Interface {
 			return val.IsNil()
 		}
-		if val.Kind() == reflect.Ptr {
+		if val.Kind() == reflect.Pointer {
 			if val.IsNil() {
 				return true
 			}
@@ -860,7 +860,7 @@ func promotedValidatePath(typ reflect.Type) []int {
 					continue
 				}
 				t := f.Type
-				if t.Kind() == reflect.Ptr {
+				if t.Kind() == reflect.Pointer {
 					t = t.Elem()
 				}
 				if t.Kind() != reflect.Struct {
@@ -915,7 +915,7 @@ func targetStruct(i any) (reflect.Type, reflect.Value, error) {
 	}
 
 	val := reflect.ValueOf(i)
-	if val.Kind() != reflect.Ptr {
+	if val.Kind() != reflect.Pointer {
 		return nil, reflect.Value{}, fmt.Errorf("%w: target is %s, want a pointer to a struct", ErrInvalidTarget, val.Type())
 	}
 	if val.IsNil() {
@@ -1611,7 +1611,7 @@ func bindFieldValue(fieldVal reflect.Value, value any) error {
 	if value == nil {
 		return nil
 	}
-	if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
+	if fieldVal.Kind() == reflect.Pointer && fieldVal.IsNil() {
 		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
 	}
 	return setField(fieldVal, value)
@@ -1832,7 +1832,7 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 
 		// A pointer to a slice takes many values just as a slice does.
 		fieldType := field.Type
-		if fieldType.Kind() == reflect.Ptr {
+		if fieldType.Kind() == reflect.Pointer {
 			fieldType = fieldType.Elem()
 		}
 
@@ -1899,7 +1899,7 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 // value, and skipping a JSON false or 0 would silently lose the update the
 // pointer exists to carry.
 func omitsEmpty(t reflect.Type, opts string) bool {
-	return t.Kind() != reflect.Ptr && hasOption(opts, optOmitEmpty)
+	return t.Kind() != reflect.Pointer && hasOption(opts, optOmitEmpty)
 }
 
 // pointerCycle returns a type reachable from t, through the fields that bind,
@@ -1912,9 +1912,9 @@ func pointerCycle(t reflect.Type, seen map[reflect.Type]bool) reflect.Type {
 	}
 	seen[t] = true
 	switch t.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		chain := make(map[reflect.Type]bool)
-		for u := t; u.Kind() == reflect.Ptr; u = u.Elem() {
+		for u := t; u.Kind() == reflect.Pointer; u = u.Elem() {
 			if chain[u] {
 				return t
 			}
@@ -2000,15 +2000,15 @@ func parseBody(contentType string, bodyBytes []byte) (map[string]any, error) {
 	var reqBody map[string]any
 	ct := parseContentType(contentType)
 
-	switch {
-	case ct == "multipart/form-data":
+	switch ct {
+	case "multipart/form-data":
 		reqBody, err := parseMultipartBody(contentType, bodyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid multipart form: %w", ErrMalformedBody, err)
 		}
 		return reqBody, nil
 
-	case ct == "application/x-www-form-urlencoded":
+	case "application/x-www-form-urlencoded":
 		// The body is parsed from the bytes already read, not through
 		// Request.ParseForm: that applies its own 10 MB cap whatever
 		// MaxBodySize says, reads a body only for POST, PUT and PATCH, and
@@ -2072,9 +2072,12 @@ func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]any, e
 		}
 	}
 	for name, files := range form.File {
-		// A name sent as both text and a file has no one value to bind.
+		// A name sent as both text and a file has no one value to bind. It
+		// is refused if a field binds it, and ignored like any other member
+		// if none does.
 		if _, both := form.Value[name]; both {
-			return nil, fmt.Errorf("form field %q is sent as both text and a file", shortKey(name))
+			reqBody[name] = textAndFile{}
+			continue
 		}
 		if len(files) == 1 {
 			reqBody[name] = files[0]
@@ -2119,11 +2122,18 @@ func setFileHeader(field reflect.Value, value any) (bool, error) {
 	}
 }
 
+// textAndFile marks a multipart name sent as both a text part and a file
+// part, which no field can bind.
+type textAndFile struct{}
+
 // setField sets the appropriate value on the given reflect.Value field
 func setField(field reflect.Value, value any) error {
 	// Handle nil value
 	if value == nil {
 		return nil
+	}
+	if _, ok := value.(textAndFile); ok {
+		return errors.New("sent as both text and a file")
 	}
 
 	// An uploaded file is not converted, it is handed over as it arrived.
@@ -2231,7 +2241,7 @@ func unmarshalJSONRaw(field reflect.Value, raw []byte) error {
 func wrapsFinitely(t reflect.Type) bool {
 	seen := make(map[reflect.Type]bool)
 	for {
-		for i := 0; t.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+		for i := 0; t.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 			t = t.Elem()
 		}
 		if takesOneValue(t) {
@@ -2249,7 +2259,7 @@ func wrapsFinitely(t reflect.Type) bool {
 // one per element: anything but a slice, or a slice that unmarshals itself from
 // text. A pointer is judged by what it points to.
 func takesOneValue(t reflect.Type) bool {
-	for i := 0; t.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+	for i := 0; t.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 		t = t.Elem()
 	}
 	return t.Kind() != reflect.Slice || isTextUnmarshaler(t) || unmarshalsJSON(t) || isByteSlice(t)
@@ -2268,7 +2278,7 @@ func tryTextUnmarshaler(field reflect.Value, value any) (bool, error) {
 		// A nil pointer has nothing to unmarshal into, and UnmarshalText
 		// would dereference it. Give it a value first, as the kind-based
 		// paths further down do for pointers they handle themselves.
-		if field.Kind() == reflect.Ptr && field.IsNil() {
+		if field.Kind() == reflect.Pointer && field.IsNil() {
 			if !field.CanSet() {
 				return false, nil
 			}
@@ -2350,7 +2360,7 @@ func setFieldByKind(field reflect.Value, value any) error {
 	case reflect.Struct:
 		return setStruct(field, value)
 
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if field.IsNil() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
@@ -2429,6 +2439,63 @@ func setUintChecked(field reflect.Value, n uint64) error {
 	return nil
 }
 
+// wholeNumberText reads a JSON number's text exactly, returning the whole
+// number it denotes as plain digits, with a sign if negative, or an error if
+// it is not whole or is too large for any 64-bit integer. 1e5 gives 100000,
+// 2.50e1 gives 25, and 2.0000000000000001 is not whole. No float is involved,
+// and an exponent however large costs nothing: a whole number that would need
+// more than 20 digits is refused before any are written.
+func wholeNumberText(s string, t reflect.Type) (string, error) {
+	notWhole := fmt.Errorf("%s is not a whole number for %s", clipText(s, 64), t)
+	overflow := fmt.Errorf("%s overflows %s", clipText(s, 64), t)
+
+	neg := strings.HasPrefix(s, "-")
+	mantissa, exp, _ := strings.Cut(strings.TrimPrefix(s, "-"), "e")
+	if exp == "" {
+		mantissa, exp, _ = strings.Cut(mantissa, "E")
+	}
+	whole, frac, _ := strings.Cut(mantissa, ".")
+	digits := strings.TrimLeft(whole+frac, "0")
+	if digits == "" {
+		return "0", nil // zero, however written
+	}
+	// The value is digits × 10^shift.
+	e, err := strconv.Atoi(exp)
+	if exp == "" {
+		e, err = 0, nil
+	}
+	if err != nil {
+		// An exponent too long for an int: vast, or vanishingly small.
+		if strings.HasPrefix(exp, "-") {
+			return "", notWhole
+		}
+		return "", overflow
+	}
+	// Past a few thousand either way the answer is already known, and the
+	// sums below cannot overflow.
+	if e > 1<<16 {
+		return "", overflow
+	}
+	if e < -(1 << 16) {
+		return "", notWhole
+	}
+	shift := e - len(frac)
+	trimmed := strings.TrimRight(digits, "0")
+	shift += len(digits) - len(trimmed)
+	digits = trimmed
+	if shift < 0 {
+		return "", notWhole
+	}
+	if len(digits)+shift > 20 {
+		return "", overflow
+	}
+	text := digits + strings.Repeat("0", shift)
+	if neg {
+		text = "-" + text
+	}
+	return text, nil
+}
+
 // setIntFromFloat writes a float to an integer field, refusing one outside
 // int64's range before converting: Go's conversion of an out-of-range float is
 // implementation-defined, and would otherwise saturate or wrap unreported.
@@ -2489,13 +2556,18 @@ func setInt(field reflect.Value, value any) error {
 		if i, err := v.Int64(); err == nil {
 			return setIntChecked(field, i)
 		}
-		// Numbers written in a form Int64 rejects, such as 1e5 or 1.0, went
-		// through float64 before and still do.
-		f, err := v.Float64()
+		// A number written another way, such as 1e5 or 2.0, is read exactly
+		// from its text: through float64, 2.0000000000000001 would round to a
+		// whole 2 the client did not send.
+		text, err := wholeNumberText(v.String(), field.Type())
 		if err != nil {
 			return err
 		}
-		return setIntFromFloat(field, f)
+		i, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s overflows %s", clipText(v.String(), 64), field.Type())
+		}
+		return setIntChecked(field, i)
 	case string:
 		i, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
@@ -2531,11 +2603,18 @@ func setUint(field reflect.Value, value any) error {
 		if u, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
 			return setUintChecked(field, u)
 		}
-		f, err := v.Float64()
+		text, err := wholeNumberText(v.String(), field.Type())
 		if err != nil {
 			return err
 		}
-		return setUintFromFloat(field, f)
+		if strings.HasPrefix(text, "-") {
+			return fmt.Errorf("cannot convert negative number to uint")
+		}
+		u, err := strconv.ParseUint(text, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s overflows %s", clipText(v.String(), 64), field.Type())
+		}
+		return setUintChecked(field, u)
 	case string:
 		i, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
@@ -2630,7 +2709,7 @@ func setSlice(field reflect.Value, value any) error {
 		var errs BindErrors
 		for i := 0; i < len(v); i++ {
 			elem := s.Index(i)
-			if elem.Kind() == reflect.Ptr {
+			if elem.Kind() == reflect.Pointer {
 				elem.Set(reflect.New(elem.Type().Elem()))
 				elem = elem.Elem()
 			}
@@ -2884,7 +2963,7 @@ func isEmptyValue(v any) bool {
 		return rv.Uint() == 0
 	case reflect.Float32, reflect.Float64:
 		return rv.Float() == 0
-	case reflect.Interface, reflect.Ptr:
+	case reflect.Interface, reflect.Pointer:
 		return rv.IsNil()
 	}
 	return false

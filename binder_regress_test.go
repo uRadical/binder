@@ -327,8 +327,8 @@ func TestDuplicateMemberFailureStands(t *testing.T) {
 }
 
 type mapAddr struct {
-	Zip  string `json:"zip,required"`
-	City int    `json:"city"`
+	Zip  string `body:"zip,required"`
+	City int    `body:"city"`
 }
 
 // Failures within a map come in key order, numeric for integer keys, and an
@@ -708,8 +708,8 @@ func TestManyDeepFailuresAreBounded(t *testing.T) {
 func TestRepeatAfterBudgetStillFails(t *testing.T) {
 	bad := `[` + strings.Repeat(`"x",`, maxFailures-1) + `"x"]`
 	type addr struct {
-		X    []int  `json:"x"`
-		City string `json:"city,required"`
+		X    []int  `body:"x"`
+		City string `body:"city,required"`
 	}
 	for _, tc := range []struct {
 		body   string
@@ -937,7 +937,7 @@ func TestLongKeyOrderAndRequiredMessage(t *testing.T) {
 	var got struct {
 		M map[uint8]int `json:"m"`
 		N struct {
-			A int `json:"a,required"`
+			A int `body:"a,required"`
 		} `json:"n"`
 	}
 	long := strings.Repeat("9", 400)
@@ -1055,7 +1055,7 @@ func TestLongMapKeyIsShortenedInPaths(t *testing.T) {
 	body := `{"m":{"` + key + `":[` + strings.Repeat(`{},`, 99) + `{}]}}`
 	var got struct {
 		M map[string][]struct {
-			A int `json:"a,required"`
+			A int `body:"a,required"`
 		} `json:"m"`
 	}
 	var before, after runtime.MemStats
@@ -1235,8 +1235,8 @@ func TestLongUnknownKeyAndInvalidUTF8Clip(t *testing.T) {
 	}
 }
 
-// A multipart name sent as both text and a file is malformed, not a silent
-// choice of one.
+// A multipart name sent as both text and a file is refused for a field that
+// binds it, not a silent choice of one, and ignored where nothing binds it.
 func TestMultipartTextAndFileSameName(t *testing.T) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -1249,8 +1249,26 @@ func TestMultipartTextAndFileSameName(t *testing.T) {
 	var got struct {
 		Doc string `body:"doc"`
 	}
-	if err := Bind(r, &got); !errors.Is(err, ErrMalformedBody) {
-		t.Errorf("got %v, want ErrMalformedBody", err)
+	var errs BindErrors
+	if err := Bind(r, &got); !errors.As(err, &errs) || errs[0].Name != "doc" {
+		t.Errorf("got %v, want a failure for doc", err)
+	}
+
+	// A struct that does not bind the name is not affected by it.
+	var buf2 bytes.Buffer
+	w2 := multipart.NewWriter(&buf2)
+	_ = w2.WriteField("attachment", "text")
+	fw2, _ := w2.CreateFormFile("attachment", "a.txt")
+	_, _ = fw2.Write([]byte("file"))
+	_ = w2.WriteField("name", "n")
+	_ = w2.Close()
+	r2 := httptest.NewRequest("POST", "/", &buf2)
+	r2.Header.Set("Content-Type", w2.FormDataContentType())
+	var other struct {
+		Name string `body:"name"`
+	}
+	if err := Bind(r2, &other); err != nil || other.Name != "n" {
+		t.Errorf("unbound name: got %v, Name=%q", err, other.Name)
 	}
 }
 
@@ -1288,5 +1306,34 @@ func TestPlainValueForFormMapIsIgnored(t *testing.T) {
 	}
 	if err := Bind(r, &got); err != nil || got.M["a"] != 1 {
 		t.Errorf("got %v, M=%v; want nil and a:1", err, got.M)
+	}
+}
+
+// Whether a JSON number is whole was judged after converting it to float64,
+// which rounds: 2.0000000000000001 bound as 2, and 9007199254740993.0 as
+// ...992. It is judged exactly from the number's text.
+func TestWholeNumbersJudgedExactly(t *testing.T) {
+	for body, want := range map[string]int64{
+		`{"n":1e5}`: 100000, `{"n":2.50e1}`: 25, `{"n":-3.0}`: -3, `{"n":0.0e-99999999999}`: 0,
+		`{"n":9007199254740993.0}`: 9007199254740993, `{"n":9.223372036854775807e18}`: math.MaxInt64,
+	} {
+		var got struct {
+			N int64 `json:"n"`
+		}
+		if err := bindJSONBody(t, body, &got); err != nil || got.N != want {
+			t.Errorf("%s: got %v, %d; want %d", body, err, got.N, want)
+		}
+	}
+	for _, body := range []string{
+		`{"n":2.0000000000000001}`, `{"n":1.5}`, `{"n":1e-5}`, `{"n":1e19}`,
+		`{"n":1e99999999999999999999}`, `{"n":1e-99999999999999999999}`, `{"u":-1.0}`, `{"u":1.5}`,
+	} {
+		var got struct {
+			N int64  `json:"n"`
+			U uint64 `json:"u"`
+		}
+		if err := bindJSONBody(t, body, &got); err == nil {
+			t.Errorf("%s: bound N=%d U=%d, want an error", body, got.N, got.U)
+		}
 	}
 }
