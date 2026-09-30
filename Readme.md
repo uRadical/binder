@@ -511,21 +511,21 @@ figures; it costs more memory than the binding itself.
 
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
-| BindHeaderOnly | 61 | 16 | 1 |
-| BindPathOnly | 70 | 8 | 1 |
-| BindQueryOnly | 87 | 16 | 1 |
-| BindCookieOnly | 94 | 16 | 1 |
-| BindNoQueryParams | 94 | 16 | 1 |
-| BindOmitEmpty | 123 | 48 | 1 |
-| BindParallel | 262 | 552 | 11 |
-| BindBodyOnly/JSONBody | 539 | 276 | 11 |
-| BindBodyOnly/FormBody | 561 | 552 | 11 |
-| BindMixed/WithJSON | 710 | 332 | 11 |
-| Bind | 720 | 336 | 7 |
-| BindMixed/WithForm | 743 | 616 | 11 |
-| BindManyQueryParams | 907 | 128 | 1 |
-| BindWithoutCache | 2,104 | 3,409 | 17 |
-| BindMultipart | 7,798 | 31,636 | 78 |
+| BindHeaderOnly | 52 | 16 | 1 |
+| BindPathOnly | 60 | 8 | 1 |
+| BindQueryOnly | 82 | 16 | 1 |
+| BindCookieOnly | 86 | 16 | 1 |
+| BindNoQueryParams | 87 | 16 | 1 |
+| BindOmitEmpty | 118 | 48 | 1 |
+| BindParallel | 227 | 552 | 11 |
+| BindBodyOnly/FormBody | 542 | 552 | 11 |
+| BindBodyOnly/JSONBody | 572 | 316 | 13 |
+| BindMixed/WithForm | 729 | 616 | 11 |
+| Bind | 747 | 336 | 7 |
+| BindMixed/WithJSON | 752 | 372 | 13 |
+| BindManyQueryParams | 942 | 128 | 1 |
+| BindWithoutCache | 2,232 | 3,462 | 19 |
+| BindMultipart | 7,876 | 31,657 | 78 |
 
 The one allocation in the path, query, cookie and header benchmarks is the
 target itself escaping to the heap once it is passed as `any`: binding from
@@ -535,8 +535,8 @@ rather than a copy. A JSON body costs more, since the body must be read and
 parsed before any field can be converted. A form body is parsed into a map
 first, and costs about the same as JSON.
 
-`Bind` against `BindWithoutCache` measures the per-type tag cache: 720 ns and
-7 allocations with it warm, against 2,104 ns and 17 allocations when it is
+`Bind` against `BindWithoutCache` measures the per-type tag cache: 747 ns and
+7 allocations with it warm, against 2,232 ns and 19 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
@@ -677,11 +677,11 @@ on an Apple M-series laptop, Go 1.27:
 
 | Scenario | Binder | Echo | Gin | gorilla/schema | Stdlib by hand |
 |----------|-------:|-----:|----:|---------------:|---------------:|
-| Query string, 5 fields | 523 ns | 881 ns | 1,105 ns | 1,936 ns | 364 ns |
+| Query string, 5 fields | 520 ns | 874 ns | 1,104 ns | 1,934 ns | 363 ns |
 | | 64 B, 1 alloc | 544 B, 8 allocs | 608 B, 9 allocs | 1,367 B, 46 allocs | 480 B, 7 allocs |
-| JSON body, 5 fields | 570 ns | 824 ns | 868 ns | - | 745 ns |
+| JSON body, 5 fields | 599 ns | 820 ns | 864 ns | - | 743 ns |
 | | 256 B, 8 allocs | 681 B, 8 allocs | 681 B, 8 allocs | - | 681 B, 8 allocs |
-| Path, query, body, header and cookie | 595 ns | 1,340 ns | 1,473 ns | - | - |
+| Path, query, body, header and cookie | 606 ns | 1,336 ns | 1,474 ns | - | - |
 | | 248 B, 6 allocs | 1,202 B, 15 allocs | 1,644 B, 21 allocs | - | - |
 
 Every binding library's figures include 1 allocation for the target escaping
