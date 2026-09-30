@@ -1611,10 +1611,28 @@ func bindFieldValue(fieldVal reflect.Value, value any) error {
 	if value == nil {
 		return nil
 	}
-	if fieldVal.Kind() == reflect.Pointer && fieldVal.IsNil() {
-		fieldVal.Set(reflect.New(fieldVal.Type().Elem())) // Initialize pointer fields
+	if isNilPointer(fieldVal) {
+		fieldVal.Set(reflect.New(fieldVal.Type().Elem()))
+		return unsetOnFailure(fieldVal, setField(fieldVal, value))
 	}
 	return setField(fieldVal, value)
+}
+
+// isNilPointer reports whether v is a nil pointer, which binding a value
+// allocates.
+func isNilPointer(v reflect.Value) bool {
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
+// unsetOnFailure takes back a pointer allocated for a value that then failed
+// to bind, so that a pointer left nil means nothing was bound through it,
+// rather than pointing at a zero value, or at part of a struct, that no one
+// sent. A pointer the caller set beforehand is never passed here.
+func unsetOnFailure(v reflect.Value, err error) error {
+	if err != nil {
+		v.SetZero()
+	}
+	return err
 }
 
 // fieldFailures turns a failure to set a field into BindErrors carrying the

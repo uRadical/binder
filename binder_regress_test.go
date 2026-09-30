@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -187,22 +188,45 @@ type CycleB struct {
 	Validator
 }
 
+// valInt supplies Validate from a type that is not a struct, which the search
+// for where Validate comes from does not descend into.
+type valInt int
+
+func (valInt) Validate(context.Context) error { return errValidated }
+
+type CycleC struct {
+	*CycleD
+	valInt
+	N int `query:"n"`
+}
+
+type CycleD struct {
+	*CycleC
+}
+
 // Embedded pointers that refer to each other used to hang the search for
 // where Validate comes from, holding the type cache's lock, so every later
-// Bind hung too.
+// Bind hung too. The search must end whether or not it finds Validate on a
+// struct: CycleC's comes from valInt, so only the cycle guard stops it.
 func TestValidateSearchTerminatesOnCycle(t *testing.T) {
-	done := make(chan error, 1)
-	go func() {
-		var got CycleA
-		done <- Bind(httptest.NewRequest("GET", "/?n=1", nil), &got)
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("got %v, want nil: the nil embedded Validator is skipped", err)
+	for _, tc := range []struct {
+		name   string
+		target any
+		want   error
+	}{
+		{"nil embedded Validator is skipped", &CycleA{}, nil},
+		{"Validate from a non-struct runs", &CycleC{}, errValidated},
+	} {
+		done := make(chan error, 1)
+		go func() { done <- Bind(httptest.NewRequest("GET", "/?n=1", nil), tc.target) }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, tc.want) {
+				t.Errorf("%s: got %v, want %v", tc.name, err, tc.want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: Bind did not return", tc.name)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Bind did not return")
 	}
 }
 
@@ -318,6 +342,17 @@ func TestDuplicateMemberFailureStands(t *testing.T) {
 	if !errors.As(err, &errs) || len(errs) != 3 {
 		t.Fatalf("got %v, want three failures", err)
 	}
+	// A later occurrence that fails too neither replaces the first failure
+	// nor adds a second.
+	err = bindJSONBody(t, `{"age":"x","age":"y","in":{"age":"x","age":"y"},"m":{"a":"x","a":"y"}}`, &got)
+	if !errors.As(err, &errs) || len(errs) != 3 {
+		t.Fatalf("got %v, want three failures", err)
+	}
+	for _, e := range errs {
+		if !strings.Contains(e.Error(), `"x"`) {
+			t.Errorf("%s: failure %v, want the first occurrence's", e.Name, e)
+		}
+	}
 	var good struct {
 		Age int `json:"age"`
 	}
@@ -391,11 +426,17 @@ func TestBase64IntoBytes(t *testing.T) {
 	}
 }
 
+// wideElem is large, so a buffer allocated for an empty array of them shows.
+type wideElem struct {
+	N int `json:"n"`
+	_ [64]int64
+}
+
 // An empty inner array costs a small, fixed amount rather than a buffer.
 func TestEmptyInnerArraysAreCheap(t *testing.T) {
 	body := `{"s":[` + strings.Repeat("[],", 9999) + `[]]}`
 	var got struct {
-		S [][]int64 `json:"s"`
+		S [][]wideElem `json:"s"`
 	}
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
@@ -419,36 +460,53 @@ type failTree struct {
 // maxFailures failures are built.
 func TestDeepFailuresAreLinear(t *testing.T) {
 	const depth = 1000
-	var b strings.Builder
-	for range depth {
-		b.WriteString(`{"w":["x","x","x","x","x"],"k":[`)
-	}
-	b.WriteString(`{}`)
-	for range depth {
-		b.WriteString(`]}`)
-	}
-	body := `{"k":[` + b.String() + `]}`
-	var got struct {
-		K []failTree `json:"k"`
-	}
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	start := time.Now()
-	err := bindJSONBody(t, body, &got)
-	elapsed := time.Since(start)
-	runtime.ReadMemStats(&after)
+	// With "w" first, the budget is spent on the outermost levels; with "k"
+	// first, on the deepest, whose paths are a thousand levels long.
+	for _, wFirst := range []bool{true, false} {
+		var b strings.Builder
+		for range depth {
+			if wFirst {
+				b.WriteString(`{"w":["x","x","x","x","x"],"k":[`)
+			} else {
+				b.WriteString(`{"k":[`)
+			}
+		}
+		b.WriteString(`{}`)
+		for range depth {
+			if wFirst {
+				b.WriteString(`]}`)
+			} else {
+				b.WriteString(`],"w":["x","x","x","x","x"]}`)
+			}
+		}
+		body := `{"k":[` + b.String() + `]}`
+		var got struct {
+			K []failTree `json:"k"`
+		}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		start := time.Now()
+		err := bindJSONBody(t, body, &got)
+		elapsed := time.Since(start)
+		runtime.ReadMemStats(&after)
 
-	var errs BindErrors
-	if !errors.As(err, &errs) || len(errs) != maxFailures {
-		t.Fatalf("got %d failures, want %d", len(errs), maxFailures)
-	}
-	// Failures come in field order, and K is declared before W, so the
-	// deepest come first and the outermost level's last.
-	if last := errs[len(errs)-1]; last.Name != "k[0].w[4]" || last.Field != "K[0].W[4]" {
-		t.Errorf("last failure named %q / %q", last.Name, last.Field)
-	}
-	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 || elapsed > 2*time.Second {
-		t.Errorf("allocated %d MB in %v for a %d KB body", alloc>>20, elapsed, len(body)>>10)
+		var errs BindErrors
+		if !errors.As(err, &errs) || len(errs) != maxFailures {
+			t.Fatalf("wFirst=%v: got %d failures, want %d", wFirst, len(errs), maxFailures)
+		}
+		last := errs[len(errs)-1]
+		if wFirst {
+			// Failures come in field order, and K is declared before W, so
+			// the deepest come first and the outermost level's last.
+			if last.Name != "k[0].w[4]" || last.Field != "K[0].W[4]" {
+				t.Errorf("last failure named %q / %q", last.Name, last.Field)
+			}
+		} else if !strings.HasPrefix(last.Name, "k[0].k[0]") || !strings.HasSuffix(last.Name, "k[0].w[4]") || !strings.Contains(last.Name, "…") || len(last.Name) > 400 {
+			t.Errorf("last failure named %.200q", last.Name)
+		}
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 16<<20 || elapsed > 2*time.Second {
+			t.Errorf("wFirst=%v: allocated %d MB in %v for a %d KB body", wFirst, alloc>>20, elapsed, len(body)>>10)
+		}
 	}
 }
 
@@ -588,8 +646,10 @@ func TestMapKeysOrderedAndCanonical(t *testing.T) {
 		M map[int]int `json:"m"`
 	}
 	var errs BindErrors
-	if err := bindJSONBody(t, `{"m":{"01":"x","1":5}}`, &got); !errors.As(err, &errs) || len(errs) != 1 {
-		t.Errorf("got %v, want one failure", err)
+	for _, body := range []string{`{"m":{"01":"x","1":5}}`, `{"m":{"01":"x","1":"y"}}`, `{"m":{"1":"x","01":"y"}}`} {
+		if err := bindJSONBody(t, body, &got); !errors.As(err, &errs) || len(errs) != 1 || !strings.Contains(errs[0].Error(), `"x"`) {
+			t.Errorf("%s: got %v, want one failure, for x", body, err)
+		}
 	}
 }
 
@@ -761,7 +821,8 @@ func (k *looseKey) UnmarshalText(b []byte) error { k.s = string(b); return nil }
 func (k looseKey) String() string                { return "K" }
 
 // Failures were keyed by a key's printed form, so a later, different key that
-// printed the same deleted an earlier one's failure.
+// printed the same was taken for the earlier one: its failure deleted the
+// earlier one's, or it was skipped as a repeat of it.
 func TestMapFailureKeyedByValue(t *testing.T) {
 	var got struct {
 		M map[looseKey]int `json:"m"`
@@ -769,6 +830,37 @@ func TestMapFailureKeyedByValue(t *testing.T) {
 	if err := bindJSONBody(t, `{"m":{"a":"x","b":1}}`, &got); err == nil {
 		t.Error("got nil, want the failure for a")
 	}
+	// Two different keys that print the same each report their own failure.
+	var errs BindErrors
+	err := bindJSONBody(t, `{"m":{"a":"x","b":"y"}}`, &got)
+	if !errors.As(err, &errs) {
+		t.Fatalf("got %v", err)
+	}
+	var names []string
+	for _, e := range errs {
+		names = append(names, e.Name)
+	}
+	if want := []string{"m[a]", "m[b]"}; !slices.Equal(names, want) {
+		t.Errorf("JSON: got %v, want %v", names, want)
+	}
+	// As from a query.
+	var q struct {
+		M map[looseKey]int `query:"m"`
+	}
+	errs = nil
+	if err := Bind(httptest.NewRequest("GET", "/?m[a]=x&m[b]=y", nil), &q); !errors.As(err, &errs) || len(errs) != 2 {
+		t.Errorf("query: got %v, want failures for a and b", err)
+	}
+}
+
+// failCount counts conversions attempted, each of which fails.
+var failCount atomic.Int64
+
+type countedFail struct{}
+
+func (*countedFail) UnmarshalText([]byte) error {
+	failCount.Add(1)
+	return errors.New("bad")
 }
 
 // A query or form map, or slice, stops converting once maxFailures entries
@@ -779,15 +871,41 @@ func TestTextSourcesStopAtCap(t *testing.T) {
 	for i := range 4000 {
 		fmt.Fprintf(&b, "m[k%d]=x&n=x&", i)
 	}
-	r := httptest.NewRequest("POST", "/", strings.NewReader(b.String()))
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	var got struct {
-		M map[string]int `body:"m"`
-		N []int          `body:"n"`
+	for _, target := range []any{
+		&struct {
+			M map[string]countedFail `body:"m"`
+		}{},
+		&struct {
+			N []countedFail `body:"n"`
+		}{},
+	} {
+		r := httptest.NewRequest("POST", "/", strings.NewReader(b.String()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		failCount.Store(0)
+		var errs BindErrors
+		if err := Bind(r, target); !errors.As(err, &errs) || len(errs) != maxFailures {
+			t.Errorf("%T: got %d failures, want %d: %.200v", target, len(errs), maxFailures, err)
+		}
+		if n := failCount.Load(); n > maxFailures {
+			t.Errorf("%T: converted %d values, want at most %d", target, n, maxFailures)
+		}
 	}
-	var errs BindErrors
-	if err := Bind(r, &got); !errors.As(err, &errs) || len(errs) != maxFailures {
-		t.Errorf("got %d failures, want %d: %.200v", len(errs), maxFailures, err)
+}
+
+// Top-level failures are charged to the budget like any other, so a nested
+// value after them stops converting once the budget is spent.
+func TestTopLevelFailureIsCharged(t *testing.T) {
+	var got struct {
+		A int           `json:"a"`
+		N []countedFail `json:"n"`
+	}
+	body := `{"a":"x","n":[` + strings.Repeat(`"x",`, maxFailures-1) + `"x"]}`
+	failCount.Store(0)
+	if err := bindJSONBody(t, body, &got); err == nil {
+		t.Fatal("got nil")
+	}
+	if n := failCount.Load(); n != maxFailures-1 {
+		t.Errorf("converted %d elements, want %d", n, maxFailures-1)
 	}
 }
 
@@ -940,8 +1058,10 @@ func TestLongKeyOrderAndRequiredMessage(t *testing.T) {
 			A int `body:"a,required"`
 		} `json:"n"`
 	}
-	long := strings.Repeat("9", 400)
-	err := bindJSONBody(t, `{"m":{"`+long+`":1,"12":"x","x":1},"n":{}}`, &got)
+	// By value, 2×10^399 comes before 10^400, which its text does not.
+	shorter := "2" + strings.Repeat("0", 399)
+	longer := "1" + strings.Repeat("0", 400)
+	err := bindJSONBody(t, `{"m":{"`+longer+`":1,"12":"x","`+shorter+`":1,"x":1},"n":{}}`, &got)
 	var errs BindErrors
 	if !errors.As(err, &errs) {
 		t.Fatal(err)
@@ -952,8 +1072,9 @@ func TestLongKeyOrderAndRequiredMessage(t *testing.T) {
 	}
 	// A long key is ordered by its full value, and named by its first
 	// maxKeyInPath bytes.
-	if want := []string{"m[12]", "m[" + long[:maxKeyInPath] + "…]", "m[x]", "n.a"}; !slices.Equal(names, want) {
-		t.Errorf("order %.80v", names)
+	want := []string{"m[12]", "m[" + shorter[:maxKeyInPath] + "…]", "m[" + longer[:maxKeyInPath] + "…]", "m[x]", "n.a"}
+	if !slices.Equal(names, want) {
+		t.Errorf("order %.200v", names)
 	}
 	if last := errs[len(errs)-1]; !strings.HasPrefix(last.Message, "missing required field N.A") {
 		t.Errorf("message %q", last.Message)
@@ -999,9 +1120,41 @@ func TestLongIndexRunKeepsElisionMark(t *testing.T) {
 	}
 }
 
+// wideRow is tagged so that a nested object binds its fields; untagged, none
+// would bind, and bookkeeping sized to them would cost nothing to find.
 type wideRow struct {
-	A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P       bool
-	Q, R, S, T, U, V, W, X, Y, Z, AA, BB, CC, DD, EE, FF bool
+	A  bool `json:"a"`
+	B  bool `json:"b"`
+	C  bool `json:"c"`
+	D  bool `json:"d"`
+	E  bool `json:"e"`
+	F  bool `json:"f"`
+	G  bool `json:"g"`
+	H  bool `json:"h"`
+	I  bool `json:"i"`
+	J  bool `json:"j"`
+	K  bool `json:"k"`
+	L  bool `json:"l"`
+	M  bool `json:"m"`
+	N  bool `json:"n"`
+	O  bool `json:"o"`
+	P  bool `json:"p"`
+	Q  bool `json:"q"`
+	R  bool `json:"r"`
+	S  bool `json:"s"`
+	T  bool `json:"t"`
+	U  bool `json:"u"`
+	V  bool `json:"v"`
+	W  bool `json:"w"`
+	X  bool `json:"x"`
+	Y  bool `json:"y"`
+	Z  bool `json:"z"`
+	AA bool `json:"aa"`
+	BB bool `json:"bb"`
+	CC bool `json:"cc"`
+	DD bool `json:"dd"`
+	EE bool `json:"ee"`
+	FF bool `json:"ff"`
 }
 
 // Every nested object allocated bookkeeping sized to its struct, failures or
@@ -1237,21 +1390,32 @@ func TestLongUnknownKeyAndInvalidUTF8Clip(t *testing.T) {
 
 // A multipart name sent as both text and a file is refused for a field that
 // binds it, not a silent choice of one, and ignored where nothing binds it.
+// Both a text field and a file field are checked: whichever part silently
+// won, one of them would bind it without a failure.
 func TestMultipartTextAndFileSameName(t *testing.T) {
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	_ = w.WriteField("doc", "text")
-	fw, _ := w.CreateFormFile("doc", "d.txt")
-	_, _ = fw.Write([]byte("file"))
-	_ = w.Close()
-	r := httptest.NewRequest("POST", "/", &buf)
-	r.Header.Set("Content-Type", w.FormDataContentType())
+	build := func() *http.Request {
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+		_ = w.WriteField("doc", "text")
+		fw, _ := w.CreateFormFile("doc", "d.txt")
+		_, _ = fw.Write([]byte("file"))
+		_ = w.Close()
+		r := httptest.NewRequest("POST", "/", &buf)
+		r.Header.Set("Content-Type", w.FormDataContentType())
+		return r
+	}
 	var got struct {
 		Doc string `body:"doc"`
 	}
 	var errs BindErrors
-	if err := Bind(r, &got); !errors.As(err, &errs) || errs[0].Name != "doc" {
-		t.Errorf("got %v, want a failure for doc", err)
+	if err := Bind(build(), &got); !errors.As(err, &errs) || errs[0].Name != "doc" {
+		t.Errorf("text field: got %v, want a failure for doc", err)
+	}
+	var gotFile struct {
+		Doc *multipart.FileHeader `body:"doc"`
+	}
+	if err := Bind(build(), &gotFile); !errors.As(err, &errs) || errs[0].Name != "doc" {
+		t.Errorf("file field: got %v; want a failure for doc", err)
 	}
 
 	// A struct that does not bind the name is not affected by it.

@@ -463,6 +463,13 @@ an entry too, after the fields, with an empty `Field` and `Err` set to
 `errors.Is` sees through the list, so `errors.Is(err, binder.ErrMissingRequired)`
 reports whether any field was missing.
 
+A pointer field whose value fails to bind is left nil, so a nil pointer always
+means nothing was bound through it. That holds for a pointer to a struct too:
+if any of its members fails, the members that bound are dropped with it. A
+pointer set before binding is kept. Other fields can be left holding part of a
+value that failed, such as the members of a struct that bound, so once `Bind`
+has returned an error, act on the failures rather than on the struct.
+
 Failures that concern the request as a whole are reported with sentinel errors
 rather than `BindErrors`, so a handler can choose the right status code. They
 end binding at once, since nothing bound after them could be trusted:

@@ -330,6 +330,15 @@ func memberName(raw jsontext.Value) ([]byte, error) {
 // directly; everything else falls back to decoding a value and converting it,
 // so coercions such as a JSON string into an integer keep working.
 func decodeJSONInto(dec *jsonDecoder, field reflect.Value, fi *fieldInfo) error {
+	if isNilPointer(field) {
+		return unsetOnFailure(field, decodeJSONField(dec, field, fi))
+	}
+	return decodeJSONField(dec, field, fi)
+}
+
+// decodeJSONField is decodeJSONInto without the undoing of a pointer that a
+// failed value allocated.
+func decodeJSONField(dec *jsonDecoder, field reflect.Value, fi *fieldInfo) error {
 	kind := dec.PeekKind()
 
 	// omitempty on anything but a predeclared type, whose fast path judges
@@ -443,6 +452,15 @@ func decodeWithPlan(dec *jsonDecoder, v reflect.Value, p *decodePlan) error {
 		_, err := dec.ReadToken()
 		return err
 	}
+	if isNilPointer(v) {
+		return unsetOnFailure(v, decodeNonNull(dec, v, p, kind))
+	}
+	return decodeNonNull(dec, v, p, kind)
+}
+
+// decodeNonNull is decodeWithPlan for a value known not to be null, without
+// the undoing of a pointer that a failed value allocated.
+func decodeNonNull(dec *jsonDecoder, v reflect.Value, p *decodePlan, kind jsontext.Kind) error {
 	if p.direct == 0 || p.direct != kind {
 		return decodeScalarInto(dec, v, p, kind)
 	}

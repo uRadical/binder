@@ -96,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A pointer field whose value fails to bind stays nil.** It used to be left
+  pointing at a zero value, or at the members of a struct that bound before
+  one failed, so after a failure a non-nil pointer did not mean a value was
+  bound. A pointer set before binding is kept.
 - `Validator.Validate` receives `r.Context()`, so rules that depend on the
   caller, a tenant or a deadline can run during binding.
 - Unknown fields are reported alongside field failures rather than ending

@@ -93,7 +93,8 @@ func TestObjectIntoMapFailures(t *testing.T) {
 	if err := bindJSONBody(t, `{"by_id":{"7":"x"},"count":{"a":null,"b":2}}`, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ByID[7] != "x" || got.Count["a"] != nil || *got.Count["b"] != 2 {
+	// The null's key is present, holding nil, not dropped.
+	if a, ok := got.Count["a"]; got.ByID[7] != "x" || !ok || a != nil || *got.Count["b"] != 2 {
 		t.Errorf("got %+v", got)
 	}
 	err := bindJSONBody(t, `{"by_id":{"seven":"x","8":{}}}`, &got)
@@ -103,21 +104,40 @@ func TestObjectIntoMapFailures(t *testing.T) {
 	}
 }
 
+// span decodes itself from an object whose members name no field of it, so it
+// binds only through its own UnmarshalJSON.
+type span struct{ Len int }
+
+func (s *span) UnmarshalJSON(b []byte) error {
+	var r struct{ From, To int }
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+	s.Len = r.To - r.From
+	return nil
+}
+
 // Elements that decode themselves, or from text, do so inside a slice or map
-// as they do at the top level.
+// as they do at the top level, from an object as from a scalar.
 func TestCustomElementTypes(t *testing.T) {
 	var got struct {
 		Times  []time.Time           `body:"times"`
 		Prices []cents               `body:"prices"`
 		ByDay  map[string]*time.Time `body:"by_day"`
 		Waits  []time.Duration       `body:"waits"`
+		Spans  []span                `body:"spans"`
+		ByName map[string]*span      `body:"by_name"`
 	}
-	body := `{"times":["2026-01-02T00:00:00Z"],"prices":[1.25],"by_day":{"mon":"2026-01-05T00:00:00Z"},"waits":["1s",5]}`
+	body := `{"times":["2026-01-02T00:00:00Z"],"prices":[1.25],"by_day":{"mon":"2026-01-05T00:00:00Z"},"waits":["1s",5],` +
+		`"spans":[{"From":1,"To":4}],"by_name":{"a":{"From":2,"To":9}}}`
 	if err := bindJSONBody(t, body, &got); err != nil {
 		t.Fatal(err)
 	}
 	if len(got.Times) != 1 || got.Times[0].Day() != 2 || got.Prices[0] != 125 || got.ByDay["mon"].Day() != 5 || got.Waits[0] != time.Second || got.Waits[1] != 5 {
 		t.Errorf("got %+v", got)
+	}
+	if len(got.Spans) != 1 || got.Spans[0].Len != 3 || got.ByName["a"] == nil || got.ByName["a"].Len != 7 {
+		t.Errorf("spans %+v, by_name %+v", got.Spans, got.ByName["a"])
 	}
 }
 
