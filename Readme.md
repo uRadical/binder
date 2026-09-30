@@ -196,8 +196,11 @@ type Search struct {
 Keys convert to the map's key type, a string, an integer or a
 `TextUnmarshaler`, and values as a field of the element type would, so
 `map[string]time.Time` or `map[string]uuid.UUID` work too. A repeated key fills
-a slice value and otherwise binds its first value. An empty value counts as
-absent, and a map with no entries is left nil, so `required` reports it. A bad
+a slice value and otherwise binds its first value. In a query or form an
+empty value counts as absent, and a map with no entries is left nil, so
+`required` reports it; a JSON object binds as sent, so `{}` is an empty map
+that satisfies `required`, and a `null` value gives its key the zero value, as
+in `encoding/json`. A bad
 entry is reported under the name the client sent, such as `min[price]`. Only
 one level of brackets is read: `filter[a][b]` has no agreed meaning. The map is
 replaced, not merged into.
@@ -262,7 +265,9 @@ Email string `body:"email,required"`
 
 The failure is a `*BindError` wrapping `ErrMissingRequired`, reported in
 `BindErrors` like any other field failure. For `path`, `query` and `header`
-an empty value counts as missing, so `?q=` is treated as no `q`. A body key or
+an empty value counts as missing, so `?q=` is treated as no `q`; for a slice,
+that holds when every value given is empty, and an empty value among others is
+an element, an error for a non-string element type. A body key or
 a cookie that is present but empty satisfies `required`.
 
 ## Advanced Usage
@@ -345,7 +350,7 @@ type Paging struct {
 
 type ListOrders struct {
     Paging          // ?page=2&limit=20 fills Page and Limit
-    *Audit          // allocated only if one of its fields is sent a value
+    *Audit          // allocated only if one of its fields is sent (a null is not)
     Status string `query:"status"`
 }
 ```
@@ -594,6 +599,11 @@ as `ErrMalformedBody`, also wrap more than one error.
 holds whatever was left in it, so running your rules over it would add a
 second, misleading error for the same input.
 
+A `Validate` promoted from an embedded pointer, such as `*Audit`, is not called
+when that pointer is still nil because none of its fields was sent: there is
+nothing to validate, and calling it would dereference nil. A type's own
+`Validate`, or one promoted from an embedded value, always runs.
+
 Binder passes `r.Context()`, so a rule can use the authenticated user, a
 tenant, or the request's deadline for a lookup:
 
@@ -624,7 +634,7 @@ their source:
 | **File uploads** | Yes | Yes | Yes | No |
 | **Path values** | `http.ServeMux` / `r.PathValue` | Echo's router | Gin's router | N/A |
 | **Validation** | Your `Validate(ctx)` method, called by `Bind` | Pluggable `Validator`, called separately via `c.Validate` | validator/v10 tags, called by `ShouldBind` | No |
-| **Custom types** | `encoding.TextUnmarshaler`, and `UnmarshalJSON` for body values | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler`, and `TextUnmarshaler` with a `parser` tag option | Registered converters and `TextUnmarshaler` |
+| **Custom types** | `encoding.TextUnmarshaler`, `UnmarshalJSON` and json/v2's `UnmarshalJSONFrom` | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler`, and `TextUnmarshaler` with a `parser` tag option | Registered converters and `TextUnmarshaler` |
 | **Reports every bad field** | Yes, as `BindErrors` | No | Validation failures only; conversion stops at the first | Yes, as `MultiError` |
 
 ### Speed and Allocations

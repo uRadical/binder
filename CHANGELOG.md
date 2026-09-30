@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Go field name rather than the key `""`.
 - **Form bodies are parsed on every method.** A form-encoded body is parsed
   from the bytes binder read rather than through `Request.ParseForm`, so it
-  binds on GET and DELETE as it does on POST, is limited by `MaxBodySize` alone
+  binds on GET and DELETE as it does on POST, is limited by `MaxBodySize`
   rather than also by `ParseForm`'s 10 MB cap, and a malformed URL query no
   longer fails it as `ErrMalformedBody`.
 - **A JSON array or object into a string is an error.** It used to bind Go's
@@ -64,8 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a zero value, so the option is now ignored on one.
 - **A `time.Duration` needs a unit in text.** A query, header, form or JSON
   string value such as `9` used to bind as 9 nanoseconds; it is now an error
-  ("missing unit in duration"). Send `9ns`, or a JSON number, which is still
-  nanoseconds.
+  ("missing unit in duration"), except `0`. Send `9ns`, or a JSON number,
+  which is still nanoseconds.
 - **Nested options apply.** `required` and `omitempty` inside a nested struct
   used to be ignored; they now behave as they do at the top level.
 
@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The body buffer was sized up front from the client's `Content-Length`, so a
+  request declaring a large body and sending none made the server allocate up
+  to the limit at once, and a limit near `MaxInt64` panicked. At most 64 KB is
+  allocated before the body arrives, and the limit arithmetic cannot overflow.
+- A `Validate` promoted from an embedded pointer that stayed nil panicked,
+  dereferencing it. It is no longer called when the pointer is nil; a type's
+  own `Validate`, or one promoted from an embedded value, always runs.
+- A JSON `null` inside a nested struct allocated an embedded pointer on the
+  way to its field. It sets nothing, as elsewhere.
 - A type with its own JSON decoding was refused, such as a money type with
   `UnmarshalJSON` ("cannot set struct field with value of type json.Number")
   or `json.RawMessage`. A type implementing `json.Unmarshaler` or json/v2's
@@ -111,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a shared `Paging` bound nothing into it. An untagged embedded struct, or
   pointer to one, now has its fields promoted as in `encoding/json`: they bind
   from every source, an embedded pointer is allocated only when one of its
-  fields is sent a value, an outer field shadows a promoted one, and a failure
+  fields is sent (a null is not), an outer field shadows a promoted one, and a failure
   names the field by its path, such as `Paging.Limit`. An embed tagged
   `json:"-"` is left out.
 - `body:"x"` and `json:"x"` on two fields were treated as different keys,
