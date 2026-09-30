@@ -19,7 +19,7 @@ func resetStore(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	users = map[int]User{
-		1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, CreatedAt: time.Now()},
+		1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, Credit: 2500, CreatedAt: time.Now()},
 		2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, TeamID: teamSupport, CreatedAt: time.Now()},
 	}
 	nextID = 3
@@ -114,6 +114,18 @@ func TestListUsers(t *testing.T) {
 		t.Errorf("bad page: got %d %v, want 400 and page invalid", status, body)
 	}
 
+	// A map from ?filter[field]=text, each a case-insensitive substring.
+	status, body = request(t, "GET", "/users?filter[name]=ALI&filter%5Bemail%5D=example", "", apiKey)
+	if status != http.StatusOK || !reflect.DeepEqual(names(body), []string{"Alice"}) {
+		t.Errorf("filter: got %d %v, want 200 and only Alice", status, body)
+	}
+
+	// Validate rejects a key that is not a filterable field, by its query name.
+	status, body = request(t, "GET", "/users?filter[password]=x", "", apiKey)
+	if status != http.StatusUnprocessableEntity || !reflect.DeepEqual(fieldErrors(t, body), map[string]any{"filter[password]": "is not a field that can be filtered"}) {
+		t.Errorf("bad filter: got %d %v, want 422 naming filter[password]", status, body)
+	}
+
 	status, body = request(t, "GET", "/users?team="+teamSupport.String(), "", apiKey)
 	if status != http.StatusOK || !reflect.DeepEqual(names(body), []string{"Bob"}) {
 		t.Errorf("team filter: got %d %v, want 200 and only Bob", status, body)
@@ -135,11 +147,36 @@ func TestCreateUser(t *testing.T) {
 		body       string
 		wantStatus int
 		wantFields map[string]any // per-field errors expected, if any
+		wantCredit float64        // credit expected on a created user
 	}{
 		{
 			name:       "valid",
 			body:       `{"name":"Carol","email":"carol@example.com","tags":["user"],"team_id":"0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70"}`,
 			wantStatus: http.StatusCreated,
+		},
+		{
+			name:       "money as a JSON number binds exactly",
+			body:       `{"name":"Carol","email":"carol@example.com","credit":19.99}`,
+			wantStatus: http.StatusCreated,
+			wantCredit: 19.99,
+		},
+		{
+			name:       "money as a JSON string",
+			body:       `{"name":"Carol","email":"carol@example.com","credit":"0.5"}`,
+			wantStatus: http.StatusCreated,
+			wantCredit: 0.5,
+		},
+		{
+			name:       "money with too many decimal places",
+			body:       `{"name":"Carol","email":"carol@example.com","credit":1.234}`,
+			wantStatus: http.StatusBadRequest,
+			wantFields: map[string]any{"credit": "invalid value"},
+		},
+		{
+			name:       "negative money binds but fails validation",
+			body:       `{"name":"Carol","email":"carol@example.com","credit":-5}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantFields: map[string]any{"credit": "must not be negative"},
 		},
 		{
 			name:       "a team ID that is not a UUID",
@@ -189,8 +226,14 @@ func TestCreateUser(t *testing.T) {
 					t.Errorf("errors = %v, want %v", got, tt.wantFields)
 				}
 			}
-			if status == http.StatusCreated && (body["id"] != float64(3) || body["name"] != "Carol" || body["team_id"] != teamPlatform.String()) {
-				t.Errorf("created %v, want user 3 named Carol on the platform team", body)
+			if status == http.StatusCreated && (body["id"] != float64(3) || body["name"] != "Carol") {
+				t.Errorf("created %v, want user 3 named Carol", body)
+			}
+			if status == http.StatusCreated && strings.Contains(tt.body, "team_id") && body["team_id"] != teamPlatform.String() {
+				t.Errorf("team_id = %v, want the platform team", body["team_id"])
+			}
+			if status == http.StatusCreated && body["credit"] != tt.wantCredit {
+				t.Errorf("credit = %v, want %v", body["credit"], tt.wantCredit)
 			}
 		})
 	}
@@ -260,4 +303,19 @@ func TestConcurrentRequests(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// A form post gives binder text, which Money receives as a JSON string, so the
+// same type binds from a form as from JSON.
+func TestCreateUserFromFormWithMoney(t *testing.T) {
+	resetStore(t)
+	r := httptest.NewRequest("POST", "/users", strings.NewReader("name=Eve&email=eve@example.com&credit=3.10"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	routes().ServeHTTP(w, r)
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || w.Code != http.StatusCreated || body["credit"] != 3.1 {
+		t.Errorf("got %d %s, want 201 with credit 3.10", w.Code, w.Body)
+	}
 }

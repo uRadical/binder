@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +25,50 @@ type User struct {
 	Active    bool      `json:"active"`
 	Tags      []string  `json:"tags"`
 	TeamID    uuid.UUID `json:"team_id"`
+	Credit    Money     `json:"credit"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// Money is an amount in pence. It decodes itself from JSON, so binder hands a
+// "credit" member to UnmarshalJSON rather than converting it: 12.5 becomes
+// 1250 exactly, with no float rounding on the way.
+type Money int64
+
+// UnmarshalJSON reads a decimal amount with at most two places, as a JSON
+// number (12.50) or a string ("12.50"). A form body or query string gives
+// binder text, which it passes on as a JSON string, so the same type binds
+// from a form post too.
+func (m *Money) UnmarshalJSON(b []byte) error {
+	text := strings.Trim(string(b), `"`)
+	whole, frac, _ := strings.Cut(text, ".")
+	if len(frac) > 2 {
+		return fmt.Errorf("%s has more than two decimal places", text)
+	}
+	pounds, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s is not an amount", text)
+	}
+	pence := int64(0)
+	if frac != "" {
+		frac += strings.Repeat("0", 2-len(frac))
+		if pence, err = strconv.ParseInt(frac, 10, 64); err != nil {
+			return fmt.Errorf("%s is not an amount", text)
+		}
+	}
+	if strings.HasPrefix(whole, "-") {
+		pence = -pence
+	}
+	*m = Money(pounds*100 + pence)
+	return nil
+}
+
+// MarshalJSON writes the amount back as a JSON number: 1250 is 12.50.
+func (m Money) MarshalJSON() ([]byte, error) {
+	sign, v := "", int64(m)
+	if v < 0 {
+		sign, v = "-", -v
+	}
+	return fmt.Appendf(nil, "%s%d.%02d", sign, v/100, v%100), nil
 }
 
 // The teams users belong to. A team is named by a UUID, which binds from any
@@ -38,7 +82,7 @@ var (
 // every access to users and nextID holds mu.
 var mu sync.Mutex
 var users = map[int]User{
-	1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, CreatedAt: time.Now().Add(-24 * time.Hour)},
+	1: {ID: 1, Name: "Alice", Email: "alice@example.com", Active: true, Tags: []string{"admin", "user"}, TeamID: teamPlatform, Credit: 2500, CreatedAt: time.Now().Add(-24 * time.Hour)},
 	2: {ID: 2, Name: "Bob", Email: "bob@example.com", Active: false, Tags: []string{"user"}, TeamID: teamSupport, CreatedAt: time.Now().Add(-48 * time.Hour)},
 }
 var nextID = 3
@@ -82,6 +126,41 @@ type ListUsersRequest struct {
 	// A pointer tells "no filter" from a team: nil unless ?team= names one,
 	// and a value that is not a UUID is reported like any other bad value.
 	Team *uuid.UUID `query:"team"`
+	// A map binds from name[key]=value pairs: ?filter[name]=ali&filter[email]=example
+	// gives {"name": "ali", "email": "example"}. Nil when no filter is sent.
+	Filter map[string]string `query:"filter"`
+}
+
+// filterFields are the user fields ?filter[...] can match, by substring.
+var filterFields = map[string]func(User) string{
+	"name":  func(u User) string { return u.Name },
+	"email": func(u User) string { return u.Email },
+}
+
+// Validate rejects a filter on a field that cannot be filtered, naming it as
+// the client sent it, so a typo is reported rather than matching everyone.
+func (r ListUsersRequest) Validate(ctx context.Context) error {
+	errs := ValidationErrors{}
+	for key := range r.Filter {
+		if filterFields[key] == nil {
+			errs["filter["+key+"]"] = "is not a field that can be filtered"
+		}
+	}
+	if len(errs) > 0 {
+		return errs
+	}
+	return nil
+}
+
+// matchesFilter reports whether a user matches every filter, each a
+// case-insensitive substring of the named field.
+func matchesFilter(u User, filter map[string]string) bool {
+	for key, want := range filter {
+		if !strings.Contains(strings.ToLower(filterFields[key](u)), strings.ToLower(want)) {
+			return false
+		}
+	}
+	return true
 }
 
 type CreateUserRequest struct {
@@ -93,6 +172,8 @@ type CreateUserRequest struct {
 	// A JSON string such as "0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70" binds
 	// straight into a uuid.UUID.
 	TeamID uuid.UUID `body:"team_id"`
+	// Money decodes itself: {"credit": 12.50} binds as 1250 pence.
+	Credit Money `body:"credit"`
 }
 
 // ValidationErrors is this application's error type for Validate: problems
@@ -113,6 +194,9 @@ func (r CreateUserRequest) Validate(ctx context.Context) error {
 	}
 	if len(r.Tags) > 5 {
 		errs["tags"] = "must have at most 5 entries"
+	}
+	if r.Credit < 0 {
+		errs["credit"] = "must not be negative"
 	}
 	if len(errs) > 0 {
 		return errs
@@ -222,6 +306,11 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Filter by ?filter[field]=text, if given
+		if !matchesFilter(user, req.Filter) {
+			continue
+		}
+
 		result = append(result, user)
 	}
 
@@ -264,6 +353,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		Active:    req.Active,
 		Tags:      req.Tags,
 		TeamID:    req.TeamID,
+		Credit:    req.Credit,
 		CreatedAt: time.Now(),
 	}
 
@@ -392,12 +482,14 @@ func main() {
 	fmt.Println("  GET    http://localhost:8080/users?page=2&limit=1")
 	fmt.Println("  GET    http://localhost:8080/users?tags=admin&tags=user")
 	fmt.Println("  GET    http://localhost:8080/users?team=" + teamPlatform.String())
+	fmt.Println("  GET    http://localhost:8080/users?filter[name]=ali")
 	fmt.Println("  POST   http://localhost:8080/users")
 	fmt.Println("  PUT    http://localhost:8080/users/1")
 	fmt.Println("  DELETE http://localhost:8080/users/1")
 	fmt.Println()
 	fmt.Println("GET /users needs the api_key cookie: a browser gets it from its first")
-	fmt.Println("response; with curl, add -b api_key=demo-key and quote the URL.")
+	fmt.Println("response; with curl, add -b api_key=demo-key and quote the URL, and")
+	fmt.Println("add -g for a URL with [ ], such as filter[name].")
 	fmt.Println()
 	fmt.Println("See example/README.md for detailed usage instructions")
 

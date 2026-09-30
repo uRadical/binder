@@ -12,6 +12,8 @@ This example demonstrates how to use the Binder library to build a complete REST
 - **Repeated values** - `/users?tags=admin&tags=user` filling a slice
 - **UUIDs** - A `uuid.UUID` bound from a JSON body and a query string
 - **Embedded structs** - A shared `Paging` struct whose fields bind as if declared on the request
+- **Maps** - `/users?filter[name]=ali` filling a `map[string]string`
+- **Custom JSON decoding** - A `Money` type with its own `UnmarshalJSON`, from JSON and from a form
 - **Required fields** - Reporting a missing value rather than binding a zero one
 - **Per-call options** - `BindWithOptions` for body limits and unknown fields
 - **Validation** - Using the `Validator` interface
@@ -53,12 +55,15 @@ curl http://localhost:8080/users/1
 curl -b api_key=demo-key 'http://localhost:8080/users?active=true&limit=5'
 curl -b api_key=demo-key 'http://localhost:8080/users?page=2&limit=1'
 curl -b api_key=demo-key 'http://localhost:8080/users?team=0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70'
+# -g stops curl reading [ ] as a range pattern; a browser needs nothing
+curl -g -b api_key=demo-key 'http://localhost:8080/users?filter[name]=ali&filter[email]=example'
 ```
 
 **Binder features:**
 - `query:"active"` - Optional boolean filter into a `*bool`, nil when not given
 - `Paging` embedded - its `query:"page"` and `query:"limit"` fields are promoted, so any list endpoint gets paging by embedding one struct
 - `query:"team"` - Optional team filter into a `*uuid.UUID`, nil when not given
+- `query:"filter"` - A `map[string]string` from `filter[field]=text` pairs, nil when none are sent; `Validate` rejects a field that cannot be filtered
 - `cookie:"api_key"` - API key from cookie; the demo middleware sets it on the response, so a browser sends it from the second request on
 
 ### 3. Create User
@@ -71,7 +76,8 @@ curl -X POST http://localhost:8080/users \
     "email": "charlie@example.com",
     "active": true,
     "tags": ["user", "premium"],
-    "team_id": "0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70"
+    "team_id": "0192f4a0-7b3c-7d4e-9a1b-2c3d4e5f6a70",
+    "credit": 12.50
   }'
 ```
 
@@ -81,6 +87,7 @@ curl -X POST http://localhost:8080/users \
 - `body:"active"` - Boolean from JSON
 - `body:"tags"` - Slice of strings from JSON
 - `body:"team_id"` - A JSON string parsed into a `uuid.UUID`
+- `body:"credit"` - A `Money` amount; the type has its own `UnmarshalJSON`, so binder hands it the member and `12.50` becomes 1250 pence exactly
 - `Validate(ctx)` method - Custom validation after binding
 
 ### 4. Update User (Partial)
@@ -238,10 +245,12 @@ The server also accepts form-encoded data. Try this:
 ```bash
 curl -X POST http://localhost:8080/users \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "name=David&email=david@example.com&active=true"
+  -d "name=David&email=david@example.com&active=true&credit=3.10"
 ```
 
-Binder automatically detects the content type and parses accordingly.
+Binder automatically detects the content type and parses accordingly. `credit`
+still binds into `Money`: a form carries text, which binder passes to
+`UnmarshalJSON` as a JSON string.
 
 ## Advanced Features Shown
 
@@ -253,6 +262,8 @@ Binder automatically detects the content type and parses accordingly.
 6. **Custom Validation** - Implementing the `Validator` interface with an error type of your own
 7. **Text Types** - `uuid.UUID` binds from any source because it implements `encoding.TextUnmarshaler`; `time.Time` and `net.IP` bind the same way
 8. **Embedded Structs** - `ListUsersRequest` embeds `Paging`; its fields are promoted as in `encoding/json`, and a bad `?page=` is reported as `page`
+9. **Maps** - `?filter[name]=ali` fills `Filter map[string]string`; the same `name[key]=value` form works in a form body, and a map of `int`, `bool` or `uuid.UUID` values converts each one
+10. **Custom JSON Decoding** - `Money` implements `UnmarshalJSON`, so binder hands it the JSON member; from a form post it receives the text as a JSON string, so `credit=3.10` works too
 
 ## Testing with Different Tools
 
@@ -273,6 +284,16 @@ http POST localhost:8080/users name=Eve email=eve@example.com active:=true tags:
 Try these to see error handling:
 
 ```bash
+# A filter on a field that cannot be filtered
+curl -g -b api_key=demo-key 'http://localhost:8080/users?filter[password]=x'
+# 422 {"errors":{"filter[password]":"is not a field that can be filtered"}}
+
+# Money with more than two decimal places
+curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Carol","email":"carol@example.com","credit":1.234}'
+# 400 {"errors":{"credit":"invalid value"}}
+
 # Invalid user ID (non-integer)
 curl http://localhost:8080/users/abc
 # 400 {"errors":{"id":"invalid value"}}
