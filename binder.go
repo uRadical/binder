@@ -1867,17 +1867,17 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 		}
 	}
 
-	var maps map[string]struct{}
+	var mapFields map[string]struct{}
 	for _, fi := range info {
 		if fi.IsMap && (fi.Source == body || fi.Source == jjson) {
-			if maps == nil {
-				maps = make(map[string]struct{})
+			if mapFields == nil {
+				mapFields = make(map[string]struct{})
 			}
-			maps[fi.TagName] = struct{}{}
+			mapFields[fi.TagName] = struct{}{}
 		}
 	}
 
-	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields, bodyMaps: maps}
+	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields, bodyMaps: mapFields}
 	seen := make(map[reflect.Type]bool)
 	var cycle reflect.Type
 	for _, fi := range info {
@@ -2358,7 +2358,7 @@ func setFieldByKind(field reflect.Value, value any) error {
 		return fmt.Errorf("arrays are not supported, use slices instead")
 
 	case reflect.Struct:
-		return setStruct(field, value)
+		return setStruct(value)
 
 	case reflect.Pointer:
 		if field.IsNil() {
@@ -2932,7 +2932,7 @@ func compareWhole(aNeg bool, a string, bNeg bool, b string) int {
 // setStruct reports a value that cannot fill a struct field. A JSON object
 // fills one token by token, in decodeObjectIntoStruct, so what reaches here
 // is text, a number, a bool or an array, none of which a struct can take.
-func setStruct(field reflect.Value, value any) error {
+func setStruct(value any) error {
 	return fmt.Errorf("cannot set struct field with value of type %T", value)
 }
 

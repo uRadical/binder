@@ -183,7 +183,7 @@ func TestBindValidationFailure(t *testing.T) {
 	var p ValidationStruct
 	err := Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with negative value")
+		t.Fatal("Binding should fail with negative value")
 	}
 
 	if !strings.Contains(err.Error(), "validation failed") {
@@ -390,7 +390,7 @@ func TestBindInvalidInt(t *testing.T) {
 	var p params
 	err := Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with invalid int")
+		t.Fatal("Binding should fail with invalid int")
 	}
 
 	if !strings.Contains(err.Error(), "error setting field ID") {
@@ -408,7 +408,7 @@ func TestBindInvalidFloat(t *testing.T) {
 	var p params
 	err := Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with invalid float")
+		t.Fatal("Binding should fail with invalid float")
 	}
 
 	if !strings.Contains(err.Error(), "error setting field Value") {
@@ -426,7 +426,7 @@ func TestBindInvalidBool(t *testing.T) {
 	var p params
 	err := Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with invalid boolean")
+		t.Fatal("Binding should fail with invalid boolean")
 	}
 
 	if !strings.Contains(err.Error(), "error setting field Flag") {
@@ -445,7 +445,7 @@ func TestBindInvalidUUID(t *testing.T) {
 	var p params
 	err := Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with invalid UUID")
+		t.Fatal("Binding should fail with invalid UUID")
 	}
 
 	if !strings.Contains(err.Error(), "error setting field ID") {
@@ -463,7 +463,7 @@ func TestBindUnsupportedType(t *testing.T) {
 	var p params
 	err := Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with unsupported type")
+		t.Fatal("Binding should fail with unsupported type")
 	}
 
 	if !strings.Contains(err.Error(), "unsupported type") {
@@ -657,7 +657,7 @@ func TestBindArrayNotSupported(t *testing.T) {
 	var p params
 	err = Bind(r, &p)
 	if err == nil {
-		t.Errorf("Binding should fail with array type")
+		t.Fatal("Binding should fail with array type")
 	}
 
 	if !strings.Contains(err.Error(), "arrays are not supported, use slices instead") {

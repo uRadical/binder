@@ -912,7 +912,7 @@ func TestRepeatOfFailedMemberIsSkipped(t *testing.T) {
 // sliceKey unmarshals into a value no map can hold.
 type sliceKey struct{ V any }
 
-func (k *sliceKey) UnmarshalText(b []byte) error { k.V = []byte(b); return nil }
+func (k *sliceKey) UnmarshalText(b []byte) error { k.V = bytes.Clone(b); return nil }
 
 // A key type whose value cannot be hashed used to panic; it is an invalid key.
 func TestUnhashableMapKeyIsAnError(t *testing.T) {
