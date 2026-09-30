@@ -557,7 +557,7 @@ This library has been designed with production use in mind:
 - **Errors are never swallowed** - A body that fails to parse is reported, not ignored
 - **Request body preservation** - The body is restored after binding, so later handlers can read it again
 - **Configurable per call** - `BindWithOptions` sets limits per endpoint; there is no package-level state to change
-- **Well-tested** - About 93% statement coverage, run under the race detector, with fuzz targets for the reflection paths
+- **Well-tested** - About 95% statement coverage, run under the race detector, with fuzz targets for the reflection paths
 
 ## When to Use Binder
 

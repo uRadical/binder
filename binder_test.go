@@ -678,9 +678,7 @@ func TestFieldCache(t *testing.T) {
 	typ := reflect.TypeOf(cachedStruct{})
 
 	// Clear the cache before the test
-	fieldCacheMutex.Lock()
-	delete(fieldCache, typ)
-	fieldCacheMutex.Unlock()
+	fieldCache.Delete(typ)
 
 	// First access builds the cache, second must reuse it
 	info1 := getFieldInfo(typ)
@@ -724,9 +722,8 @@ func TestFieldCache(t *testing.T) {
 	}
 
 	// Check the cache directly
-	fieldCacheMutex.RLock()
-	cachedInfo, exists := fieldCache[typ]
-	fieldCacheMutex.RUnlock()
+	cached, exists := fieldCache.Load(typ)
+	cachedInfo, _ := cached.(*typeInfo)
 
 	if !exists {
 		t.Errorf("Type should exist in cache")
@@ -829,9 +826,7 @@ func BenchmarkBindWithoutCache(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		// Clear cache for each iteration
-		fieldCacheMutex.Lock()
-		fieldCache = make(map[reflect.Type]*typeInfo)
-		fieldCacheMutex.Unlock()
+		fieldCache.Clear()
 
 		var p params
 		_ = Bind(req, &p)

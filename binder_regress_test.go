@@ -1501,3 +1501,60 @@ func TestWholeNumbersJudgedExactly(t *testing.T) {
 		}
 	}
 }
+
+// A required member that was sent but failed is reported for its failure,
+// not as missing as well: it was present.
+func TestFailedRequiredMemberIsNotMissing(t *testing.T) {
+	var got struct {
+		Age int `body:"age,required"`
+	}
+	var errs BindErrors
+	err := bindJSONBody(t, `{"age":"x"}`, &got)
+	if !errors.As(err, &errs) || len(errs) != 1 || errors.Is(errs[0], ErrMissingRequired) {
+		t.Errorf("got %v, want one conversion failure", err)
+	}
+}
+
+// Which members were sent is tracked past a struct's 64th field too, so a
+// required field there that was sent is not reported missing, at the top
+// level or nested.
+func TestRequiredPastSixtyFourthField(t *testing.T) {
+	fields := make([]reflect.StructField, 70)
+	for i := range fields {
+		tag := fmt.Sprintf(`body:"f%d"`, i)
+		if i == len(fields)-1 {
+			tag = fmt.Sprintf(`body:"f%d,required"`, i)
+		}
+		fields[i] = reflect.StructField{Name: fmt.Sprintf("F%d", i), Type: reflect.TypeFor[int](), Tag: reflect.StructTag(tag)}
+	}
+	wide := reflect.StructOf(fields)
+	nested := reflect.StructOf([]reflect.StructField{{Name: "N", Type: wide, Tag: `body:"n"`}})
+
+	if err := bindJSONBody(t, `{"f69":1}`, reflect.New(wide).Interface()); err != nil {
+		t.Errorf("top level: %v", err)
+	}
+	if err := bindJSONBody(t, `{"n":{"f69":1}}`, reflect.New(nested).Interface()); err != nil {
+		t.Errorf("nested: %v", err)
+	}
+	if err := bindJSONBody(t, `{"n":{"f0":1}}`, reflect.New(nested).Interface()); !errors.Is(err, ErrMissingRequired) {
+		t.Errorf("nested, f69 absent: got %v, want ErrMissingRequired", err)
+	}
+}
+
+// An omitempty member past the failure budget is not decoded, like any other,
+// though only the check before each member stops it: its decoding has no
+// check of its own.
+func TestOmitEmptyPastBudgetIsSkipped(t *testing.T) {
+	var got struct {
+		A []int       `body:"a"`
+		C countedFail `body:"c,omitempty"`
+	}
+	body := `{"a":[` + strings.Repeat(`"x",`, maxFailures-1) + `"x"],"c":"x"}`
+	failCount.Store(0)
+	if err := bindJSONBody(t, body, &got); err == nil {
+		t.Fatal("got nil")
+	}
+	if n := failCount.Load(); n != 0 {
+		t.Errorf("converted %d values past the budget, want none", n)
+	}
+}

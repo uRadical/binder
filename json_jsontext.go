@@ -12,6 +12,7 @@ import (
 	"io"
 	"mime/multipart"
 	"reflect"
+	"slices"
 	"strconv"
 	"sync"
 )
@@ -172,11 +173,11 @@ func jsonKindName(k jsontext.Kind) string {
 // avoids both, and lets a member no field binds be skipped without decoding it
 // at all.
 //
-// It marks in bound, which the caller provides, the fields it filled, so the
-// caller can apply required to the ones it did not, and reports the names of
-// members nothing binds. A member that
-// cannot be converted is recorded in errs and the walk continues; only a
-// failure to read the JSON itself is returned.
+// It marks in bound, which the caller provides, the fields that were sent, so
+// the caller can apply required to the ones that were not, and reports the
+// names of members nothing binds. A member that cannot be converted is
+// recorded in errs and the walk continues; only a failure to read the JSON
+// itself is returned.
 func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wantUnknown bool, bound []bool, errs *fieldErrs) (unknown []string, err error) {
 	pooled := getDecoder(data)
 	defer putDecoder(pooled)
@@ -195,109 +196,26 @@ func jsonBodyInto(data []byte, info *typeInfo, val reflect.Value, wantUnknown bo
 		return nil, fmt.Errorf("cannot bind a JSON %s body: want an object", jsonKindName(tok.Kind()))
 	}
 
-	var seenUnknown map[string]struct{}
-	for dec.PeekKind() == '"' {
-		// The name is looked up from its raw bytes, since a map lookup keyed
-		// by string(b) does not allocate, where making it a string first
-		// would, for every member. The bytes are voided by the next call on
-		// the decoder, so an unknown name is copied before moving on.
-		raw, err := dec.ReadValue()
-		if err != nil {
-			return nil, err
-		}
-		name, err := memberName(raw)
-		if err != nil {
-			return nil, err
-		}
-
-		index, isBound := info.bodyFields[string(name)]
-		if !isBound {
-			// A set, not a scan of unknown, keeps a body of many distinct
-			// unknown members linear rather than quadratic.
-			// Only as many as are reported are kept.
-			if wantUnknown && len(unknown) < maxFailures {
-				if _, dup := seenUnknown[string(name)]; !dup {
-					if seenUnknown == nil {
-						seenUnknown = make(map[string]struct{})
-					}
-					seenUnknown[string(name)] = struct{}{}
-					unknown = append(unknown, string(name))
-				}
-			}
-			if err := dec.SkipValue(); err != nil {
-				return nil, err
-			}
-			continue
-		}
-
-		// A conversion failure has already consumed the member's value, so
-		// the walk can carry on to the next one. The field counts as bound
-		// either way: it was present, so required must not report it again.
-		// A pointer, not a copy: fieldInfo carries a reflect.StructField and
-		// is copied for every member otherwise.
-		fi := &info.fields[index]
-
-		// Once the budget is spent the bind has failed: later members are
-		// only checked for being well-formed, and replace no failure.
-		if dec.exhausted() {
-			if err := dec.SkipValue(); err != nil {
-				return nil, err
-			}
-			bound[index] = true
-			continue
-		}
-
-		// A member sent twice binds its last occurrence, unless an earlier
-		// one failed: as in encoding/json, that failure stands, and later
-		// occurrences are only checked for being well-formed.
-		if errs.failed(index) {
-			if err := dec.SkipValue(); err != nil {
-				return nil, err
-			}
-			continue
-		}
-
-		// A null sets nothing, so a promoted field's embedded pointer is not
-		// allocated for one.
-		if len(fi.Index) > 1 && dec.PeekKind() == 'n' {
-			if err := dec.SkipValue(); err != nil {
-				return nil, err
-			}
-			bound[index] = true
-			continue
-		}
-
-		// A promoted omitempty field is decoded before its embedded pointer
-		// is reached, so an empty value allocates nothing, as in a form body.
-
-		if len(fi.Index) > 1 && fi.OmitEmpty {
-			err := decodeUnlessEmpty(dec, fi.Plan, func() reflect.Value { return fieldAt(val, fi.Index) })
-			var failed conversionFailure
-			if errors.As(err, &failed) {
-				f := fieldFailures(*fi, failed.err)
-				dec.charge(f)
-				errs.set(info, index, f)
-			} else if err != nil {
-				return nil, err
-			}
-			bound[index] = true
-			continue
-		}
-
-		if err := decodeJSONInto(dec, fieldAt(val, fi.Index), fi); err != nil {
-			var failed conversionFailure
-			if !errors.As(err, &failed) {
-				return nil, err
-			}
-			f := fieldFailures(*fi, failed.err)
-			dec.charge(f)
-			errs.set(info, index, f)
-		}
-		bound[index] = true
+	var want *[]string
+	if wantUnknown {
+		want = &unknown
 	}
-
-	if _, err := dec.ReadToken(); err != nil { // the closing brace
+	sent, failures, err := decodeFields(dec, &info.body, val, want)
+	if err != nil {
 		return nil, err
+	}
+	for i := range info.fields {
+		// A member that failed still counts as bound: it was present, so
+		// required must not report it again.
+		if sent.has(i) {
+			bound[i] = true
+		}
+		if failures != nil && len(failures[i]) > 0 {
+			for _, e := range failures[i] {
+				e.Source = info.fields[i].Source
+			}
+			errs.set(info, i, failures[i])
+		}
 	}
 	return unknown, endOfBody(dec)
 }
@@ -325,79 +243,16 @@ func memberName(raw jsontext.Value) ([]byte, error) {
 	return jsontext.AppendUnquote(nil, raw)
 }
 
-// decodeJSONInto writes one JSON value into a struct field. Where the field is
-// a predeclared type and the token already matches it, the value is set
-// directly; everything else falls back to decoding a value and converting it,
-// so coercions such as a JSON string into an integer keep working.
-func decodeJSONInto(dec *jsonDecoder, field reflect.Value, fi *fieldInfo) error {
-	if isNilPointer(field) {
-		return unsetOnFailure(field, decodeJSONField(dec, field, fi))
-	}
-	return decodeJSONField(dec, field, fi)
-}
-
-// decodeJSONField is decodeJSONInto without the undoing of a pointer that a
-// failed value allocated.
-func decodeJSONField(dec *jsonDecoder, field reflect.Value, fi *fieldInfo) error {
-	kind := dec.PeekKind()
-
-	// omitempty on anything but a predeclared type, whose fast path judges
-	// emptiness itself, is decided as the value is read.
-	if fi.OmitEmpty && (fi.Fast == fastNone || kind == '[' || kind == '{') {
-		return decodeUnlessEmpty(dec, fi.Plan, func() reflect.Value { return field })
-	}
-
-	// A type that decodes itself from JSON is handed the member exactly as
-	// sent. A null sets nothing, as for any field, and a string goes to
-	// UnmarshalText when the type has it, as setField does.
-	if fi.JSON && kind != 'n' && (kind != '"' || !fi.Plan.text) {
-		raw, err := dec.ReadValue()
-		if err != nil {
-			return err
-		}
-		// The decoder reuses raw's memory, and a type may keep what it is given.
-		return conversionError(unmarshalJSONRaw(field, bytes.Clone(raw)))
-	}
-
-	// An array, object or nested struct is decoded straight into its Go
-	// type rather than through []any and map[string]any, which cost several
-	// times the body's size.
-	if d := fi.Plan.direct; d != 0 && d == kind {
-		return decodeValueInto(dec, field)
-	}
-
-	if handled, err := decodeFast(dec, field, fi.Fast, kind, fi.OmitEmpty); handled {
-		return err
-	}
-	if mismatch, err := skipMismatch(dec, field.Type(), kind); mismatch {
-		return err
-	}
-
-	// The token does not match the destination, or the destination is not a
-	// predeclared type: decode the value and convert it as the other sources
-	// do, so coercions such as a JSON string into an integer keep working.
-	value, err := decodeJSONValue(dec)
-	if err != nil {
-		return err
-	}
-	if value == nil {
-		return nil
-	}
-	if fi.OmitEmpty && isEmptyValue(value) {
-		return nil
-	}
-	return conversionError(setJSONValue(field, value))
-}
-
 // decodePlan is what decoding needs to know about a type, resolved once: the
 // checks behind it go through reflect's Implements, which is too slow to ask
 // for every element of an array.
 type decodePlan struct {
-	typ    reflect.Type
-	direct jsontext.Kind // '[' or '{' when decoded token by token, through any pointers
-	fast   fastKind      // set straight from a matching token
-	json   bool          // decodes itself from JSON
-	text   bool          // unmarshals itself from text
+	typ      reflect.Type
+	direct   jsontext.Kind // '[' or '{' when decoded token by token, through any pointers
+	fast     fastKind      // set straight from a matching token
+	json     bool          // decodes itself from JSON
+	text     bool          // unmarshals itself from text
+	anyValue bool          // an empty interface, which takes any value
 }
 
 var decodePlans sync.Map // reflect.Type -> *decodePlan
@@ -409,7 +264,7 @@ func planFor(t reflect.Type) *decodePlan {
 	if p, ok := decodePlans.Load(t); ok {
 		return p.(*decodePlan)
 	}
-	p := &decodePlan{typ: t, fast: fastKindOf(t), json: unmarshalsJSON(t), text: isTextUnmarshaler(t)}
+	p := &decodePlan{typ: t, fast: fastKindOf(t), json: unmarshalsJSON(t), text: isTextUnmarshaler(t), anyValue: takesAnyValue(t)}
 	base := t
 	for i := 0; base.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 		base = base.Elem()
@@ -428,19 +283,11 @@ func planFor(t reflect.Type) *decodePlan {
 	return p
 }
 
-// decodeValueInto reads one JSON value into v, a slice, map or struct field
-// or an element of one, walking the tokens rather than decoding into
-// interface values first. It follows the same rules as the general path: a
-// null sets nothing, a slice or map is replaced, a nested struct binds its
-// body and json tags with required and omitempty, and every failure is
-// reported, named by path, in a conversionFailure. Any other error is the
-// JSON itself.
-func decodeValueInto(dec *jsonDecoder, v reflect.Value) error {
-	return decodeWithPlan(dec, v, planFor(v.Type()))
-}
-
-// decodeWithPlan is decodeValueInto with v's plan already in hand, so that an
-// array or map looks its element type's plan up once rather than per element.
+// decodeWithPlan reads one JSON value into v, a field or an element, whose
+// plan p is. A null sets nothing, a slice or map is replaced, a nested struct
+// binds its body and json tags with required and omitempty, and every failure
+// is reported, named by path, in a conversionFailure. Any other error is the
+// JSON itself. A pointer that was nil is left nil if the value fails.
 func decodeWithPlan(dec *jsonDecoder, v reflect.Value, p *decodePlan) error {
 	// Once the budget is spent the bind has failed, so what remains is only
 	// checked for being well-formed, not decoded.
@@ -452,138 +299,86 @@ func decodeWithPlan(dec *jsonDecoder, v reflect.Value, p *decodePlan) error {
 		_, err := dec.ReadToken()
 		return err
 	}
+	target := func() reflect.Value { return v }
 	if isNilPointer(v) {
-		return unsetOnFailure(v, decodeNonNull(dec, v, p, kind))
+		return unsetOnFailure(v, decodeInto(dec, p, kind, false, target))
 	}
-	return decodeNonNull(dec, v, p, kind)
+	return decodeInto(dec, p, kind, false, target)
 }
 
-// decodeNonNull is decodeWithPlan for a value known not to be null, without
-// the undoing of a pointer that a failed value allocated.
-func decodeNonNull(dec *jsonDecoder, v reflect.Value, p *decodePlan, kind jsontext.Kind) error {
-	if p.direct == 0 || p.direct != kind {
-		return decodeScalarInto(dec, v, p, kind)
-	}
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			v.Set(reflect.New(v.Type().Elem()))
-		}
-		return decodeValueInto(dec, v.Elem())
-	}
-
-	switch v.Kind() {
-	case reflect.Slice:
-		return decodeArrayInto(dec, v)
-	case reflect.Map:
-		return decodeObjectIntoMap(dec, v)
-	default:
-		return decodeObjectIntoStruct(dec, v)
-	}
-}
-
-// decodeScalarInto reads one value into a field that is not decoded token by
-// token: a predeclared type from a matching token directly, anything else
-// through the general conversion, so coercions and custom types work as they
-// do at the top level.
-func decodeScalarInto(dec *jsonDecoder, v reflect.Value, p *decodePlan, kind jsontext.Kind) error {
-	if p.json && (kind != '"' || !p.text) {
-		raw, err := dec.ReadValue()
-		if err != nil {
-			return err
-		}
-		return conversionError(unmarshalJSONRaw(v, bytes.Clone(raw)))
-	}
-	if handled, err := decodeFast(dec, v, p.fast, kind, false); handled {
-		return err
-	}
-	if mismatch, err := skipMismatch(dec, v.Type(), kind); mismatch {
-		return err
-	}
-	value, err := decodeJSONValue(dec)
-	if err != nil || value == nil {
-		return err
-	}
-	return conversionError(setJSONValue(v, value))
-}
-
-// decodeUnlessEmpty reads one value for an omitempty field and decodes it into
-// the field target returns, unless it is empty: "", 0, false, null, {} or [].
-// Every byte is read once, but for a value an empty interface takes, which is
-// parsed again from its raw form. An array or object is judged by peeking past
-// its opening token for the closing one, and otherwise decoded from there, so
-// a deep value of nested omitempty fields costs no more than a flat one. target
-// is called only for a value that will be set, so an empty one allocates no
-// embedded pointer on the way.
-func decodeUnlessEmpty(dec *jsonDecoder, p *decodePlan, target func() reflect.Value) error {
-	if dec.exhausted() {
-		return dec.SkipValue()
-	}
-	kind := dec.PeekKind()
+// decodeInto reads one value of the given kind, not null, into the field
+// target returns, following p:
+//
+//   - a type that decodes itself is handed the value exactly as sent;
+//   - an array or object the type takes is decoded token by token, rather
+//     than through []any and map[string]any, which cost several times the
+//     body's size;
+//   - any other array or object is refused unread, unless the field is an
+//     empty interface, which takes it as decoded;
+//   - a predeclared type is set straight from a matching token;
+//   - anything else is decoded and converted as the other sources convert
+//     text, so coercions such as a JSON string into an integer work.
+//
+// With omitEmpty an empty value, "", 0, false, {} or [], sets nothing, and
+// target is called only for a value that will be set.
+func decodeInto(dec *jsonDecoder, p *decodePlan, kind jsontext.Kind, omitEmpty bool, target func() reflect.Value) error {
 	switch {
-	case kind == 'n':
-		_, err := dec.ReadToken()
-		return err
-
 	case p.json && (kind != '"' || !p.text):
-		// A type that decodes itself is handed the value exactly as sent.
 		raw, err := dec.ReadValue()
-		if err != nil || rawJSONEmpty(raw) {
+		if err != nil || omitEmpty && rawJSONEmpty(raw) {
 			return err
 		}
-		return conversionError(unmarshalJSONRaw(target(), bytes.Clone(raw)))
+		// The decoder reuses raw's memory, and a type may keep what it is given.
+		return dec.fail(unmarshalJSONRaw(target(), bytes.Clone(raw)))
 
 	case p.direct != 0 && p.direct == kind:
 		if _, err := dec.ReadToken(); err != nil {
 			return err
 		}
-		closing := jsontext.Kind(']')
-		if kind == '{' {
-			closing = '}'
-		}
-		if dec.PeekKind() == closing {
+		// An empty array or object is judged by peeking past its opening
+		// token, so a deep value of nested omitempty fields is read once.
+		if omitEmpty && (dec.PeekKind() == ']' || dec.PeekKind() == '}') {
 			_, err := dec.ReadToken()
 			return err
 		}
-		v := target()
-		for v.Kind() == reflect.Pointer {
-			if v.IsNil() {
-				v.Set(reflect.New(v.Type().Elem()))
-			}
-			v = v.Elem()
-		}
-		switch v.Kind() {
-		case reflect.Slice:
-			return decodeArrayRest(dec, v)
-		case reflect.Map:
-			return decodeObjectRestIntoMap(dec, v)
-		default:
-			return decodeObjectRestIntoStruct(dec, v)
-		}
+		return decodeOpened(dec, target())
 
-	case kind == '[' || kind == '{':
-		// An array or object for a type that does not take one directly is
-		// skipped when empty, as omitempty says, and otherwise refused,
-		// unless the field is an empty interface, which takes it as decoded.
+	case (kind == '[' || kind == '{') && !p.anyValue:
+		// Decoding a value that is refused anyway would cost memory in
+		// proportion to it.
 		raw, err := dec.ReadValue()
-		if err != nil || rawJSONEmpty(raw) {
+		if err != nil || omitEmpty && rawJSONEmpty(raw) {
 			return err
 		}
-		if !takesAnyValue(p.typ) {
-			return conversionError(fmt.Errorf("cannot bind a JSON %s to %s", jsonKindName(kind), p.typ))
-		}
-		sub := &jsonDecoder{Decoder: jsontext.NewDecoder(bytes.NewReader(bytes.Clone(raw)), decodeOptions)}
-		value, err := decodeJSONValue(sub)
-		if err != nil {
-			return err
-		}
-		return conversionError(setJSONValue(target(), value))
+		return dec.fail(mismatchError(p.typ, kind))
+	}
 
-	default:
-		value, err := decodeJSONValue(dec)
-		if err != nil || isEmptyValue(value) {
-			return err
+	if handled, err := decodeFast(dec, p.fast, kind, omitEmpty, target); handled {
+		return err
+	}
+	value, err := decodeJSONValue(dec)
+	if err != nil || value == nil || omitEmpty && isEmptyValue(value) {
+		return err
+	}
+	return dec.fail(setJSONValue(target(), value))
+}
+
+// decodeOpened decodes an array or object whose opening token has been read
+// into v, allocating any pointers on the way to the slice, map or struct.
+func decodeOpened(dec *jsonDecoder, v reflect.Value) error {
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
 		}
-		return conversionError(setJSONValue(target(), value))
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Slice:
+		return decodeArray(dec, v)
+	case reflect.Map:
+		return decodeMap(dec, v)
+	default:
+		return decodeStruct(dec, v)
 	}
 }
 
@@ -605,29 +400,16 @@ func rawJSONEmpty(raw jsontext.Value) bool {
 	}
 }
 
-// skipMismatch skips an array or object bound for a type that cannot take
-// one, reporting the mismatch without decoding the value: only an empty
-// interface, such as any, takes an array or object that is not decoded
-// token by token. Decoding it first would cost memory in proportion
-// to a value that is refused anyway.
-func skipMismatch(dec *jsonDecoder, t reflect.Type, kind jsontext.Kind) (bool, error) {
-	if kind != '[' && kind != '{' {
-		return false, nil
-	}
-	if takesAnyValue(t) {
-		return false, nil
-	}
+// mismatchError reports an array or object for a type that cannot take one.
+func mismatchError(t reflect.Type, kind jsontext.Kind) error {
 	base := t
 	for i := 0; base.Kind() == reflect.Pointer && i < maxPointerDepth; i++ {
 		base = base.Elem()
 	}
-	if err := dec.SkipValue(); err != nil {
-		return true, err
-	}
 	if base.Kind() == reflect.Array {
-		return true, conversionError(errors.New("arrays are not supported, use slices instead"))
+		return errors.New("arrays are not supported, use slices instead")
 	}
-	return true, conversionError(fmt.Errorf("cannot bind a JSON %s to %s", jsonKindName(kind), t))
+	return fmt.Errorf("cannot bind a JSON %s to %s", jsonKindName(kind), t)
 }
 
 // takesAnyValue reports whether t, through any pointers, is an empty
@@ -665,11 +447,7 @@ func setJSONValue(v reflect.Value, value any) error {
 		if target.Kind() == reflect.Slice && !takesOneValue(target.Type()) && wrapsFinitely(target.Type()) {
 			s := reflect.MakeSlice(target.Type(), 1, 1)
 			if err := setJSONValue(s.Index(0), value); err != nil {
-				var inner BindErrors
-				if errors.As(err, &inner) {
-					return BindErrors(nestIndexFailures("[0]", "[0]", inner))
-				}
-				return BindErrors{newIndexBindError("[0]", "[0]", err)}
+				return indexFailures("[0]", "[0]", err)
 			}
 			target.Set(s)
 			return nil
@@ -686,8 +464,9 @@ func isByteSlice(t reflect.Type) bool {
 }
 
 // collectFailure adds a child's conversion failure to errs under the given
-// path, and returns any other error, which ends the walk.
-func collectFailure(dec *jsonDecoder, errs *BindErrors, err error, part pathPart) error {
+// path, and returns any other error, which ends the walk. The failure was
+// charged to the budget where it arose.
+func collectFailure(errs *BindErrors, err error, part pathPart) error {
 	if err == nil {
 		return nil
 	}
@@ -696,42 +475,39 @@ func collectFailure(dec *jsonDecoder, errs *BindErrors, err error, part pathPart
 		return err
 	}
 	var inner BindErrors
-	if errors.As(failed.err, &inner) {
-		// Failures decoded token by token were counted where they arose;
-		// ones a conversion grouped, such as a slice's from one bad value,
-		// are counted here, and any past the budget dropped.
-		kept := inner[:0]
-		for _, e := range inner {
-			if e.counted || dec.budget() {
-				e.counted = true
-				kept = append(kept, e)
-			}
-		}
-		// The child's list is passed up rather than copied when it is the
-		// only one, so a deep value's failures are not copied level by level.
-		if len(*errs) == 0 {
-			*errs = nestFailuresAs(part, "", kept)
-		} else {
-			*errs = append(*errs, nestFailuresAs(part, "", kept)...)
-		}
-	} else if dec.budget() {
+	if !errors.As(failed.err, &inner) {
 		e := newBindError(part.field, "", part.name, failed.err)
 		e.leafIndex = part.index
-		e.counted = true
 		*errs = append(*errs, e)
+		return nil
+	}
+	// The child's list is passed up rather than copied when it is the only
+	// one, so a deep value's failures are not copied level by level.
+	if len(*errs) == 0 {
+		*errs = nestFailuresAs(part, "", inner)
+	} else {
+		*errs = append(*errs, nestFailuresAs(part, "", inner)...)
 	}
 	return nil
 }
 
-// charge counts failures not yet charged, such as a top-level field's, which
-// are recorded whatever the budget: there are only as many as fields.
-func (d *jsonDecoder) charge(errs []*BindError) {
-	for _, e := range errs {
-		if !e.counted {
-			e.counted = true
-			d.failures++
-		}
+// fail reports a value that could not be converted as a conversionFailure,
+// charging it to the budget where it arises, so that it is counted once
+// however far it is passed up. A group, such as a slice's elements from one
+// bad value, counts each of them; there are at most maxFailures, and past the
+// budget nothing more is decoded, so what it may exceed the budget by is
+// bounded, and the list is cut to maxFailures once binding is done.
+func (d *jsonDecoder) fail(err error) error {
+	if err == nil {
+		return nil
 	}
+	var group BindErrors
+	if errors.As(err, &group) {
+		d.failures += len(group)
+	} else {
+		d.failures++
+	}
+	return conversionFailure{err}
 }
 
 // exhausted reports whether the failure budget is spent.
@@ -746,17 +522,10 @@ func (d *jsonDecoder) budget() bool {
 	return true
 }
 
-// decodeArrayInto fills a slice from a JSON array, replacing what it held. A
-// null element leaves its zero value, so a nil pointer stays nil.
-func decodeArrayInto(dec *jsonDecoder, v reflect.Value) error {
-	if _, err := dec.ReadToken(); err != nil {
-		return err
-	}
-	return decodeArrayRest(dec, v)
-}
-
-// decodeArrayRest is decodeArrayInto once the opening bracket has been read.
-func decodeArrayRest(dec *jsonDecoder, v reflect.Value) error {
+// decodeArray fills a slice from a JSON array whose opening bracket has been
+// read, replacing what it held. A null element leaves its zero value, so a nil
+// pointer stays nil.
+func decodeArray(dec *jsonDecoder, v reflect.Value) error {
 	// An empty array needs no buffer to grow into.
 	if dec.PeekKind() == ']' {
 		if _, err := dec.ReadToken(); err != nil {
@@ -793,7 +562,7 @@ func decodeArrayRest(dec *jsonDecoder, v reflect.Value) error {
 		if err := decodeWithPlan(dec, s.Index(i), elemPlan); err != nil {
 			// The element's name is built only when it has failed.
 			index := "[" + strconv.Itoa(i) + "]"
-			if err := collectFailure(dec, &errs, err, pathPart{field: index, name: index, index: true}); err != nil {
+			if err := collectFailure(&errs, err, pathPart{field: index, name: index, index: true}); err != nil {
 				return err
 			}
 		}
@@ -812,28 +581,16 @@ func decodeArrayRest(dec *jsonDecoder, v reflect.Value) error {
 	return nil
 }
 
-// decodeObjectIntoMap fills a map from a JSON object, replacing what it held.
-// Keys convert as setMap converts them, a null value gives its key the zero
-// value, as in encoding/json, and a failure is named by key.
-func decodeObjectIntoMap(dec *jsonDecoder, v reflect.Value) error {
-	if _, err := dec.ReadToken(); err != nil {
-		return err
-	}
-	return decodeObjectRestIntoMap(dec, v)
-}
-
-// decodeObjectRestIntoMap is decodeObjectIntoMap once the opening brace has
-// been read. A key sent twice binds its last occurrence, unless an earlier
-// one failed: that failure stands.
-func decodeObjectRestIntoMap(dec *jsonDecoder, v reflect.Value) error {
+// decodeMap fills a map from a JSON object whose opening brace has been read,
+// replacing what it held. Keys convert as setMap converts them, a null value
+// gives its key the zero value, as in encoding/json, and a failure is named by
+// key. A key sent twice binds its last occurrence, unless an earlier one
+// failed: that failure stands.
+func decodeMap(dec *jsonDecoder, v reflect.Value) error {
 	typ := v.Type()
 	elemPlan := planFor(typ.Elem())
 	m := reflect.MakeMap(typ)
-	var failed map[any]keyFailures
-	// Keys that failed, by their text as sent: a key whose converted value
-	// never equals itself, such as NaN or a pointer, is still recognised
-	// when it is sent again.
-	var failedText map[string]bool
+	var failed mapFailures
 	// One key and one element are reused for every entry: SetMapIndex
 	// copies them into the map.
 	key := reflect.New(typ.Key()).Elem()
@@ -844,13 +601,9 @@ func decodeObjectRestIntoMap(dec *jsonDecoder, v reflect.Value) error {
 			return err
 		}
 		k := tok.String()
-		if dec.exhausted() {
-			if err := dec.SkipValue(); err != nil {
-				return err
-			}
-			continue
-		}
-		if failedText[k] {
+		// Past the budget, or after the key has failed, the value is only
+		// checked for being well-formed.
+		if dec.exhausted() || failed.repeats(k) {
 			if err := dec.SkipValue(); err != nil {
 				return err
 			}
@@ -858,46 +611,28 @@ func decodeObjectRestIntoMap(dec *jsonDecoder, v reflect.Value) error {
 		}
 		key.SetZero()
 		if err := convertMapKey(key, k); err != nil {
-			if _, dup := failed[k]; !dup && dec.budget() {
-				e := newIndexBindError(mapKeyField(k), mapKeyName(k), fmt.Errorf("invalid key: %w", err))
-				e.counted = true
-				failed = addKeyFailures(failed, k, k, BindErrors{e})
+			if dec.budget() {
+				failed.addText(k, BindErrors{newIndexBindError(mapKeyField(k), mapKeyName(k), fmt.Errorf("invalid key: %w", err))})
 			}
 			if err := dec.SkipValue(); err != nil {
 				return err
 			}
 			continue
 		}
-		// Failures are kept by the key's converted value, so "01" and "1"
-		// into an integer key are one entry. A key sent again after it
-		// failed keeps that failure, and its value is only checked for
-		// being well-formed.
-		var id any
-		if failed != nil {
-			id = key.Interface()
-			if _, dup := failed[id]; dup {
-				if err := dec.SkipValue(); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-		elem.SetZero()
-		var errs BindErrors
-		if err := decodeWithPlan(dec, elem, elemPlan); err != nil {
-			if err := collectFailure(dec, &errs, err, pathPart{field: mapKeyField(k), name: mapKeyName(k), index: true}); err != nil {
+		if failed.has(key) {
+			if err := dec.SkipValue(); err != nil {
 				return err
 			}
+			continue
 		}
-		if len(errs) > 0 {
-			if id == nil {
-				id = key.Interface()
+		elem.SetZero()
+		if err := decodeWithPlan(dec, elem, elemPlan); err != nil {
+			// The entry's name is built only when it has failed.
+			var errs BindErrors
+			if err := collectFailure(&errs, err, pathPart{field: mapKeyField(k), name: mapKeyName(k), index: true}); err != nil {
+				return err
 			}
-			failed = addKeyFailures(failed, id, k, errs)
-			if failedText == nil {
-				failedText = make(map[string]bool)
-			}
-			failedText[k] = true
+			failed.add(key, k, errs)
 			continue
 		}
 		// A value skipped once the budget was spent was never decoded.
@@ -909,8 +644,8 @@ func decodeObjectRestIntoMap(dec *jsonDecoder, v reflect.Value) error {
 	if _, err := dec.ReadToken(); err != nil {
 		return err
 	}
-	if len(failed) > 0 {
-		return conversionFailure{keyOrderedFailures(typ.Key(), failed)}
+	if errs := failed.list(typ.Key()); errs != nil {
+		return conversionFailure{errs}
 	}
 	if !dec.exhausted() {
 		v.Set(m)
@@ -918,111 +653,27 @@ func decodeObjectRestIntoMap(dec *jsonDecoder, v reflect.Value) error {
 	return nil
 }
 
-// decodeObjectIntoStruct fills a nested struct from a JSON object: members
-// bind by body or json tag,
-// with promoted fields, required and omitempty, a null sets nothing, members
-// no field binds are skipped, and failures come in field order, named by path.
-// A member sent twice binds its last occurrence, unless an earlier one failed;
-// a struct member sent twice merges into the same struct.
-func decodeObjectIntoStruct(dec *jsonDecoder, v reflect.Value) error {
-	if _, err := dec.ReadToken(); err != nil {
-		return err
-	}
-	return decodeObjectRestIntoStruct(dec, v)
-}
-
-// decodeObjectRestIntoStruct is decodeObjectIntoStruct once the opening brace
-// has been read.
-func decodeObjectRestIntoStruct(dec *jsonDecoder, v reflect.Value) error {
+// decodeStruct fills a nested struct from a JSON object whose opening brace
+// has been read: members bind by body or json tag, with promoted fields,
+// required and omitempty, a null sets nothing, members no field binds are
+// skipped, and failures come in field order, named by path. A member sent
+// twice binds its last occurrence, unless an earlier one failed; a struct
+// member sent twice merges into the same struct.
+func decodeStruct(dec *jsonDecoder, v reflect.Value) error {
 	ns := nestedStructFor(v.Type())
-	fields := ns.fields
-
-	// Which fields were sent matters only for required ones, and a failure
-	// list only once something fails, so an object that binds cleanly, the
-	// usual case, allocates for neither: a struct of up to 64 fields tracks
-	// what was sent in a word on the stack.
-	var sentBits uint64
-	var sent []bool
-	if len(fields) > 64 && ns.anyRequired {
-		sent = make([]bool, len(fields))
-	}
-	markSent := func(i int) {
-		if i < 64 {
-			sentBits |= 1 << i
-		} else if sent != nil {
-			sent[i] = true
-		}
-	}
-	wasSent := func(i int) bool {
-		if i < 64 {
-			return sentBits&(1<<i) != 0
-		}
-		return sent != nil && sent[i]
-	}
-	var failures []BindErrors
-
-	for dec.PeekKind() == '"' {
-		tok, err := dec.ReadToken()
-		if err != nil {
-			return err
-		}
-		i, ok := ns.index[tok.String()]
-		if !ok {
-			if err := dec.SkipValue(); err != nil {
-				return err
-			}
-			continue
-		}
-		tf := fields[i]
-		markSent(i)
-		// A member sent twice binds its last occurrence, unless an earlier
-		// one failed: that failure stands, and later occurrences are only
-		// checked for being well-formed.
-		if failures != nil && len(failures[i]) > 0 {
-			if err := dec.SkipValue(); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if dec.PeekKind() == 'n' {
-			if _, err := dec.ReadToken(); err != nil {
-				return err
-			}
-			continue
-		}
-		var err2 error
-		if omitsEmpty(tf.field.Type, tf.opts) {
-			// An empty value must not allocate an embedded pointer on the
-			// way to its field, so the field is reached only once the value
-			// is known not to be empty.
-			err2 = decodeUnlessEmpty(dec, ns.plans[i], func() reflect.Value { return fieldByIndex(v, tf.index) })
-		} else {
-			err2 = decodeWithPlan(dec, fieldByIndex(v, tf.index), ns.plans[i])
-		}
-		if err2 != nil {
-			if failures == nil {
-				failures = make([]BindErrors, len(fields))
-			}
-			if err := collectFailure(dec, &failures[i], err2, pathPart{field: tf.goName, name: tf.name}); err != nil {
-				return err
-			}
-		}
-	}
-	if _, err := dec.ReadToken(); err != nil {
+	sent, failures, err := decodeFields(dec, &ns.objectFields, v, nil)
+	if err != nil {
 		return err
 	}
-
 	var errs BindErrors
-	for i, tf := range fields {
-		if ns.required[i] && !wasSent(i) && dec.budget() {
+	for i, part := range ns.parts {
+		if ns.required[i] && !sent.has(i) && dec.budget() {
 			errs = append(errs, &BindError{
-				Field:   tf.goName,
+				Field:   part.field,
 				Source:  body,
-				Name:    tf.name,
-				Message: fmt.Sprintf("missing required field %s: no %s value named %q", tf.goName, body, tf.name),
+				Name:    part.name,
+				Message: fmt.Sprintf("missing required field %s: no %s value named %q", part.field, body, part.name),
 				Err:     ErrMissingRequired,
-				counted: true,
 			})
 		}
 		if failures == nil || len(failures[i]) == 0 {
@@ -1043,15 +694,133 @@ func decodeObjectRestIntoStruct(dec *jsonDecoder, v reflect.Value) error {
 	return nil
 }
 
+// objectFields is what decoding a JSON object into a struct needs, resolved
+// once per type: each field by the member it binds, and per field its plan,
+// whether it is omitempty, its path through any embedded structs, and how a
+// failure in it is named. Its indexes are those of the fields it was built
+// from: typeInfo.fields at the top level, nestedFieldsFor within, where only
+// the fields a body binds have entries in index.
+type objectFields struct {
+	index     map[string]int
+	plans     []*decodePlan
+	omitEmpty []bool
+	paths     [][]int
+	parts     []pathPart
+}
+
+func newObjectFields(n int) objectFields {
+	return objectFields{
+		index:     make(map[string]int, n),
+		plans:     make([]*decodePlan, n),
+		omitEmpty: make([]bool, n),
+		paths:     make([][]int, n),
+		parts:     make([]pathPart, n),
+	}
+}
+
+// add records field i, which binds the member name.
+func (of *objectFields) add(i int, name string, t reflect.Type, omitEmpty bool, path []int, goName string) {
+	of.index[name] = i
+	of.plans[i] = planFor(t)
+	of.omitEmpty[i] = omitEmpty
+	of.paths[i] = path
+	of.parts[i] = pathPart{field: goName, name: name}
+}
+
+// sentFields records which fields an object sent: in a word for the first 64,
+// allocating only for a member of a wider struct.
+type sentFields struct {
+	bits uint64
+	more []bool
+}
+
+func (s *sentFields) add(i int) {
+	if i < 64 {
+		s.bits |= 1 << i
+		return
+	}
+	for len(s.more) <= i-64 {
+		s.more = append(s.more, false)
+	}
+	s.more[i-64] = true
+}
+
+func (s *sentFields) has(i int) bool {
+	if i < 64 {
+		return s.bits&(1<<i) != 0
+	}
+	return i-64 < len(s.more) && s.more[i-64]
+}
+
+// decodeFields decodes the members of an object, its opening brace read, into
+// the fields of v that of describes, through its closing brace. It returns
+// which fields were sent and, once any has failed, each field's failures,
+// both indexed as of is. With unknown given, it appends the name of each
+// distinct member no field binds, up to maxFailures of them.
+//
+// A member sent twice binds its last occurrence, unless an earlier one
+// failed: as in encoding/json, that failure stands. Past the failure budget,
+// after a failed occurrence of the member, or for a null, which sets nothing,
+// a value is only checked for being well-formed.
+func decodeFields(dec *jsonDecoder, of *objectFields, v reflect.Value, unknown *[]string) (sent sentFields, failures []BindErrors, err error) {
+	for dec.PeekKind() == '"' {
+		// The name is looked up from its raw bytes, since a map lookup keyed
+		// by string(b) does not allocate, where making it a string first
+		// would, for every member. The bytes are voided by the next call on
+		// the decoder, so an unknown name is copied before moving on.
+		raw, err := dec.ReadValue()
+		if err != nil {
+			return sent, nil, err
+		}
+		name, err := memberName(raw)
+		if err != nil {
+			return sent, nil, err
+		}
+		i, ok := of.index[string(name)]
+		if !ok {
+			// Only as many as are reported are kept, so checking for a
+			// repeat is a scan of at most maxFailures names.
+			if unknown != nil && len(*unknown) < maxFailures && !slices.Contains(*unknown, string(name)) {
+				*unknown = append(*unknown, string(name))
+			}
+			if err := dec.SkipValue(); err != nil {
+				return sent, nil, err
+			}
+			continue
+		}
+
+		sent.add(i)
+		if dec.exhausted() || failures != nil && len(failures[i]) > 0 || dec.PeekKind() == 'n' {
+			if err := dec.SkipValue(); err != nil {
+				return sent, nil, err
+			}
+			continue
+		}
+		// An omitempty field is reached only once its value is known not to
+		// be empty, so an empty one allocates no embedded pointer on the way.
+		if of.omitEmpty[i] {
+			err = decodeInto(dec, of.plans[i], dec.PeekKind(), true, func() reflect.Value { return fieldAt(v, of.paths[i]) })
+		} else {
+			err = decodeWithPlan(dec, fieldAt(v, of.paths[i]), of.plans[i])
+		}
+		if err != nil {
+			if failures == nil {
+				failures = make([]BindErrors, len(of.plans))
+			}
+			if err := collectFailure(&failures[i], err, of.parts[i]); err != nil {
+				return sent, nil, err
+			}
+		}
+	}
+	_, err = dec.ReadToken() // the closing brace
+	return sent, failures, err
+}
+
 // nestedStruct is what decoding a nested struct from a JSON object needs,
-// resolved once per type: its fields, a lookup by body key, each field's
-// decoding plan, and which fields are required.
+// resolved once per type: its fields, and which of them are required.
 type nestedStruct struct {
-	fields      []taggedField
-	index       map[string]int
-	plans       []*decodePlan
-	required    []bool
-	anyRequired bool
+	objectFields
+	required []bool
 }
 
 var nestedStructCache sync.Map // reflect.Type -> *nestedStruct
@@ -1061,27 +830,19 @@ func nestedStructFor(typ reflect.Type) *nestedStruct {
 		return cached.(*nestedStruct)
 	}
 	fields := nestedFieldsFor(typ)
-	ns := &nestedStruct{
-		fields:   fields,
-		index:    make(map[string]int, len(fields)),
-		plans:    make([]*decodePlan, len(fields)),
-		required: make([]bool, len(fields)),
-	}
+	ns := &nestedStruct{objectFields: newObjectFields(len(fields)), required: make([]bool, len(fields))}
 	for i, tf := range fields {
-		ns.index[tf.name] = i
-		ns.plans[i] = planFor(tf.field.Type)
-		if hasOption(tf.opts, optRequired) {
-			ns.required[i], ns.anyRequired = true, true
-		}
+		ns.add(i, tf.name, tf.field.Type, omitsEmpty(tf.field.Type, tf.opts), tf.index, tf.goName)
+		ns.required[i] = hasOption(tf.opts, optRequired)
 	}
 	nestedStructCache.Store(typ, ns)
 	return ns
 }
 
 // decodeFast sets a predeclared field straight from a token of the matching
-// kind, reporting whether it did. omitEmpty leaves the field alone for an
-// empty value.
-func decodeFast(dec *jsonDecoder, field reflect.Value, fast fastKind, kind jsontext.Kind, omitEmpty bool) (bool, error) {
+// kind, reporting whether it did. With omitEmpty an empty value sets nothing,
+// and target is called only for a value that will be set.
+func decodeFast(dec *jsonDecoder, fast fastKind, kind jsontext.Kind, omitEmpty bool, target func() reflect.Value) (bool, error) {
 	switch fast {
 	case fastString:
 		if kind == '"' {
@@ -1089,11 +850,9 @@ func decodeFast(dec *jsonDecoder, field reflect.Value, fast fastKind, kind jsont
 			if err != nil {
 				return true, err
 			}
-			text := tok.String()
-			if omitEmpty && text == "" {
-				return true, nil
+			if text := tok.String(); !omitEmpty || text != "" {
+				target().SetString(text)
 			}
-			field.SetString(text)
 			return true, nil
 		}
 
@@ -1103,72 +862,69 @@ func decodeFast(dec *jsonDecoder, field reflect.Value, fast fastKind, kind jsont
 			if err != nil {
 				return true, err
 			}
-			value := tok.Bool()
-			if omitEmpty && !value {
-				return true, nil
+			if value := tok.Bool(); !omitEmpty || value {
+				target().SetBool(value)
 			}
-			field.SetBool(value)
 			return true, nil
 		}
 
 	case fastInt, fastUint, fastFloat:
 		if kind == '0' {
-			return true, decodeNumberInto(dec, field, fast, omitEmpty)
+			return true, decodeNumber(dec, fast, omitEmpty, target)
 		}
 	}
 	return false, nil
 }
 
-// decodeNumberInto writes a numeric token into a predeclared numeric field.
-// A literal an exact parse rejects, such as 1e3 for an integer, is handed to
+// decodeNumber writes a numeric token into a predeclared numeric field. A
+// literal an exact parse rejects, such as 1e3 for an integer, is handed to
 // the general conversion, which accepts it as earlier releases did.
-func decodeNumberInto(dec *jsonDecoder, field reflect.Value, fast fastKind, omitEmpty bool) error {
+func decodeNumber(dec *jsonDecoder, fast fastKind, omitEmpty bool, target func() reflect.Value) error {
 	raw, err := dec.ReadValue()
 	if err != nil {
 		return err
 	}
-
 	switch fast {
 	case fastInt:
 		number, err := strconv.ParseInt(string(raw), 10, 64)
 		if err != nil {
-			return setFieldFromNumber(field, raw, omitEmpty)
+			return setFieldFromNumber(dec, raw, omitEmpty, target)
 		}
 		if omitEmpty && number == 0 {
 			return nil
 		}
-		return conversionError(setIntChecked(field, number))
+		return dec.fail(setIntChecked(target(), number))
 
 	case fastUint:
 		number, err := strconv.ParseUint(string(raw), 10, 64)
 		if err != nil {
-			return setFieldFromNumber(field, raw, omitEmpty)
+			return setFieldFromNumber(dec, raw, omitEmpty, target)
 		}
 		if omitEmpty && number == 0 {
 			return nil
 		}
-		return conversionError(setUintChecked(field, number))
+		return dec.fail(setUintChecked(target(), number))
 
 	default: // fastFloat
 		number, err := strconv.ParseFloat(string(raw), 64)
 		if err != nil {
-			return setFieldFromNumber(field, raw, omitEmpty)
+			return setFieldFromNumber(dec, raw, omitEmpty, target)
 		}
 		if omitEmpty && number == 0 {
 			return nil
 		}
-		return conversionError(setFloatChecked(field, number))
+		return dec.fail(setFloatChecked(target(), number))
 	}
 }
 
 // setFieldFromNumber converts a number whose literal an exact parse rejected,
 // such as 1e3 into an integer field.
-func setFieldFromNumber(field reflect.Value, raw jsontext.Value, omitEmpty bool) error {
+func setFieldFromNumber(dec *jsonDecoder, raw jsontext.Value, omitEmpty bool, target func() reflect.Value) error {
 	number := json.Number(raw.String())
 	if omitEmpty && isEmptyValue(number) {
 		return nil
 	}
-	return conversionError(setField(field, number))
+	return dec.fail(setField(target(), number))
 }
 
 // conversionFailure marks a failure to convert a decoded value as concerning
@@ -1178,10 +934,3 @@ func setFieldFromNumber(field reflect.Value, raw jsontext.Value, omitEmpty bool)
 type conversionFailure struct{ err error }
 
 func (c conversionFailure) Error() string { return c.err.Error() }
-
-func conversionError(err error) error {
-	if err == nil {
-		return nil
-	}
-	return conversionFailure{err}
-}

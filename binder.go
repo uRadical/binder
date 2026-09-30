@@ -93,89 +93,6 @@ type taggedField struct {
 	opts   string
 }
 
-// taggedFields lists the fields of typ that bind from the given sources, in
-// declaration order. As in encoding/json, an embedded struct, or pointer to
-// one, that carries no binding tag of its own has its fields promoted; a
-// tagged one is an ordinary field. A key declared at more than one depth
-// binds only the shallowest field, and at the same depth, the first declared.
-func taggedFields(typ reflect.Type, sources []string) []taggedField {
-	if !embedsStruct(typ) {
-		return flatTaggedFields(typ, sources)
-	}
-
-	type level struct {
-		typ   reflect.Type
-		index []int
-		path  string
-	}
-	var out []taggedField
-	seen := make(map[[2]string]bool)
-	visited := make(map[reflect.Type]bool)
-	for current := []level{{typ: typ}}; len(current) > 0; {
-		var next []level
-		var found []taggedField
-		for _, l := range current {
-			// A struct reached twice, as through a cycle of embedded
-			// pointers, has already given up its fields.
-			if visited[l.typ] {
-				continue
-			}
-			visited[l.typ] = true
-
-			for i := 0; i < l.typ.NumField(); i++ {
-				f := l.typ.Field(i)
-				index := append(slices.Clip(l.index), i)
-				source, name, opts, ok := fieldTag(f, sources)
-
-				// As in encoding/json, `json:"-"` excludes an embedded struct
-				// entirely, and one whose tag gives no name, such as
-				// `json:",omitempty"`, is still promoted.
-				if f.Anonymous && !ok && f.Tag.Get(jjson) == "-" {
-					continue
-				}
-				if f.Anonymous && (!ok || !namedInTag(f, source)) {
-					t := f.Type
-					isPtr := t.Kind() == reflect.Pointer
-					if isPtr {
-						t = t.Elem()
-					}
-					// An unexported embedded pointer cannot be allocated,
-					// but an unexported embedded struct's exported fields
-					// can still be set.
-					if t.Kind() == reflect.Struct {
-						if f.IsExported() || !isPtr {
-							next = append(next, level{typ: t, index: index, path: l.path + f.Name + "."})
-						}
-						continue
-					}
-					// An embedded type that is not a struct has nothing to
-					// promote; with a tag it binds as an ordinary field.
-					if !ok {
-						continue
-					}
-				}
-
-				// Unexported fields cannot be set through reflection, so they
-				// are ignored even when tagged, as encoding/json does.
-				if !ok || !f.IsExported() {
-					continue
-				}
-				found = append(found, taggedField{index: index, goName: l.path + f.Name, field: f, source: source, name: name, opts: opts})
-			}
-		}
-		for _, tf := range found {
-			key := [2]string{bindKeySource(tf.source), tf.name}
-			if !seen[key] {
-				seen[key] = true
-				out = append(out, tf)
-			}
-		}
-		current = next
-	}
-	slices.SortFunc(out, func(a, b taggedField) int { return slices.Compare(a.index, b.index) })
-	return out
-}
-
 // embedsStruct reports whether typ has an embedded field, so that
 // taggedFields must take the walk that handles promotion.
 func embedsStruct(typ reflect.Type) bool {
@@ -216,6 +133,99 @@ func declared(fields []taggedField, source, name string) bool {
 		}
 	}
 	return false
+}
+
+// embeddedStruct decides what an embedded field contributes, given its tag
+// for one of the sources: handled is false when it binds as an ordinary
+// field, and otherwise promoted is the struct whose fields it promotes, or nil
+// when it contributes nothing. As in encoding/json, `json:"-"` excludes it,
+// and a tag giving no name, such as `json:",omitempty"`, still promotes it.
+func embeddedStruct(f reflect.StructField, source string, tagged bool) (promoted reflect.Type, handled bool) {
+	if !tagged && f.Tag.Get(jjson) == "-" {
+		return nil, true
+	}
+	if tagged && namedInTag(f, source) {
+		return nil, false
+	}
+	t := f.Type
+	isPtr := t.Kind() == reflect.Pointer
+	if isPtr {
+		t = t.Elem()
+	}
+	if t.Kind() == reflect.Struct {
+		// An unexported embedded pointer cannot be allocated, but an
+		// unexported embedded struct's exported fields can still be set.
+		if f.IsExported() || !isPtr {
+			return t, true
+		}
+		return nil, true
+	}
+	// A type that is not a struct has nothing to promote; with a tag it
+	// binds as an ordinary field.
+	return nil, !tagged
+}
+
+// taggedFields lists the fields of typ that bind from the given sources, in
+// declaration order. As in encoding/json, an embedded struct, or pointer to
+// one, that carries no binding tag of its own has its fields promoted; a
+// tagged one is an ordinary field. A key declared at more than one depth
+// binds only the shallowest field, and at the same depth, the first declared.
+func taggedFields(typ reflect.Type, sources []string) []taggedField {
+	if !embedsStruct(typ) {
+		return flatTaggedFields(typ, sources)
+	}
+
+	type level struct {
+		typ   reflect.Type
+		index []int
+		path  string
+	}
+	var out []taggedField
+	seen := make(map[[2]string]bool)
+	visited := make(map[reflect.Type]bool)
+	for current := []level{{typ: typ}}; len(current) > 0; {
+		var next []level
+		var found []taggedField
+		for _, l := range current {
+			// A struct reached twice, as through a cycle of embedded
+			// pointers, has already given up its fields.
+			if visited[l.typ] {
+				continue
+			}
+			visited[l.typ] = true
+
+			for i := 0; i < l.typ.NumField(); i++ {
+				f := l.typ.Field(i)
+				index := append(slices.Clip(l.index), i)
+				source, name, opts, ok := fieldTag(f, sources)
+				if f.Anonymous {
+					if promoted, handled := embeddedStruct(f, source, ok); handled {
+						if promoted != nil {
+							next = append(next, level{typ: promoted, index: index, path: l.path + f.Name + "."})
+						}
+						continue
+					}
+				}
+
+				// Unexported fields cannot be set through reflection, so they
+				// are ignored even when tagged, as encoding/json does.
+				if !ok || !f.IsExported() {
+					continue
+				}
+				found = append(found, taggedField{index: index, goName: l.path + f.Name, field: f, source: source, name: name, opts: opts})
+			}
+		}
+		for _, tf := range found {
+			key := [2]string{bindKeySource(tf.source), tf.name}
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, tf)
+			}
+		}
+		current = next
+	}
+	slices.SortFunc(out, func(a, b taggedField) int { return slices.Compare(a.index, b.index) })
+	return out
 }
 
 // bindKeySource names the space a key belongs to: body and its json alias
@@ -316,11 +326,6 @@ type fieldInfo struct {
 	IsSlice   bool     // destination is a slice, so repeated values all bind
 	IsMap     bool     // destination is a map, filled from name[key]=value pairs
 	Fast      fastKind // set straight from a JSON token, skipping conversion
-	// JSON is set when the field's type decodes itself from JSON, so a body
-	// member can be handed to it as the raw bytes the client sent.
-	JSON bool
-	// Plan is how a JSON body member decodes into the field, resolved once.
-	Plan *decodePlan
 	// HeaderKey is TagName in canonical form, for a header field. Resolving
 	// it once lets r.Header be indexed directly, where Header.Get
 	// canonicalises the name, allocating, on every request.
@@ -376,14 +381,13 @@ var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(
 // once. The body key set lives here rather than being rebuilt per request,
 // which would allocate on every call including those with no body at all.
 type typeInfo struct {
-	fields   []fieldInfo
-	bodyKeys map[string]struct{}
+	fields []fieldInfo
+	// body finds the field each body member binds, and holds what decoding
+	// a JSON body into those fields needs.
+	body objectFields
 	// bodyMaps names the body fields that are maps, whose members a form body
 	// sends as name[key] fields.
 	bodyMaps map[string]struct{}
-	// bodyFields indexes fields by the body member they bind, so a token walk
-	// can find the destination without a second pass.
-	bodyFields map[string]int
 	// invalid is why the type cannot be bound at all, such as a field whose
 	// type is a pointer to itself; nil for a type that can.
 	invalid error
@@ -392,10 +396,10 @@ type typeInfo struct {
 	validatePath []int
 }
 
-// Cache of resolved type information. It is keyed by type and so is bounded by
-// the number of struct types a program binds into.
-var fieldCache = make(map[reflect.Type]*typeInfo)
-var fieldCacheMutex sync.RWMutex
+// fieldCache holds resolved type information, reflect.Type -> *typeInfo. It is
+// keyed by type and so is bounded by the number of struct types a program
+// binds into.
+var fieldCache sync.Map
 
 // Validator is an optional interface that structs can implement to provide
 // custom validation logic that runs automatically after successful binding.
@@ -521,7 +525,6 @@ type BindError struct {
 	nested      bool // placed beneath a parent, so finish has work to do
 	autoMessage bool // Message is worded in finish from the path and cause
 	elided      bool // outer lost parts to maxPathSegments
-	counted     bool // charged to the bind's failure budget
 }
 
 func (e *BindError) Error() string {
@@ -663,7 +666,7 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 	// unknown members must be reported, when every member is one.
 	var bodyData map[string]any
 	var unknown []string
-	if len(info.bodyKeys) > 0 || opts.DisallowUnknownFields {
+	if len(info.body.index) > 0 || opts.DisallowUnknownFields {
 		bodyData, unknown, err = parseRequestBody(r, opts.maxBodySize(), info, val, opts.DisallowUnknownFields, bound, &errs)
 		if err != nil {
 			return err
@@ -743,11 +746,6 @@ func (e BindErrors) Unwrap() []error {
 type fieldErrs struct {
 	byField [][]*BindError
 	unknown []*BindError
-}
-
-// failed reports whether a field has already recorded a failure.
-func (e *fieldErrs) failed(index int) bool {
-	return e.byField != nil && len(e.byField[index]) > 0
 }
 
 func (e *fieldErrs) set(info *typeInfo, index int, errs []*BindError) {
@@ -1078,7 +1076,7 @@ func readBody(r *http.Request, limit int64) ([]byte, error) {
 func unknownKeys(info *typeInfo, bodyData map[string]any) []string {
 	var unknown []string
 	for name := range bodyData {
-		if _, found := info.bodyKeys[name]; found {
+		if _, found := info.body.index[name]; found {
 			continue
 		}
 		// A form field such as meta[a] belongs to a map field named meta,
@@ -1653,10 +1651,14 @@ func nestFailures(field, name, source string, inner BindErrors) []*BindError {
 	return nestFailuresAs(pathPart{field: field, name: name}, source, inner)
 }
 
-// nestIndexFailures places failures beneath a slice index or map key, such as
-// [2] or ["a"].
-func nestIndexFailures(field, name string, inner BindErrors) []*BindError {
-	return nestFailuresAs(pathPart{field: field, name: name, index: true}, "", inner)
+// indexFailures places a failure, or the failures of a nested value, beneath
+// a slice index or map key, such as [2] or ["a"].
+func indexFailures(field, name string, err error) BindErrors {
+	var inner BindErrors
+	if errors.As(err, &inner) {
+		return nestFailuresAs(pathPart{field: field, name: name, index: true}, "", inner)
+	}
+	return BindErrors{newIndexBindError(field, name, err)}
 }
 
 func nestFailuresAs(p pathPart, source string, inner BindErrors) []*BindError {
@@ -1825,91 +1827,71 @@ func newBindError(field, source, name string, err error) *BindError {
 func getFieldInfo(typ reflect.Type) []fieldInfo { return typeInfoFor(typ).fields }
 
 // typeInfoFor resolves a struct type's binding tags on first use and reuses
-// them afterwards.
+// them afterwards. Two binds of a new type at once may both resolve it; the
+// results are the same, and one is kept.
 func typeInfoFor(typ reflect.Type) *typeInfo {
-	fieldCacheMutex.RLock()
-	cached, found := fieldCache[typ]
-	fieldCacheMutex.RUnlock()
-
-	if found {
-		return cached
-	}
-
-	fieldCacheMutex.Lock()
-	defer fieldCacheMutex.Unlock()
-
-	// Check again in case another goroutine built it while we were waiting
-	if cached, found = fieldCache[typ]; found {
-		return cached
+	if cached, ok := fieldCache.Load(typ); ok {
+		return cached.(*typeInfo)
 	}
 
 	tagged := taggedFields(typ, bindSources[:])
-	info := make([]fieldInfo, 0, len(tagged))
-	for _, tf := range tagged {
-		field, source, name, opts := tf.field, tf.source, tf.name, tf.opts
-
-		// A pointer to a slice takes many values just as a slice does.
-		fieldType := field.Type
-		if fieldType.Kind() == reflect.Pointer {
-			fieldType = fieldType.Elem()
-		}
-
-		var headerKey string
-		if source == header {
-			headerKey = http.CanonicalHeaderKey(name)
-		}
-
-		info = append(info, fieldInfo{
-			Index:     tf.index,
-			Name:      tf.goName,
-			FieldType: field,
-			Source:    source,
-			TagName:   name,
-			OmitEmpty: omitsEmpty(field.Type, opts),
-			Required:  hasOption(opts, optRequired),
-			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType) && !isByteSlice(fieldType),
-			IsMap:     fieldType.Kind() == reflect.Map && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType),
-			Fast:      fastKindOf(field.Type),
-			JSON:      unmarshalsJSON(field.Type),
-			Plan:      planFor(field.Type),
-			HeaderKey: headerKey,
-		})
-	}
-
-	keys := make(map[string]struct{})
-	fields := make(map[string]int)
-	for i, fi := range info {
+	info := &typeInfo{fields: make([]fieldInfo, len(tagged)), body: newObjectFields(len(tagged))}
+	for i, tf := range tagged {
+		fi := newFieldInfo(tf)
+		info.fields[i] = fi
 		if fi.Source == body || fi.Source == jjson {
-			keys[fi.TagName] = struct{}{}
-			fields[fi.TagName] = i
-		}
-	}
-
-	var mapFields map[string]struct{}
-	for _, fi := range info {
-		if fi.IsMap && (fi.Source == body || fi.Source == jjson) {
-			if mapFields == nil {
-				mapFields = make(map[string]struct{})
+			info.body.add(i, fi.TagName, fi.FieldType.Type, fi.OmitEmpty, fi.Index, fi.Name)
+			if fi.IsMap {
+				if info.bodyMaps == nil {
+					info.bodyMaps = make(map[string]struct{})
+				}
+				info.bodyMaps[fi.TagName] = struct{}{}
 			}
-			mapFields[fi.TagName] = struct{}{}
 		}
 	}
+	info.invalid = pointerCycleError(typ, info.fields)
+	if info.invalid == nil {
+		info.validatePath = promotedValidatePath(typ)
+	}
+	cached, _ := fieldCache.LoadOrStore(typ, info)
+	return cached.(*typeInfo)
+}
 
-	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields, bodyMaps: mapFields}
+// newFieldInfo resolves how one tagged field binds.
+func newFieldInfo(tf taggedField) fieldInfo {
+	// A pointer to a slice takes many values just as a slice does.
+	t := tf.field.Type
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	fi := fieldInfo{
+		Index:     tf.index,
+		Name:      tf.goName,
+		FieldType: tf.field,
+		Source:    tf.source,
+		TagName:   tf.name,
+		OmitEmpty: omitsEmpty(tf.field.Type, tf.opts),
+		Required:  hasOption(tf.opts, optRequired),
+		IsSlice:   t.Kind() == reflect.Slice && !isTextUnmarshaler(t) && !unmarshalsJSON(t) && !isByteSlice(t),
+		IsMap:     t.Kind() == reflect.Map && !isTextUnmarshaler(t) && !unmarshalsJSON(t),
+		Fast:      fastKindOf(tf.field.Type),
+	}
+	if tf.source == header {
+		fi.HeaderKey = http.CanonicalHeaderKey(tf.name)
+	}
+	return fi
+}
+
+// pointerCycleError reports a field of typ that reaches a pointer type that
+// points to itself, which binding cannot fill, or nil.
+func pointerCycleError(typ reflect.Type, fields []fieldInfo) error {
 	seen := make(map[reflect.Type]bool)
-	var cycle reflect.Type
-	for _, fi := range info {
-		if cycle = pointerCycle(fi.FieldType.Type, seen); cycle != nil {
-			break
+	for _, fi := range fields {
+		if cycle := pointerCycle(fi.FieldType.Type, seen); cycle != nil {
+			return fmt.Errorf("%w: %s reaches %s, a pointer type that points to itself", ErrInvalidTarget, typ, cycle)
 		}
 	}
-	if cycle != nil {
-		cached.invalid = fmt.Errorf("%w: %s reaches %s, a pointer type that points to itself", ErrInvalidTarget, typ, cycle)
-	} else {
-		cached.validatePath = promotedValidatePath(typ)
-	}
-	fieldCache[typ] = cached
-	return cached
+	return nil
 }
 
 // omitsEmpty reports whether a field skips an empty value. omitempty has no
@@ -2734,12 +2716,7 @@ func setSlice(field reflect.Value, value any) error {
 
 			if err := setField(elem, v[i]); err != nil {
 				index := fmt.Sprintf("[%d]", i)
-				var inner BindErrors
-				if errors.As(err, &inner) {
-					errs = append(errs, nestIndexFailures(index, index, inner)...)
-				} else {
-					errs = append(errs, newIndexBindError(index, index, err))
-				}
+				errs = append(errs, indexFailures(index, index, err)...)
 				// Once maxFailures elements have failed, the rest need not
 				// be converted: the bind has failed.
 				if len(errs) >= maxFailures {
@@ -2771,7 +2748,7 @@ func setSlice(field reflect.Value, value any) error {
 
 // setMap fills a map from the name[key]=value pairs of a query or form, or a
 // map-shaped value that did not come from a JSON object, which is decoded
-// token by token in decodeObjectIntoMap instead. Each key is converted to the map's
+// token by token in decodeMap instead. Each key is converted to the map's
 // key type, any type that converts from text, and each
 // value as a field of the element type would be. The map is replaced rather
 // than merged into, as a slice is. Every entry is attempted until maxFailures
@@ -2789,7 +2766,7 @@ func setMap(field reflect.Value, value any) error {
 	// Keys are taken in order, so that when two spellings of one key are
 	// both sent, which one binds does not depend on map iteration.
 	keys := slices.Sorted(maps.Keys(obj))
-	var failed map[any]keyFailures
+	var failed mapFailures
 	count := 0
 	for _, k := range keys {
 		// Once maxFailures entries have failed, the rest need not be
@@ -2800,31 +2777,23 @@ func setMap(field reflect.Value, value any) error {
 		key := reflect.New(typ.Key()).Elem()
 		if err := convertMapKey(key, k); err != nil {
 			count++
-			failed = addKeyFailures(failed, k, k, BindErrors{newIndexBindError(mapKeyField(k), mapKeyName(k), fmt.Errorf("invalid key: %w", err))})
+			failed.addText(k, BindErrors{newIndexBindError(mapKeyField(k), mapKeyName(k), fmt.Errorf("invalid key: %w", err))})
 			continue
 		}
-		// A key whose other spelling already failed keeps that failure, as
-		// in a JSON object: "01" failing is not undone by "1".
-		id := key.Interface()
-		if _, dup := failed[id]; dup {
+		if failed.has(key) {
 			continue
 		}
 		elem := reflect.New(typ.Elem()).Elem()
 		if err := bindFieldValue(elem, obj[k]); err != nil {
-			var inner BindErrors
-			if errors.As(err, &inner) {
-				count += len(inner)
-				failed = addKeyFailures(failed, id, k, nestIndexFailures(mapKeyField(k), mapKeyName(k), inner))
-			} else {
-				count++
-				failed = addKeyFailures(failed, id, k, BindErrors{newIndexBindError(mapKeyField(k), mapKeyName(k), err)})
-			}
+			errs := indexFailures(mapKeyField(k), mapKeyName(k), err)
+			count += len(errs)
+			failed.add(key, k, errs)
 			continue
 		}
 		m.SetMapIndex(key, elem)
 	}
-	if len(failed) > 0 {
-		return keyOrderedFailures(typ.Key(), failed)
+	if errs := failed.list(typ.Key()); errs != nil {
+		return errs
 	}
 	field.Set(m)
 	return nil
@@ -2843,11 +2812,54 @@ func convertMapKey(key reflect.Value, text string) error {
 	return nil
 }
 
-// keyFailures is one map entry's failures, with the key as the client
-// spelled it, which names and orders them.
+// mapFailures gathers the failures of a map's entries, one entry per key,
+// keeping each by the key's converted value, so that two spellings of one
+// key, such as "01" and "1" for an integer key, are one entry, and by its text
+// as sent, so that a key whose converted value never equals itself, such as
+// NaN, is still recognised when sent again. A key that has failed keeps that
+// failure: sending it again, in any spelling, does not undo it.
+type mapFailures struct {
+	byKey  map[any]keyFailures
+	byText map[string]bool
+}
+
+// keyFailures is one entry's failures, with the key as the client spelled
+// it, which names and orders them.
 type keyFailures struct {
-	raw  string
+	text string
 	errs BindErrors
+}
+
+// repeats reports whether a key sent as text has already failed.
+func (f *mapFailures) repeats(text string) bool { return f.byText[text] }
+
+// has reports whether key, in any spelling, has already failed. Its
+// interface value, which can allocate, is taken only once one has.
+func (f *mapFailures) has(key reflect.Value) bool {
+	if len(f.byKey) == 0 {
+		return false
+	}
+	_, dup := f.byKey[key.Interface()]
+	return dup
+}
+
+// add records the failures of the entry for key, sent as text.
+func (f *mapFailures) add(key reflect.Value, text string, errs BindErrors) {
+	f.record(key.Interface(), text, errs)
+}
+
+// addText records the failure of a key that did not convert, by its text.
+func (f *mapFailures) addText(text string, errs BindErrors) {
+	f.record(text, text, errs)
+}
+
+func (f *mapFailures) record(id any, text string, errs BindErrors) {
+	if f.byKey == nil {
+		f.byKey = make(map[any]keyFailures)
+		f.byText = make(map[string]bool)
+	}
+	f.byKey[id] = keyFailures{text: text, errs: errs}
+	f.byText[text] = true
 }
 
 // mapKeyField and mapKeyName name a map entry in a failure: Meta["a"] and
@@ -2863,24 +2875,16 @@ const maxKeyInPath = 64
 // shortKey is k, or at most its first maxKeyInPath bytes and "…".
 func shortKey(k string) string { return clipText(k, maxKeyInPath) }
 
-// addKeyFailures records one map entry's failures under id: the converted key,
-// so that two spellings of one key, such as "01" and "1" for an integer key,
-// are one entry, or the raw text of a key that did not convert.
-func addKeyFailures(failed map[any]keyFailures, id any, raw string, errs BindErrors) map[any]keyFailures {
-	if failed == nil {
-		failed = make(map[any]keyFailures)
-	}
-	failed[id] = keyFailures{raw: raw, errs: errs}
-	return failed
-}
-
-// keyOrderedFailures lists map entries' failures in key order, keeping each
-// entry's own failures in the order its fields are declared. For an integer
+// list returns the failures in key order, or nil when there are none, keeping
+// each entry's own failures in the order its fields are declared. For an integer
 // key type, keys written as whole numbers come first, by value, so that 9
 // comes before 10, and any others after them by text; the order is total, so
 // it is the same on every run.
-func keyOrderedFailures(keyType reflect.Type, failed map[any]keyFailures) BindErrors {
-	entries := slices.Collect(maps.Values(failed))
+func (f *mapFailures) list(keyType reflect.Type) BindErrors {
+	if len(f.byKey) == 0 {
+		return nil
+	}
+	entries := slices.Collect(maps.Values(f.byKey))
 	numeric := false
 	switch keyType.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -2889,8 +2893,8 @@ func keyOrderedFailures(keyType reflect.Type, failed map[any]keyFailures) BindEr
 	}
 	slices.SortFunc(entries, func(a, b keyFailures) int {
 		if numeric {
-			xNeg, x, xn := wholeNumber(a.raw)
-			yNeg, y, yn := wholeNumber(b.raw)
+			xNeg, x, xn := wholeNumber(a.text)
+			yNeg, y, yn := wholeNumber(b.text)
 			switch {
 			case xn && yn:
 				if c := compareWhole(xNeg, x, yNeg, y); c != 0 {
@@ -2902,7 +2906,7 @@ func keyOrderedFailures(keyType reflect.Type, failed map[any]keyFailures) BindEr
 				return 1
 			}
 		}
-		return strings.Compare(a.raw, b.raw)
+		return strings.Compare(a.text, b.text)
 	})
 	var errs BindErrors
 	for _, e := range entries {
@@ -2948,7 +2952,7 @@ func compareWhole(aNeg bool, a string, bNeg bool, b string) int {
 }
 
 // setStruct reports a value that cannot fill a struct field. A JSON object
-// fills one token by token, in decodeObjectIntoStruct, so what reaches here
+// fills one token by token, in decodeStruct, so what reaches here
 // is text, a number, a bool or an array, none of which a struct can take.
 func setStruct(value any) error {
 	return fmt.Errorf("cannot set struct field with value of type %T", value)

@@ -121,9 +121,7 @@ func TestConcurrentBindingWithCacheEviction(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				fieldCacheMutex.Lock()
-				fieldCache = make(map[reflect.Type]*typeInfo)
-				fieldCacheMutex.Unlock()
+				fieldCache.Clear()
 			}
 		}
 	}()
