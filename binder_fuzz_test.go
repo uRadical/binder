@@ -1,10 +1,10 @@
 package binder
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -137,14 +137,26 @@ func FuzzBindWithOptions(f *testing.F) {
 	})
 }
 
-// FuzzBindNested drives nested-struct binding directly with arbitrary members.
+// FuzzBindNested drives nested-struct binding with an arbitrary member at each
+// level of nesting, as a string and as raw JSON.
 func FuzzBindNested(f *testing.F) {
 	f.Add("k", "v")
 	f.Add("when", "2026-01-02T03:04:05Z")
+	f.Add("n", "12")
+	f.Add("tags", `["a",null]`)
 
 	f.Fuzz(func(t *testing.T, key, value string) {
-		var target fuzzNested
-		_ = bindNestedFields(reflect.ValueOf(&target).Elem(), map[string]any{key: value})
+		k, _ := json.Marshal(key)
+		v, _ := json.Marshal(value)
+		for _, body := range []string{
+			`{"inner":{"deep":{` + string(k) + `:` + string(v) + `}}}`,
+			`{"inner":{` + string(k) + `:` + value + `}}`,
+		} {
+			r := httptest.NewRequest("POST", "/u", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			var target fuzzNested
+			_ = Bind(r, &target)
+		}
 	})
 }
 

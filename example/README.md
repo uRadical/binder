@@ -8,7 +8,7 @@ This example demonstrates how to use the Binder library to build a complete REST
 - **Query parameters** - `/users?active=true&limit=5`
 - **Request bodies** - JSON data in POST/PUT requests
 - **Cookies** - API key authentication
-- **Headers** - Request tracing via `X-Request-ID`
+- **Headers** - `X-Request-ID` bound from a header
 - **Repeated values** - `/users?tags=admin&tags=user` filling a slice
 - **UUIDs** - A `uuid.UUID` bound from a JSON body and a query string
 - **Embedded structs** - A shared `Paging` struct whose fields bind as if declared on the request
@@ -31,7 +31,7 @@ go run .
 
 The server will start on `http://localhost:8080`
 
-`main_test.go` exercises every endpoint and error case below through the same
+`main_test.go` covers every endpoint and the error cases below through the same
 routes, and checks the shared store under concurrent requests:
 
 ```bash
@@ -158,6 +158,9 @@ func (r CreateUserRequest) Validate(ctx context.Context) error {
     if len(r.Tags) > 5 {
         errs["tags"] = "must have at most 5 entries"
     }
+    if r.Credit < 0 {
+        errs["credit"] = "must not be negative"
+    }
     if len(errs) > 0 {
         return errs
     }
@@ -175,8 +178,8 @@ which an application writes once. Binder reports what went wrong as types to
 match; the response format and status codes are the application's choice:
 
 ```go
-func createUser(w http.ResponseWriter, r *http.Request) {
-    var req CreateUserRequest
+func updateUser(w http.ResponseWriter, r *http.Request) {
+    var req UpdateUserRequest
     if err := binder.Bind(r, &req); err != nil {
         writeBindError(w, err)
         return
@@ -260,7 +263,7 @@ still binds into `Money`: a form carries text, which binder passes to
 1. **Pointer Fields** - Using `*bool` to distinguish between `false` and "not provided"
 2. **Slice Binding** - Arrays from JSON become Go slices
 3. **Omitempty** - A body field marked `omitempty` keeps its current value when sent empty, as the update's `name` and `email` do
-4. **Multiple Sources** - Combining path, query, body, and cookie data in one struct
+4. **Multiple Sources** - Path with body (`UpdateUserRequest`), query with cookie (`ListUsersRequest`), path with header (`GetUserRequest`)
 5. **Content-Type Awareness** - Same handler works for JSON and form data
 6. **Custom Validation** - Implementing the `Validator` interface with an error type of your own
 7. **Text Types** - `uuid.UUID` binds from any source because it implements `encoding.TextUnmarshaler`; `time.Time` and `net.IP` bind the same way

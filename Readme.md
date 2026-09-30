@@ -102,7 +102,7 @@ func main() {
 The library supports binding from multiple sources:
 
 - `path:"name"` - Binds from path parameters via `r.PathValue`, as set by `http.ServeMux` patterns such as `/users/{id}` or by any router that calls `r.SetPathValue`
-- `query:"name"` - Binds from URL query parameters
+- `query:"name"` - Binds from URL query parameters (a query beyond `net/url`'s limit of 10,000 parameters, like a Cookie header beyond `net/http`'s cookie limit, binds nothing from that source, as those packages do)
 - `cookie:"name"` - Binds from HTTP cookies
 - `body:"name"` - Binds from the request body: JSON, `x-www-form-urlencoded` or `multipart/form-data`
 - `json:"name"` - Backwards compatibility with existing types
@@ -115,7 +115,7 @@ When a field carries more than one of these, the first in this order wins:
 `path`, `query`, `body`, `json`, `cookie`, `header`.
 
 A tag with an empty name, such as `query:",required"`, binds under the Go
-field name, matched exactly. As in `encoding/json`, `json:"-"` is not a binding
+field name, matched exactly (for a header, case-insensitively, as any header). As in `encoding/json`, `json:"-"` is not a binding
 tag.
 
 ### Headers
@@ -176,7 +176,9 @@ type Request struct {
 }
 ```
 
-A single value still binds as a one-element slice. Values are never split on
+A single value still binds as a one-element slice, and into a slice of
+slices as a list of one list; only a recursive type such as `type P []P`, which
+would wrap it forever, refuses one. Values are never split on
 commas: `?tags=a,b` is one value, `"a,b"`.
 
 ### Maps
@@ -193,17 +195,21 @@ type Search struct {
 }
 ```
 
-Keys convert to the map's key type, a string, an integer or a
+Keys convert to the map's key type, any type that converts from text: a
+string, a number, a bool or a
 `TextUnmarshaler`, and values as a field of the element type would, so
-`map[string]time.Time` or `map[string]uuid.UUID` work too. A repeated key fills
-a slice value and otherwise binds its first value. In a query or form an
-empty value counts as absent, and a map with no entries is left nil, so
+`map[string]time.Time` or `map[string]uuid.UUID` work too. In a query or form
+a repeated key fills a slice value and otherwise binds its first non-empty
+value, and a plain `name=value` with no key is ignored; in a JSON object the
+last occurrence binds, as for any member. In a query or form an empty value
+counts as absent, and a map with no entries leaves the field as it was, so
 `required` reports it; a JSON object binds as sent, so `{}` is an empty map
 that satisfies `required`, and a `null` value gives its key the zero value, as
 in `encoding/json`. A bad
 entry is reported under the name the client sent, such as `min[price]`. Only
 one level of brackets is read: `filter[a][b]` has no agreed meaning. The map is
-replaced, not merged into.
+replaced, not merged into. In a multipart form, file parts named this way bind
+into a `map[string]*multipart.FileHeader` and are refused by any other map.
 
 ### Body vs JSON Tags
 
@@ -216,7 +222,7 @@ JSON is recognised by media type, including the RFC 6839 suffix form, so
 `application/hal+json` and `application/problem+json` are all parsed as JSON.
 A body whose Content-Type is none of JSON, `application/x-www-form-urlencoded`
 or `multipart/form-data` is not parsed, and the request binds from its path,
-query, cookie and header values alone.
+query, cookie and header values alone. When a field binds from the body it is still read, within the size limit.
 
 The `json:` tag serves as:
 - An alternative to `body:` when working specifically with JSON data
@@ -241,7 +247,8 @@ for fields whose tag is shared with serialisation.
 ## Options
 
 Add `,omitempty` to skip binding if the value is present but empty, leaving
-the field as it was:
+the field as it was. For a nested struct, an empty `{}` is skipped whole, so
+the `required` fields inside it are not checked:
 
 ```go
 Email string `body:"email,omitempty"`
@@ -268,7 +275,8 @@ The failure is a `*BindError` wrapping `ErrMissingRequired`, reported in
 an empty value counts as missing, so `?q=` is treated as no `q`; for a slice,
 that holds when every value given is empty, and an empty value among others is
 an element, an error for a non-string element type. A body key or
-a cookie that is present but empty satisfies `required`.
+a cookie that is present but empty satisfies `required` (a form map entry
+with an empty value counts as absent, as in a query).
 
 ## Advanced Usage
 
@@ -302,9 +310,9 @@ type Order struct {
 }
 ```
 
-A top-level body member is handed over exactly as sent, unless the field has
-`omitempty`, which needs the value decoded to judge it; one inside a nested
-struct, slice or map is encoded again first. A JSON `null` sets nothing. A JSON string goes to
+A JSON body value is handed over exactly as sent, at any depth; with
+`omitempty`, an empty one is skipped instead. A JSON `null` sets nothing (inside a
+map, it gives its key the zero value). A JSON string goes to
 `UnmarshalText` when the type has that too, so a value reads the same from a
 body as from a query string; a type with only `UnmarshalJSON` is given text
 from other sources as a JSON string.
@@ -336,6 +344,9 @@ type User struct {
     Address Address `body:"address"`
 }
 ```
+
+A nested struct binds from a JSON object, and only its fields with a `body` or
+`json` tag bind, as at the top level.
 
 ### Embedded Structs
 
@@ -385,8 +396,9 @@ if err := binder.BindWithOptions(r, &req, opts); err != nil {
 
 ### Request Size Limits
 
-`Bind` caps bodies at `binder.DefaultMaxBodySize`, 10 MB, so a single request
-cannot exhaust server memory. To use a different limit, pass it per call:
+`Bind` caps bodies at `binder.DefaultMaxBodySize`, 10 MB, and binding costs
+time and memory in proportion to the body, so a single request cannot run a
+server out of either. To use a different limit, pass it per call:
 
 ```go
 binder.BindWithOptions(r, &req, binder.BindOptions{MaxBodySize: 2 << 20}) // 2 MB
@@ -405,7 +417,18 @@ neither limited nor parsed, unless `DisallowUnknownFields` is set.
 Binding does not stop at the first bad field. Every field is attempted, and
 when any fail, `Bind` returns `binder.BindErrors`, a list of `*BindError`, each
 naming the field and the input it came from. It has the same shape for one
-failure as for several:
+failure as for several.
+
+At most 100 failures are reported, in field order. Once binding has recorded
+that many in a JSON body it stops converting values and only checks that the rest of the body
+is well-formed, so rejecting a flood of bad values costs about what reading it
+does; a query or form field stops converting at its own hundredth failure. A
+failure path of more than 64 parts, a part being a field or key with its
+index, keeps its ends and elides the middle, as `items[0].….orders[3].qty`,
+and a map key longer than 64 bytes is named by at most its first 64 and `…`. A
+message quotes at most 256 bytes of the value that failed; `Err` keeps it
+whole.
+
 
 ```go
 if err := binder.Bind(r, &req); err != nil {
@@ -448,7 +471,7 @@ end binding at once, since nothing bound after them could be trusted:
 |-------|---------|------------------|
 | `ErrMalformedBody` | The body could not be parsed as its `Content-Type` declares | 400 Bad Request |
 | `ErrBodyTooLarge` | The body exceeded the size limit | 413 Content Too Large |
-| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct, or the request was nil | 500 Internal Server Error |
+| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct, the request was nil, or the target has a field that cannot be bound, such as a pointer type that points to itself | 500 Internal Server Error |
 
 Two further sentinels are carried by individual `BindErrors` entries rather
 than returned alone: `ErrMissingRequired`, for a field tagged `required` that
@@ -482,20 +505,20 @@ figures; it costs more memory than the binding itself.
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
 | BindHeaderOnly | 61 | 16 | 1 |
-| BindPathOnly | 69 | 8 | 1 |
-| BindQueryOnly | 86 | 16 | 1 |
-| BindCookieOnly | 97 | 16 | 1 |
-| BindNoQueryParams | 97 | 16 | 1 |
-| BindOmitEmpty | 120 | 48 | 1 |
-| BindParallel | 264 | 552 | 11 |
-| BindBodyOnly/FormBody | 541 | 552 | 11 |
-| BindBodyOnly/JSONBody | 693 | 420 | 17 |
-| BindMixed/WithForm | 725 | 616 | 11 |
-| Bind | 729 | 336 | 7 |
-| BindManyQueryParams | 865 | 128 | 1 |
-| BindMixed/WithJSON | 870 | 476 | 17 |
-| BindWithoutCache | 2,006 | 3,249 | 17 |
-| BindMultipart | 7,875 | 31,648 | 78 |
+| BindPathOnly | 70 | 8 | 1 |
+| BindQueryOnly | 87 | 16 | 1 |
+| BindCookieOnly | 94 | 16 | 1 |
+| BindNoQueryParams | 94 | 16 | 1 |
+| BindOmitEmpty | 123 | 48 | 1 |
+| BindParallel | 262 | 552 | 11 |
+| BindBodyOnly/JSONBody | 539 | 276 | 11 |
+| BindBodyOnly/FormBody | 561 | 552 | 11 |
+| BindMixed/WithJSON | 710 | 332 | 11 |
+| Bind | 720 | 336 | 7 |
+| BindMixed/WithForm | 743 | 616 | 11 |
+| BindManyQueryParams | 907 | 128 | 1 |
+| BindWithoutCache | 2,104 | 3,409 | 17 |
+| BindMultipart | 7,798 | 31,636 | 78 |
 
 The one allocation in the path, query, cookie and header benchmarks is the
 target itself escaping to the heap once it is passed as `any`: binding from
@@ -505,8 +528,8 @@ rather than a copy. A JSON body costs more, since the body must be read and
 parsed before any field can be converted. A form body is parsed into a map
 first, and costs about the same as JSON.
 
-`Bind` against `BindWithoutCache` measures the per-type tag cache: 729 ns and
-7 allocations with it warm, against 2,006 ns and 17 allocations when it is
+`Bind` against `BindWithoutCache` measures the per-type tag cache: 720 ns and
+7 allocations with it warm, against 2,104 ns and 17 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`
@@ -523,11 +546,11 @@ memory rather than spilled to disk.
 This library has been designed with production use in mind:
 
 - **No panics** - An unusable target is reported as an error, and an unexported field is skipped
-- **Bounded reads** - Request bodies are capped, so one request cannot exhaust memory
+- **Bounded work** - Bodies are capped, binding costs time and memory in proportion to the body, and at most 100 failures are reported
 - **Errors are never swallowed** - A body that fails to parse is reported, not ignored
 - **Request body preservation** - The body is restored after binding, so later handlers can read it again
 - **Configurable per call** - `BindWithOptions` sets limits per endpoint; there is no package-level state to change
-- **Well-tested** - About 95% statement coverage, run under the race detector, with fuzz targets for the reflection paths
+- **Well-tested** - About 93% statement coverage, run under the race detector, with fuzz targets for the reflection paths
 
 ## When to Use Binder
 
@@ -602,7 +625,9 @@ second, misleading error for the same input.
 A `Validate` promoted from an embedded pointer, such as `*Audit`, is not called
 when that pointer is still nil because none of its fields was sent: there is
 nothing to validate, and calling it would dereference nil. A type's own
-`Validate`, or one promoted from an embedded value, always runs.
+`Validate` always runs, as does one promoted from an embedded value that is not
+itself reached through a nil pointer. An embedded `Validator` interface that
+is nil is skipped the same way.
 
 Binder passes `r.Context()`, so a rule can use the authenticated user, a
 tenant, or the request's deadline for a lookup:
@@ -634,7 +659,7 @@ their source:
 | **File uploads** | Yes | Yes | Yes | No |
 | **Path values** | `http.ServeMux` / `r.PathValue` | Echo's router | Gin's router | N/A |
 | **Validation** | Your `Validate(ctx)` method, called by `Bind` | Pluggable `Validator`, called separately via `c.Validate` | validator/v10 tags, called by `ShouldBind` | No |
-| **Custom types** | `encoding.TextUnmarshaler`, `UnmarshalJSON` and json/v2's `UnmarshalJSONFrom` | `BindUnmarshaler` and `TextUnmarshaler` | `BindUnmarshaler`, and `TextUnmarshaler` with a `parser` tag option | Registered converters and `TextUnmarshaler` |
+| **Custom types** | `encoding.TextUnmarshaler`, `UnmarshalJSON` and json/v2's `UnmarshalJSONFrom` | `BindUnmarshaler` and `TextUnmarshaler`, and `UnmarshalJSON` in JSON bodies | `BindUnmarshaler`, `TextUnmarshaler` with a `parser` tag option, and `UnmarshalJSON` in JSON bodies | Registered converters and `TextUnmarshaler` |
 | **Reports every bad field** | Yes, as `BindErrors` | No | Validation failures only; conversion stops at the first | Yes, as `MultiError` |
 
 ### Speed and Allocations
@@ -645,11 +670,11 @@ on an Apple M-series laptop, Go 1.27:
 
 | Scenario | Binder | Echo | Gin | gorilla/schema | Stdlib by hand |
 |----------|-------:|-----:|----:|---------------:|---------------:|
-| Query string, 5 fields | 522 ns | 884 ns | 1,124 ns | 1,984 ns | 371 ns |
+| Query string, 5 fields | 523 ns | 881 ns | 1,105 ns | 1,936 ns | 364 ns |
 | | 64 B, 1 alloc | 544 B, 8 allocs | 608 B, 9 allocs | 1,367 B, 46 allocs | 480 B, 7 allocs |
-| JSON body, 5 fields | 554 ns | 830 ns | 865 ns | - | 745 ns |
+| JSON body, 5 fields | 570 ns | 824 ns | 868 ns | - | 745 ns |
 | | 256 B, 8 allocs | 681 B, 8 allocs | 681 B, 8 allocs | - | 681 B, 8 allocs |
-| Path, query, body, header and cookie | 568 ns | 1,333 ns | 1,488 ns | - | - |
+| Path, query, body, header and cookie | 595 ns | 1,340 ns | 1,473 ns | - | - |
 | | 248 B, 6 allocs | 1,202 B, 15 allocs | 1,644 B, 21 allocs | - | - |
 
 Every binding library's figures include 1 allocation for the target escaping

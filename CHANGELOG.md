@@ -66,11 +66,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string value such as `9` used to bind as 9 nanoseconds; it is now an error
   ("missing unit in duration"), except `0`. Send `9ns`, or a JSON number,
   which is still nanoseconds.
+- **Fractions do not truncate into integers.** A JSON number such as `1.9`
+  bound into an integer field or `time.Duration` used to truncate to `1`; it
+  is now an error, as it already was from a query string. Whole numbers in
+  float form, `1e3` or `2.0`, still bind.
+- **A failed occurrence of a member stands.** A JSON member sent twice binds
+  its last occurrence, but if an earlier one failed to convert, that failure
+  is reported and later occurrences are only checked for being well-formed, as
+  in `encoding/json`. The body used to be decoded into a map first, so only
+  the last occurrence was ever looked at.
 - **Nested options apply.** `required` and `omitempty` inside a nested struct
   used to be ignored; they now behave as they do at the top level.
 
 ### Added
 
+- A JSON string binds into a `[]byte` as base64, as `encoding/json` encodes
+  one; text from a query, header or form is taken as its bytes.
+- At most 100 failures are reported per `Bind`. Once that many are recorded,
+  a JSON body stops converting values and only checks that the rest of it is
+  well-formed, so rejecting a flood of bad values costs about what reading it
+  does; a query or form field stops at its own hundredth. A failure path of
+  more than 64 parts, a part being a field or key with its index, keeps its
+  ends and elides the
+  middle.
 - `time.Duration` binds from text such as `5s`, `1m30s` or `250ms`, from any
   source including a JSON string, parsed with `time.ParseDuration`. A JSON
   number is still nanoseconds, as `encoding/json` treats it.
@@ -94,25 +112,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failure's message quoted the client's whole value, so long bad values
+  made errors of tens of megabytes. A message quotes at most 256 bytes of it;
+  `Err` keeps the cause whole.
+- A multipart file part named like a map entry, `meta[b]`, was dropped without
+  a word. It binds into a map of `*multipart.FileHeader` and is refused by any
+  other map.
+- A long map key was repeated in full in the path of every failure beneath
+  it, so a 1 MB key over 100 failures held 400 MB. A path now carries at most
+  the first 64 bytes of a key.
+- A JSON object filled a `*multipart.FileHeader`, passing for an upload. A file
+  arrives only in a multipart form.
+- A single value into a recursive list type, `type P []P`, wrapped itself as
+  a one-element list forever until the stack overflowed, killing the process.
+  A single value into such a type is now refused; a slice of slices that is
+  not recursive still takes one as a list of one list.
+- A failure deep in a JSON body had its path rebuilt, and every failure below
+  it copied, at each level on the way out, so depth multiplied its cost: 5,000
+  failures 1,000 levels down took twelve seconds and 83 GB. Paths are now
+  joined once, and failures are capped at 100.
+- A JSON array or object of the wrong shape, such as an array sent for a
+  string, was decoded whole before being refused. It is now skipped and
+  reported without being decoded.
+- A field whose type is a pointer to itself, `type P *P`, hung binding while
+  holding the type cache's lock, so every later `Bind` hung too. It is now
+  `ErrInvalidTarget`.
+- Map failures with a mix of numeric and other keys came out in a different
+  order from run to run; the order is now fixed. Two spellings of one key,
+  such as `"01"` and `"1"` into a `map[int]int`, are one entry, and a failure
+  in either stands, from JSON, query and form alike.
+- A multipart name sent as both text and a file had its text dropped without
+  a word. The body is now `ErrMalformedBody`.
+- A large body allocated about five times its size while being read, the
+  buffer growing by a quarter at a time; it now doubles, about twice.
+- With `DisallowUnknownFields`, each unknown JSON member was checked against
+  every earlier one, so a body of many distinct unknown members cost time
+  quadratic in their number: 80,000 took six seconds. It is now linear.
+- A JSON array or object inside a body, bound into a slice, map or nested
+  struct, went through `[]any` and `map[string]any` first, so an 8 MB array
+  allocated over 400 MB. Arrays, objects and nested structs are now decoded
+  token by token straight into their Go types.
+- Embedded pointers that referred to each other hung the search for a
+  promoted `Validate`, holding the type cache's lock, so every later `Bind`
+  hung too.
+- A null element of a pointer slice, `[null, 1]` into `[]*int`, was bound as
+  a pointer to zero; it stays nil, as in `encoding/json`.
+- A promoted `omitempty` field sent empty at the top level of a JSON body
+  allocated its embedded pointer; it no longer does, as in a form body.
+- A nil embedded `Validator` interface panicked when called, and a request
+  with no URL panicked on a query field.
 - The body buffer was sized up front from the client's `Content-Length`, so a
   request declaring a large body and sending none made the server allocate up
   to the limit at once, and a limit near `MaxInt64` panicked. At most 64 KB is
   allocated before the body arrives, and the limit arithmetic cannot overflow.
 - A `Validate` promoted from an embedded pointer that stayed nil panicked,
   dereferencing it. It is no longer called when the pointer is nil; a type's
-  own `Validate`, or one promoted from an embedded value, always runs.
+  own `Validate` always runs, as does one promoted from an embedded value not
+  reached through a nil pointer; a nil embedded `Validator` interface is
+  skipped the same way.
 - A JSON `null` inside a nested struct allocated an embedded pointer on the
   way to its field. It sets nothing, as elsewhere.
 - A type with its own JSON decoding was refused, such as a money type with
   `UnmarshalJSON` ("cannot set struct field with value of type json.Number")
   or `json.RawMessage`. A type implementing `json.Unmarshaler` or json/v2's
-  `UnmarshalerFrom` now decodes its value itself, at any depth; a top-level
-  member is handed over exactly as sent. A JSON string still goes to
+  `UnmarshalerFrom` now decodes its value itself, at any depth, handed the
+  bytes exactly as sent. A JSON string still goes to
   `UnmarshalText` when the type has both.
 - Maps were refused as an unsupported type, so a `map[string]string` of
   metadata could not be bound. A map now binds from a JSON object, and from a
   query string or form body written as `name[key]=value` pairs (OpenAPI's
-  `deepObject` style). Keys may be strings, integers or `TextUnmarshaler`s,
+  `deepObject` style). Keys may be any type that converts from text: strings, numbers, bools or `TextUnmarshaler`s,
   each value converts as a field of the element type would, and a bad entry is
   reported under the name the client sent, such as `min[price]`. A field of
   type `any` takes the decoded value, numbers as `json.Number`.
@@ -131,7 +200,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value, bound as the text `[x y]` into a string and failed for any other
   type. It now takes the first value, as a query parameter or header does.
 - A single value bound only into a `[]string`. A form value or JSON scalar
-  now binds as a one-element slice of any element type.
+  now binds as a one-element slice of any element type, except a JSON string
+  into a `[]byte`, which is base64. Into a slice of slices it is a list of one
+  list; only a recursive type such as `type P []P` refuses one.
 - A JSON number in float form beyond the range of `int64` or `uint64`, such
   as `1e30`, bound as the type's maximum. It is now reported as an overflow.
 - `net.IP`, and any other slice type implementing `encoding.TextUnmarshaler`,

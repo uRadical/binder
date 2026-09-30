@@ -335,3 +335,19 @@ func TestCreateUserFromFormWithMoney(t *testing.T) {
 		t.Errorf("got %d %s, want 201 with credit 3.10", w.Code, w.Body)
 	}
 }
+
+// Money reads only well-formed amounts.
+func TestMoneyUnmarshal(t *testing.T) {
+	for in, want := range map[string]Money{`12.5`: 1250, `"0.05"`: 5, `-3`: -300, `"-0.50"`: -50, `7`: 700} {
+		var m Money
+		if err := m.UnmarshalJSON([]byte(in)); err != nil || m != want {
+			t.Errorf("%s: got %d, %v; want %d", in, m, err, want)
+		}
+	}
+	for _, in := range []string{`1.`, `"1.-5"`, `1.234`, `"abc"`, `1e3`, `""`, `1.5x`, `184467440737095516.16`, `-92233720368547758.08`} {
+		var m Money
+		if err := m.UnmarshalJSON([]byte(in)); err == nil {
+			t.Errorf("%s: bound %d, want an error", in, m)
+		}
+	}
+}

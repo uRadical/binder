@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -40,13 +41,22 @@ type Money int64
 // from a form post too.
 func (m *Money) UnmarshalJSON(b []byte) error {
 	text := strings.Trim(string(b), `"`)
-	whole, frac, _ := strings.Cut(text, ".")
+	whole, frac, hasPoint := strings.Cut(text, ".")
 	if len(frac) > 2 {
 		return fmt.Errorf("%s has more than two decimal places", text)
+	}
+	// "1." and "1.-5" are not amounts: a point needs digits after it, and
+	// only digits.
+	if hasPoint && (frac == "" || strings.Trim(frac, "0123456789") != "") {
+		return fmt.Errorf("%s is not an amount", text)
 	}
 	pounds, err := strconv.ParseInt(whole, 10, 64)
 	if err != nil {
 		return fmt.Errorf("%s is not an amount", text)
+	}
+	// Pence must fit in an int64 too, or the amount would wrap.
+	if pounds > math.MaxInt64/100-1 || pounds < math.MinInt64/100+1 {
+		return fmt.Errorf("%s is too large an amount", text)
 	}
 	pence := int64(0)
 	if frac != "" {
@@ -214,8 +224,8 @@ type UpdateUserRequest struct {
 	ID    int    `path:"id"`
 	Name  string `body:"name,omitempty"`
 	Email string `body:"email,omitempty"`
-	// No omitempty: it would skip a JSON false as empty. The pointer alone
-	// tells "not sent" (nil) from false.
+	// A pointer, so "not sent" (nil) is told from false. (omitempty has no
+	// effect on a pointer, so it is left off.)
 	Active *bool    `body:"active"`
 	Tags   []string `body:"tags,omitempty"`
 }

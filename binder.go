@@ -21,6 +21,7 @@ package binder
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -41,6 +43,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Tag constants
@@ -224,6 +227,15 @@ func bindKeySource(source string) string {
 	return source
 }
 
+// fieldAt is fieldByIndex for the common case of a field on the struct itself,
+// small enough to inline where every field of every request passes through.
+func fieldAt(v reflect.Value, index []int) reflect.Value {
+	if len(index) == 1 {
+		return v.Field(index[0])
+	}
+	return fieldByIndex(v, index)
+}
+
 // fieldByIndex returns the field at index, allocating any nil embedded pointer
 // on the way to it, as encoding/json does when it sets a promoted field. It is
 // called only once a field has a value to set, not for an absent one or a
@@ -307,6 +319,8 @@ type fieldInfo struct {
 	// JSON is set when the field's type decodes itself from JSON, so a body
 	// member can be handed to it as the raw bytes the client sent.
 	JSON bool
+	// Plan is how a JSON body member decodes into the field, resolved once.
+	Plan *decodePlan
 	// HeaderKey is TagName in canonical form, for a header field. Resolving
 	// it once lets r.Header be indexed directly, where Header.Get
 	// canonicalises the name, allocating, on every request.
@@ -370,6 +384,9 @@ type typeInfo struct {
 	// bodyFields indexes fields by the body member they bind, so a token walk
 	// can find the destination without a second pass.
 	bodyFields map[string]int
+	// invalid is why the type cannot be bound at all, such as a field whose
+	// type is a pointer to itself; nil for a type that can.
+	invalid error
 	// validatePath is the path to the embedded struct a Validate method is
 	// promoted from, when the type does not declare its own; nil otherwise.
 	validatePath []int
@@ -410,8 +427,7 @@ type Validator interface {
 
 // DefaultMaxBodySize is the largest request body, in bytes, that Bind reads,
 // and the limit BindWithOptions applies when BindOptions.MaxBodySize is zero.
-// A larger body is rejected with ErrBodyTooLarge rather than buffered, so that
-// a single request cannot exhaust server memory.
+// A larger body is rejected with ErrBodyTooLarge rather than buffered.
 const DefaultMaxBodySize int64 = 10 << 20 // 10 MB
 
 // ErrBodyTooLarge is returned when a request body exceeds the body size limit.
@@ -434,13 +450,16 @@ var ErrBodyTooLarge = errors.New("request body too large")
 //
 // A body whose Content-Type is none of JSON, form-encoded or multipart is not
 // parsed at all and so is never malformed; such a request binds from its path,
-// query, header and cookie values alone.
+// query, header and cookie values alone. When a field binds from the body, the
+// body is still read, within the size limit.
 var ErrMalformedBody = errors.New("malformed request body")
 
 // ErrInvalidTarget is returned by Bind when the destination is not a non-nil
-// pointer to a struct, or the request is nil. Unlike ErrBodyTooLarge and ErrMalformedBody it reports
-// a programming error rather than a bad request, so a handler that sees it
-// should answer http.StatusInternalServerError rather than blaming the client.
+// pointer to a struct, the request is nil, or the target has a field that
+// cannot be bound, such as one whose type is a pointer to itself. Unlike
+// ErrBodyTooLarge and ErrMalformedBody it reports a programming error rather
+// than a bad request, so a handler that sees it should answer
+// http.StatusInternalServerError rather than blaming the client.
 var ErrInvalidTarget = errors.New("invalid bind target")
 
 // ErrMissingRequired is returned by Bind when a field tagged with the
@@ -458,8 +477,9 @@ var ErrUnknownField = errors.New("unknown field in request body")
 // fault alongside the field, so a handler can say which part of the request to
 // fix rather than only that something failed.
 //
-// Key client-facing output on Name, the key the client sent, which is always
-// set. Field is the Go-side name, for logs and debugging, and is empty for an
+// Key client-facing output on Name, the key the client sent, which is set for
+// every failure but an unknown body member whose name was itself empty. Field
+// is the Go-side name, for logs and debugging, and is empty for an
 // unknown body member, since no field binds it.
 //
 //	var errs binder.BindErrors
@@ -482,14 +502,26 @@ type BindError struct {
 	// but an unknown body member whose name was itself empty.
 	Name string
 
-	// Message is a complete description for logs. Its wording is not part of
-	// the compatibility promise and may change in any release.
+	// Message is a description for logs, quoting at most 256 bytes of the
+	// value that failed. Its wording is not part of the compatibility promise
+	// and may change in any release.
 	Message string
 
 	// Err is the underlying cause, reachable with errors.Is and errors.As:
 	// ErrMissingRequired for a missing required value, ErrUnknownField for an
 	// unknown body member, and otherwise the conversion error.
 	Err error
+
+	// outer collects the path above Field and Name as a
+	// failure is passed up through nested values, nearest first. Joining
+	// them once, in finish, keeps a deep failure's cost linear in its depth:
+	// rebuilding the path strings at every level would cost its square.
+	outer       []pathPart
+	leafIndex   bool // Field and Name are themselves an index, such as [2]
+	nested      bool // placed beneath a parent, so finish has work to do
+	autoMessage bool // Message is worded in finish from the path and cause
+	elided      bool // outer lost parts to maxPathSegments
+	counted     bool // charged to the bind's failure budget
 }
 
 func (e *BindError) Error() string {
@@ -567,8 +599,8 @@ func (o BindOptions) maxBodySize() int64 {
 // so a later handler can read it again.
 //
 // Returns an error if:
-//   - The target is not a non-nil pointer to a struct, or the request is nil
-//     (see ErrInvalidTarget)
+//   - The target is not a non-nil pointer to a struct, the request is nil, or
+//     the target has a field that cannot be bound (see ErrInvalidTarget)
 //   - Type conversion fails
 //   - Required fields are missing
 //   - The request body exceeds DefaultMaxBodySize (see ErrBodyTooLarge)
@@ -604,13 +636,8 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 	// Resolve the type once: binding, the body key set and the unknown-field
 	// check all draw on it, and each lookup takes the cache lock.
 	info := typeInfoFor(typ)
-
-	// Decoding only the body members some field binds is faster, but the
-	// unknown-field check needs to see the ones nothing binds, so that option
-	// decodes everything.
-	var wanted map[string]struct{}
-	if !opts.DisallowUnknownFields {
-		wanted = info.bodyKeys
+	if info.invalid != nil {
+		return info.invalid
 	}
 
 	// A field that fails is recorded and binding moves on, so a client sees
@@ -637,7 +664,7 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 	var bodyData map[string]any
 	var unknown []string
 	if len(info.bodyKeys) > 0 || opts.DisallowUnknownFields {
-		bodyData, unknown, err = parseRequestBody(r, opts.maxBodySize(), wanted, info, val, opts.DisallowUnknownFields, bound, &errs)
+		bodyData, unknown, err = parseRequestBody(r, opts.maxBodySize(), info, val, opts.DisallowUnknownFields, bound, &errs)
 		if err != nil {
 			return err
 		}
@@ -665,7 +692,11 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 // BindErrors is the error Bind returns when any field fails to bind, whether
 // one or several: every field is attempted, so a client can correct all of its
 // input in one round trip. Entries are in the order the struct declares its
-// fields, followed by any unknown body members.
+// fields, followed by any unknown body members, and at most 100 of them. Once
+// that many are recorded in a JSON body, binding stops converting values and
+// only checks that the rest of the body is well-formed. A JSON member sent
+// twice binds its last occurrence (a struct merges them, as in encoding/json),
+// but an earlier occurrence's failure stands.
 //
 //	var errs binder.BindErrors
 //	if errors.As(err, &errs) {
@@ -714,6 +745,11 @@ type fieldErrs struct {
 	unknown []*BindError
 }
 
+// failed reports whether a field has already recorded a failure.
+func (e *fieldErrs) failed(index int) bool {
+	return e.byField != nil && len(e.byField[index]) > 0
+}
+
 func (e *fieldErrs) set(info *typeInfo, index int, errs []*BindError) {
 	if e.byField == nil {
 		e.byField = make([][]*BindError, len(info.fields))
@@ -732,8 +768,24 @@ func (e *fieldErrs) list() error {
 	if len(all) == 0 {
 		return nil
 	}
+	if len(all) > maxFailures {
+		all = all[:maxFailures]
+	}
+	for _, e := range all {
+		e.finish()
+	}
 	return all
 }
+
+// maxFailures is the most failures one Bind reports. Past it, values are no
+// longer converted, so rejecting a body of a million bad values costs about
+// what reading it does.
+const maxFailures = 100
+
+// maxPointerDepth bounds a walk through pointer types. Deeper chains than
+// this are not written by hand; the bound keeps a type such as type P *P,
+// which binding refuses, from looping forever wherever it is inspected.
+const maxPointerDepth = 32
 
 // validate runs the target's Validator, if it has one.
 func validate(ctx context.Context, i any, val reflect.Value, promotedFrom []int) error {
@@ -754,10 +806,14 @@ func validate(ctx context.Context, i any, val reflect.Value, promotedFrom []int)
 }
 
 // throughNilPointer reports whether the path from val to an embedded field
-// passes through a nil pointer, the field itself included.
+// passes through a nil pointer, the field itself included, or ends at a nil
+// embedded interface.
 func throughNilPointer(val reflect.Value, index []int) bool {
 	for _, x := range index {
 		val = val.Field(x)
+		if val.Kind() == reflect.Interface {
+			return val.IsNil()
+		}
 		if val.Kind() == reflect.Ptr {
 			if val.IsNil() {
 				return true
@@ -784,12 +840,23 @@ func promotedValidatePath(typ reflect.Type) []int {
 		typ   reflect.Type
 		index []int
 	}
+	// A struct reached twice, as through embedded pointers that refer to
+	// each other, is searched once rather than forever.
+	visited := map[reflect.Type]bool{typ: true}
 	for current := []level{{typ: typ}}; len(current) > 0; {
 		var next []level
 		for _, l := range current {
 			for i := 0; i < l.typ.NumField(); i++ {
 				f := l.typ.Field(i)
 				if !f.Anonymous {
+					continue
+				}
+				// An embedded interface that includes Validate supplies it
+				// through whatever value the interface holds, or nil.
+				if f.Type.Kind() == reflect.Interface {
+					if f.Type.Implements(validatorType) {
+						return append(slices.Clip(l.index), i)
+					}
 					continue
 				}
 				t := f.Type
@@ -803,7 +870,10 @@ func promotedValidatePath(typ reflect.Type) []int {
 				if declaresMethod(t, "Validate") {
 					return index
 				}
-				next = append(next, level{typ: t, index: index})
+				if !visited[t] {
+					visited[t] = true
+					next = append(next, level{typ: t, index: index})
+				}
 			}
 		}
 		current = next
@@ -863,11 +933,11 @@ func targetStruct(i any) (reflect.Type, reflect.Value, error) {
 // parseRequestBody reads and parses the request body, restoring it for other
 // readers.
 //
-// A JSON body is bound straight into the target, which returns a nil map, the set of fields it filled and, when wantUnknown is
-// set, the members nothing binds; a field it could not fill is recorded in
-// errs. Every other format returns the map that binding reads from, and a nil
-// set.
-func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]struct{}, info *typeInfo, val reflect.Value, wantUnknown bool, bound []bool, errs *fieldErrs) (map[string]any, []string, error) {
+// A JSON body is bound straight into the target: it marks in bound the fields
+// it filled, records in errs those it could not, and returns a nil map and,
+// when wantUnknown is set, the members nothing binds. Every other format
+// returns the map that binding reads from.
+func parseRequestBody(r *http.Request, maxBodySize int64, info *typeInfo, val reflect.Value, wantUnknown bool, bound []bool, errs *fieldErrs) (map[string]any, []string, error) {
 	// Content-Length is not consulted here: a chunked request declares no
 	// length at all, so skipping on a non-positive Content-Length would drop
 	// its body entirely. Whether a body is empty is decided after reading.
@@ -900,11 +970,11 @@ func parseRequestBody(r *http.Request, maxBodySize int64, wanted map[string]stru
 	if isJSONContentType(parseContentType(r.Header.Get("Content-Type"))) {
 		// A failure to convert one member concerns that field and is
 		// recorded in errs; only a failure to read the body is returned.
-		bodyData, unknown, err := jsonBodyInto(bodyBytes, info, val, wanted, wantUnknown, bound, errs)
+		unknown, err := jsonBodyInto(bodyBytes, info, val, wantUnknown, bound, errs)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: invalid JSON: %w", ErrMalformedBody, err)
 		}
-		return bodyData, unknown, nil
+		return nil, unknown, nil
 	}
 
 	// Parse the body. A body that cannot be parsed is reported rather than
@@ -946,7 +1016,8 @@ const maxPresize = 64 << 10
 // can put them back.
 //
 // It reads into one buffer rather than using io.ReadAll over io.LimitReader:
-// that saves the LimitReader, and a buffer sized from Content-Length, where
+// that saves the LimitReader, and a buffer sized from Content-Length, up to
+// maxPresize, where
 // one is declared within the limit, is a single allocation of the right size
 // rather than 512 bytes grown by doubling. An understated length only means
 // the buffer grows; it cannot get past the limit.
@@ -969,7 +1040,15 @@ func readBody(r *http.Request, limit int64) ([]byte, error) {
 
 	for {
 		if len(buf) == cap(buf) {
-			buf = append(buf, 0)[:len(buf)] // grow, as io.ReadAll does
+			// Double rather than grow as append would, by a quarter at
+			// this size, so a large body allocates about twice its size in
+			// all rather than five times, and never past the limit.
+			grown := 2 * cap(buf)
+			// Compared without adding to limit, which may be MaxInt64.
+			if limit > 0 && int64(grown)-1 > limit {
+				grown = int(limit + 1)
+			}
+			buf = append(make([]byte, 0, grown), buf...)
 		}
 		// Read at most one byte past the limit, which is enough to tell an
 		// oversized body from one exactly at the limit.
@@ -1002,29 +1081,39 @@ func unknownKeys(info *typeInfo, bodyData map[string]any) []string {
 		if _, found := info.bodyKeys[name]; found {
 			continue
 		}
-		// A form field such as meta[a] belongs to a map field named meta.
-		if i := strings.IndexByte(name, '['); i > 0 {
-			if _, found := info.bodyMaps[name[:i]]; found {
-				if _, ok := bracketKey(name, name[:i]); ok {
-					continue
-				}
-			}
+		// A form field such as meta[a] belongs to a map field named meta,
+		// whatever the map's own name holds, brackets included.
+		if belongsToMap(info, name) {
+			continue
 		}
 		unknown = append(unknown, name)
 	}
 	return unknown
 }
 
-// unknownFieldErrors reports each body key that no field of the target binds,
-// sorted so the result does not vary with map iteration or member order.
+// belongsToMap reports whether a form key such as meta[a] is an entry of one
+// of the target's map fields.
+func belongsToMap(info *typeInfo, key string) bool {
+	for mapName := range info.bodyMaps {
+		if _, ok := bracketKey(key, mapName); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// unknownFieldErrors reports body keys that no field of the target binds,
+// sorted, and at most maxFailures of them: from a JSON body, the first that
+// many in the order they were sent.
 func unknownFieldErrors(unknown []string) []*BindError {
 	slices.Sort(unknown)
+	unknown = unknown[:min(len(unknown), maxFailures)]
 	errs := make([]*BindError, len(unknown))
 	for i, name := range unknown {
 		errs[i] = &BindError{
 			Source:  body,
 			Name:    name,
-			Message: fmt.Sprintf("unknown field %q in request body", name),
+			Message: fmt.Sprintf("unknown field %q in request body", shortKey(name)),
 			Err:     ErrUnknownField,
 		}
 	}
@@ -1141,7 +1230,7 @@ func (q *queryCache) group(name string) map[string]any {
 }
 
 // groupFormValues gathers a form body's name[key]=value fields into a map, as
-// group does for a query. File parts are not text, and are left out.
+// group does for a query, file parts included.
 func groupFormValues(bodyData map[string]any, name string) map[string]any {
 	var out map[string]any
 	for key, v := range bodyData {
@@ -1156,6 +1245,13 @@ func groupFormValues(bodyData map[string]any, name string) map[string]any {
 			for _, s := range v {
 				out = addGrouped(out, sub, s)
 			}
+		default:
+			// A file part: bound into a map of files, and refused by any
+			// other, rather than dropped.
+			if out == nil {
+				out = make(map[string]any)
+			}
+			out[sub] = v
 		}
 	}
 	return out
@@ -1224,7 +1320,12 @@ func nextQueryValue(query, name string) (value, rest string, ok bool) {
 // bindStructFields processes each bindable field in the struct and binds data
 // from the request, recording in errs each field that fails.
 func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyData map[string]any, bound []bool, errs *fieldErrs) {
-	queries := queryCache{url: r.URL}
+	// A request built by hand may have no URL; it has no query either.
+	u := r.URL
+	if u == nil {
+		u = &url.URL{}
+	}
+	queries := queryCache{url: u}
 
 	for index, fi := range info.fields {
 		// A body field the JSON walk already filled needs nothing further.
@@ -1246,7 +1347,7 @@ func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyDa
 			if fi.OmitEmpty && s == "" {
 				continue
 			}
-			if err := setFromString(fieldByIndex(val, fi.Index), s, fi); err != nil {
+			if err := setFromString(fieldAt(val, fi.Index), s, fi); err != nil {
 				errs.set(info, index, fieldFailures(fi, err))
 			}
 			continue
@@ -1274,7 +1375,7 @@ func bindStructFields(r *http.Request, info *typeInfo, val reflect.Value, bodyDa
 		}
 
 		// Set the field value
-		if err := bindFieldValue(fieldByIndex(val, fi.Index), value); err != nil {
+		if err := bindFieldValue(fieldAt(val, fi.Index), value); err != nil {
 			errs.set(info, index, fieldFailures(fi, err))
 		}
 	}
@@ -1459,13 +1560,13 @@ func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]any, q
 		return vs, anyNonEmpty(vs), nil
 
 	case body, jjson:
-		v, exists := bodyData[fi.TagName]
-		// A form body spells a map as name[key]=value pairs, as a query does.
-		if !exists && fi.IsMap {
-			if m := groupFormValues(bodyData, fi.TagName); len(m) > 0 {
-				return m, true, nil
-			}
+		// A form body spells a map as name[key]=value pairs, as a query does;
+		// a plain name=value has no key, and is ignored, as in a query.
+		if fi.IsMap {
+			m := groupFormValues(bodyData, fi.TagName)
+			return m, len(m) > 0, nil
 		}
+		v, exists := bodyData[fi.TagName]
 		return v, exists, nil
 
 	case header:
@@ -1531,31 +1632,173 @@ func fieldFailures(fi fieldInfo, err error) []*BindError {
 // nestFailures places failures reported by a nested struct or slice beneath
 // the field holding it, joining their paths to the field's.
 func nestFailures(field, name, source string, inner BindErrors) []*BindError {
-	errs := make([]*BindError, len(inner))
-	for i, e := range inner {
-		errs[i] = newBindError(joinPath(field, e.Field), source, joinPath(name, e.Name), e.Err)
-	}
-	return errs
+	return nestFailuresAs(pathPart{field: field, name: name}, source, inner)
 }
 
-// joinPath appends a nested path to its parent: a field as parent.child, a
-// slice element as parent[i].
-func joinPath(parent, child string) string {
-	if strings.HasPrefix(child, "[") {
-		return parent + child
+// nestIndexFailures places failures beneath a slice index or map key, such as
+// [2] or ["a"].
+func nestIndexFailures(field, name string, inner BindErrors) []*BindError {
+	return nestFailuresAs(pathPart{field: field, name: name, index: true}, "", inner)
+}
+
+func nestFailuresAs(p pathPart, source string, inner BindErrors) []*BindError {
+	// Failures passed up together mostly share their path from here out, so
+	// the part joining a name to its index is built once and shared.
+	var memo foldMemo
+	for _, e := range inner {
+		e.nest(p, &memo)
+		e.Source = source
 	}
-	return parent + "." + child
+	return inner
+}
+
+// pathPart is one step of a failure's path: a field or key name, or an index
+// such as [2] or ["a"]. Which it is is recorded, not guessed from the text,
+// since a tag name may itself begin with a bracket.
+type pathPart struct {
+	field, name string
+	index       bool
+}
+
+// foldMemo remembers the last part a name and its index were folded into, so
+// failures that share it share one string.
+type foldMemo struct {
+	index, field, name string
+	ok                 bool
+}
+
+// maxPathSegments bounds the parts of a failure's path. A deeper one keeps
+// the half nearest the failure and the half nearest the request's top level,
+// with the middle elided, so that a failure thousands of levels down costs no
+// more than one a few levels down.
+const maxPathSegments = 64
+
+// nest adds the next part outward to a failure's path. A name folds in the
+// indexes just inside it, Tags and [2] becoming one part, Tags[2], so that
+// eliding a long path never parts a name from its index. Folding stops at an
+// elided gap, so the gap is never folded over.
+func (e *BindError) nest(p pathPart, memo *foldMemo) {
+	e.nested = true
+	if !p.index {
+		// The failure's own innermost part is an index: fold it in.
+		if len(e.outer) == 0 && e.leafIndex {
+			e.Field, e.Name, e.leafIndex = p.field+e.Field, p.name+e.Name, false
+			return
+		}
+		// Indexes at the outer end, back to the gap if there is one.
+		floor := 0
+		if e.elided {
+			floor = maxPathSegments / 2
+		}
+		j := len(e.outer)
+		for j > floor && e.outer[j-1].index {
+			j--
+		}
+		switch {
+		case j == len(e.outer):
+			// Nothing to fold; appended below.
+		case j == len(e.outer)-1:
+			// The common case, one index: shared across the failures.
+			index := e.outer[j]
+			if !memo.ok || memo.index != index.field {
+				*memo = foldMemo{index: index.field, field: p.field + index.field, name: p.name + index.name, ok: true}
+			}
+			e.outer[j] = pathPart{field: memo.field, name: memo.name}
+			return
+		default:
+			var f, n strings.Builder
+			f.WriteString(p.field)
+			n.WriteString(p.name)
+			for i := len(e.outer) - 1; i >= j; i-- {
+				f.WriteString(e.outer[i].field)
+				n.WriteString(e.outer[i].name)
+			}
+			e.outer = append(e.outer[:j], pathPart{field: f.String(), name: n.String()})
+			return
+		}
+	}
+	// The failure's own part counts, so the path has at most
+	// maxPathSegments parts before it is elided.
+	if len(e.outer) == maxPathSegments-1 {
+		// Drop the innermost part of the outer half: the outer half then
+		// keeps the parts nearest the top, and the inner half those nearest
+		// the failure.
+		const keep = maxPathSegments / 2
+		e.outer = append(e.outer[:keep], e.outer[keep+1:]...)
+		e.elided = true
+	}
+	e.outer = append(e.outer, p)
+}
+
+// finish joins a failure's collected path into Field and Name, and words its
+// Message for the full path.
+func (e *BindError) finish() {
+	if e.nested {
+		e.Field = e.joinPath(func(p pathPart) string { return p.field }, e.Field)
+		e.Name = e.joinPath(func(p pathPart) string { return p.name }, e.Name)
+		e.outer, e.nested = nil, false
+		if errors.Is(e.Err, ErrMissingRequired) {
+			e.Message = fmt.Sprintf("missing required field %s: no %s value named %q", e.Field, e.Source, e.Name)
+			return
+		}
+	}
+	// The cause's text often quotes the client's value, which may be long;
+	// the message quotes at most maxMessageValue bytes of it.
+	if e.autoMessage {
+		e.Message = "error setting field " + e.Field + ": " + clipText(e.Err.Error(), maxMessageValue)
+		e.autoMessage = false
+	}
+}
+
+// maxMessageValue is the most of a cause's text a failure's Message repeats.
+// Err keeps the cause whole for code that needs it.
+const maxMessageValue = 256
+
+// clipText is s, or its first n bytes on a character boundary and "…".
+func clipText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	// Back up at most to the start of one character, UTF-8's longest being
+	// four bytes; text that is not UTF-8 is cut where it is.
+	for i := 0; i < utf8.UTFMax-1 && n > 0 && !utf8.RuneStart(s[n]); i++ {
+		n--
+	}
+	return s[:n] + "…"
+}
+
+// joinPath joins the collected parts, outermost first, onto the failure's own
+// part: a name after a dot, an index directly, and "…" where parts were elided.
+func (e *BindError) joinPath(text func(pathPart) string, leaf string) string {
+	var b strings.Builder
+	write := func(s string, index bool) {
+		if b.Len() > 0 && !index {
+			b.WriteByte('.')
+		}
+		b.WriteString(s)
+	}
+	for i := len(e.outer) - 1; i >= 0; i-- {
+		write(text(e.outer[i]), e.outer[i].index)
+		if e.elided && i == maxPathSegments/2 {
+			write("…", false)
+		}
+	}
+	write(leaf, e.leafIndex)
+	return b.String()
 }
 
 // newBindError builds the BindError for a value that could not be set.
+// newIndexBindError reports a failure of one element or entry, named by its
+// index or key, such as [2] or ["a"].
+func newIndexBindError(field, name string, err error) *BindError {
+	e := newBindError(field, "", name, err)
+	e.leafIndex = true
+	return e
+}
+
 func newBindError(field, source, name string, err error) *BindError {
-	return &BindError{
-		Field:   field,
-		Source:  source,
-		Name:    name,
-		Message: fmt.Sprintf("error setting field %s: %v", field, err),
-		Err:     err,
-	}
+	// Message is worded once, in finish, when the whole path is known.
+	return &BindError{Field: field, Source: source, Name: name, Err: err, autoMessage: true}
 }
 
 // getFieldInfo returns the binding tags of a struct type, resolving them on
@@ -1606,10 +1849,11 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 			TagName:   name,
 			OmitEmpty: omitsEmpty(field.Type, opts),
 			Required:  hasOption(opts, optRequired),
-			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType),
+			IsSlice:   fieldType.Kind() == reflect.Slice && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType) && !isByteSlice(fieldType),
 			IsMap:     fieldType.Kind() == reflect.Map && !isTextUnmarshaler(fieldType) && !unmarshalsJSON(fieldType),
 			Fast:      fastKindOf(field.Type),
 			JSON:      unmarshalsJSON(field.Type),
+			Plan:      planFor(field.Type),
 			HeaderKey: headerKey,
 		})
 	}
@@ -1633,7 +1877,19 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 		}
 	}
 
-	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields, bodyMaps: maps, validatePath: promotedValidatePath(typ)}
+	cached = &typeInfo{fields: info, bodyKeys: keys, bodyFields: fields, bodyMaps: maps}
+	seen := make(map[reflect.Type]bool)
+	var cycle reflect.Type
+	for _, fi := range info {
+		if cycle = pointerCycle(fi.FieldType.Type, seen); cycle != nil {
+			break
+		}
+	}
+	if cycle != nil {
+		cached.invalid = fmt.Errorf("%w: %s reaches %s, a pointer type that points to itself", ErrInvalidTarget, typ, cycle)
+	} else {
+		cached.validatePath = promotedValidatePath(typ)
+	}
 	fieldCache[typ] = cached
 	return cached
 }
@@ -1644,6 +1900,44 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 // pointer exists to carry.
 func omitsEmpty(t reflect.Type, opts string) bool {
 	return t.Kind() != reflect.Ptr && hasOption(opts, optOmitEmpty)
+}
+
+// pointerCycle returns a type reachable from t, through the fields that bind,
+// elements, keys and pointers, that is a pointer to itself through pointers alone, such
+// as type P *P, or nil when there is none. Binding such a field would
+// allocate pointer after pointer without end.
+func pointerCycle(t reflect.Type, seen map[reflect.Type]bool) reflect.Type {
+	if seen[t] {
+		return nil
+	}
+	seen[t] = true
+	switch t.Kind() {
+	case reflect.Ptr:
+		chain := make(map[reflect.Type]bool)
+		for u := t; u.Kind() == reflect.Ptr; u = u.Elem() {
+			if chain[u] {
+				return t
+			}
+			chain[u] = true
+		}
+		return pointerCycle(t.Elem(), seen)
+	case reflect.Slice, reflect.Array:
+		return pointerCycle(t.Elem(), seen)
+	case reflect.Map:
+		if p := pointerCycle(t.Key(), seen); p != nil {
+			return p
+		}
+		return pointerCycle(t.Elem(), seen)
+	case reflect.Struct:
+		// Only the fields a nested value binds, as the top level's are
+		// only those that bind.
+		for _, tf := range nestedFieldsFor(t) {
+			if p := pointerCycle(tf.field.Type, seen); p != nil {
+				return p
+			}
+		}
+	}
+	return nil
 }
 
 // isTextUnmarshaler reports whether a type, or a pointer to it, unmarshals
@@ -1669,55 +1963,6 @@ func nestedFieldsFor(typ reflect.Type) []taggedField {
 	fields := taggedFields(typ, nestedSources)
 	nestedFieldCache.Store(typ, fields)
 	return fields
-}
-
-// bindNestedFields binds map data into a struct's fields, matching each on its
-// body tag or the json alias. It is the struct case of setField.
-//
-// Every field is attempted, and the failures are returned as BindErrors whose
-// paths are relative to target.
-func bindNestedFields(target reflect.Value, data map[string]any) error {
-	var errs BindErrors
-	for _, tf := range nestedFieldsFor(target.Type()) {
-		name, opts := tf.name, tf.opts
-
-		// required and omitempty mean inside a nested struct what they mean
-		// at the top level.
-		nestedValue, ok := data[name]
-		if !ok {
-			if hasOption(opts, optRequired) {
-				errs = append(errs, &BindError{
-					Field:   tf.goName,
-					Source:  body,
-					Name:    name,
-					Message: fmt.Sprintf("missing required field %s: no %s value named %q", tf.goName, body, name),
-					Err:     ErrMissingRequired,
-				})
-			}
-			continue
-		}
-		if omitsEmpty(tf.field.Type, opts) && isEmptyValue(nestedValue) {
-			continue
-		}
-		// A null sets nothing, so it must not allocate an embedded pointer on
-		// the way to its field either.
-		if nestedValue == nil {
-			continue
-		}
-
-		if err := setField(fieldByIndex(target, tf.index), nestedValue); err != nil {
-			var inner BindErrors
-			if errors.As(err, &inner) {
-				errs = append(errs, nestFailures(tf.goName, name, body, inner)...)
-			} else {
-				errs = append(errs, newBindError(tf.goName, body, name, err))
-			}
-		}
-	}
-	if len(errs) == 0 {
-		return nil
-	}
-	return errs
 }
 
 // parseContentType extracts the content type from the Content-Type header
@@ -1827,6 +2072,10 @@ func parseMultipartBody(contentType string, bodyBytes []byte) (map[string]any, e
 		}
 	}
 	for name, files := range form.File {
+		// A name sent as both text and a file has no one value to bind.
+		if _, both := form.Value[name]; both {
+			return nil, fmt.Errorf("form field %q is sent as both text and a file", shortKey(name))
+		}
 		if len(files) == 1 {
 			reqBody[name] = files[0]
 		} else {
@@ -1950,9 +2199,9 @@ func unmarshalsJSON(t reflect.Type) bool {
 	return found
 }
 
-// unmarshalJSONValue hands a decoded value to a type's own JSON decoding. A
-// value inside a nested struct, slice or map was decoded on the way in, so it
-// is encoded again first; numbers are json.Number and keep their digits.
+// unmarshalJSONValue hands a value that did not arrive as raw JSON, such as
+// query or form text, to a type's own JSON decoding, encoding it as JSON
+// first. A JSON body value never comes here: it is handed over as sent.
 func unmarshalJSONValue(field reflect.Value, value any) error {
 	// An Encoder, unlike Marshal, can leave <, > and & as they were sent.
 	var buf bytes.Buffer
@@ -1975,14 +2224,35 @@ func unmarshalJSONRaw(field reflect.Value, raw []byte) error {
 	return jsonv2.Unmarshal(raw, field.Addr().Interface(), decodeOptions)
 }
 
+// wrapsFinitely reports whether a single value can be wrapped as a list of
+// one, a list of one list of one, and so on, until an element takes it: true
+// for []string or [][]int, false for a recursive type such as type P []P,
+// which would wrap it forever.
+func wrapsFinitely(t reflect.Type) bool {
+	seen := make(map[reflect.Type]bool)
+	for {
+		for i := 0; t.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
+			t = t.Elem()
+		}
+		if takesOneValue(t) {
+			return true
+		}
+		if seen[t] {
+			return false
+		}
+		seen[t] = true
+		t = t.Elem()
+	}
+}
+
 // takesOneValue reports whether a destination binds a single value rather than
 // one per element: anything but a slice, or a slice that unmarshals itself from
 // text. A pointer is judged by what it points to.
 func takesOneValue(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
+	for i := 0; t.Kind() == reflect.Ptr && i < maxPointerDepth; i++ {
 		t = t.Elem()
 	}
-	return t.Kind() != reflect.Slice || isTextUnmarshaler(t) || unmarshalsJSON(t)
+	return t.Kind() != reflect.Slice || isTextUnmarshaler(t) || unmarshalsJSON(t) || isByteSlice(t)
 }
 
 // tryTextUnmarshaler attempts to use TextUnmarshaler interface if implemented
@@ -2113,18 +2383,10 @@ func toString(value any) (string, error) {
 	case []any, map[string]any:
 		// A JSON array or object has no single text to take, and formatting
 		// one with %v would bind Go syntax such as "[a b]".
-		return "", fmt.Errorf("cannot convert a JSON %s to string", jsonCompositeName(v))
+		return "", errors.New("cannot bind a JSON array or object to a string")
 	default:
 		return fmt.Sprintf("%v", v), nil
 	}
-}
-
-// jsonCompositeName names a decoded JSON array or object for an error message.
-func jsonCompositeName(v any) string {
-	if _, ok := v.([]any); ok {
-		return "array"
-	}
-	return "object"
 }
 
 // durationType is time.Duration, which binds from text such as "5s".
@@ -2174,6 +2436,11 @@ func setIntFromFloat(field reflect.Value, f float64) error {
 	if math.IsNaN(f) || f < math.MinInt64 || f >= math.MaxInt64 {
 		return fmt.Errorf("%v overflows %s", f, field.Type())
 	}
+	// 1e3 and 2.0 are whole numbers written another way; 1.9 is not, and
+	// truncating it would bind a value the client did not send.
+	if f != math.Trunc(f) {
+		return fmt.Errorf("%v is not a whole number for %s", f, field.Type())
+	}
 	return setIntChecked(field, int64(f))
 }
 
@@ -2185,6 +2452,9 @@ func setUintFromFloat(field reflect.Value, f float64) error {
 	}
 	if math.IsNaN(f) || f >= math.MaxUint64 {
 		return fmt.Errorf("%v overflows %s", f, field.Type())
+	}
+	if f != math.Trunc(f) {
+		return fmt.Errorf("%v is not a whole number for %s", f, field.Type())
 	}
 	return setUintChecked(field, uint64(f))
 }
@@ -2334,6 +2604,13 @@ func setFloat(field reflect.Value, value any) error {
 
 // setSlice sets a slice value to a field
 func setSlice(field reflect.Value, value any) error {
+	// Text into a []byte is its bytes. (A JSON string is base64 instead, and
+	// is decoded before it reaches here.)
+	if text, ok := value.(string); ok && isByteSlice(field.Type()) {
+		field.SetBytes([]byte(text))
+		return nil
+	}
+
 	// Repeated form fields, query parameters and headers arrive as []string.
 	// Widening them here lets one loop below cover every multi-valued source.
 	if strs, ok := value.([]string); ok {
@@ -2362,9 +2639,14 @@ func setSlice(field reflect.Value, value any) error {
 				index := fmt.Sprintf("[%d]", i)
 				var inner BindErrors
 				if errors.As(err, &inner) {
-					errs = append(errs, nestFailures(index, index, "", inner)...)
+					errs = append(errs, nestIndexFailures(index, index, inner)...)
 				} else {
-					errs = append(errs, newBindError(index, "", index, err))
+					errs = append(errs, newIndexBindError(index, index, err))
+				}
+				// Once maxFailures elements have failed, the rest need not
+				// be converted: the bind has failed.
+				if len(errs) >= maxFailures {
+					break
 				}
 			}
 		}
@@ -2377,19 +2659,28 @@ func setSlice(field reflect.Value, value any) error {
 
 	// A single value, such as a form field sent once or a JSON scalar, binds
 	// as a one-element slice. An object does not: it is not a list of one.
+	// A list of lists takes it as a list of one list of one, but a
+	// recursive type such as type P []P would wrap it forever, so it is
+	// refused.
 	if _, isObject := value.(map[string]any); !isObject {
+		if !wrapsFinitely(field.Type()) {
+			return fmt.Errorf("cannot bind a single %T to the recursive type %s", value, field.Type())
+		}
 		return setSlice(field, []any{value})
 	}
 
 	return fmt.Errorf("cannot convert %T to slice", value)
 }
 
-// setMap fills a map from a JSON object. Each key is converted to the map's
-// key type, which may be a string, an integer or a TextUnmarshaler, and each
+// setMap fills a map from the name[key]=value pairs of a query or form, or a
+// map-shaped value that did not come from a JSON object, which is decoded
+// token by token in decodeObjectIntoMap instead. Each key is converted to the map's
+// key type, any type that converts from text, and each
 // value as a field of the element type would be. The map is replaced rather
-// than merged into, as a slice is. Every entry is attempted, and the failures
-// are returned as BindErrors named by key: Meta["a"] and meta[a], the name a
-// query or form spells it with.
+// than merged into, as a slice is. Every entry is attempted until maxFailures
+// have failed, and the failures
+// are returned as BindErrors named by key, Meta["a"] and meta[a], in key
+// order.
 func setMap(field reflect.Value, value any) error {
 	obj, ok := value.(map[string]any)
 	if !ok {
@@ -2398,47 +2689,172 @@ func setMap(field reflect.Value, value any) error {
 
 	typ := field.Type()
 	m := reflect.MakeMapWithSize(typ, len(obj))
-	var errs BindErrors
-	for k, v := range obj {
+	// Keys are taken in order, so that when two spellings of one key are
+	// both sent, which one binds does not depend on map iteration.
+	keys := slices.Sorted(maps.Keys(obj))
+	var failed map[any]keyFailures
+	count := 0
+	for _, k := range keys {
+		// Once maxFailures entries have failed, the rest need not be
+		// converted: the bind has failed.
+		if count >= maxFailures {
+			break
+		}
 		key := reflect.New(typ.Key()).Elem()
-		field, name := "["+strconv.Quote(k)+"]", "["+k+"]"
-		if err := setField(key, k); err != nil {
-			errs = append(errs, newBindError(field, "", name, fmt.Errorf("invalid key: %w", err)))
+		if err := convertMapKey(key, k); err != nil {
+			count++
+			failed = addKeyFailures(failed, k, k, BindErrors{newIndexBindError(mapKeyField(k), mapKeyName(k), fmt.Errorf("invalid key: %w", err))})
+			continue
+		}
+		// A key whose other spelling already failed keeps that failure, as
+		// in a JSON object: "01" failing is not undone by "1".
+		id := key.Interface()
+		if _, dup := failed[id]; dup {
 			continue
 		}
 		elem := reflect.New(typ.Elem()).Elem()
-		if err := bindFieldValue(elem, v); err != nil {
+		if err := bindFieldValue(elem, obj[k]); err != nil {
 			var inner BindErrors
 			if errors.As(err, &inner) {
-				errs = append(errs, nestFailures(field, name, "", inner)...)
+				count += len(inner)
+				failed = addKeyFailures(failed, id, k, nestIndexFailures(mapKeyField(k), mapKeyName(k), inner))
 			} else {
-				errs = append(errs, newBindError(field, "", name, err))
+				count++
+				failed = addKeyFailures(failed, id, k, BindErrors{newIndexBindError(mapKeyField(k), mapKeyName(k), err)})
 			}
 			continue
 		}
 		m.SetMapIndex(key, elem)
 	}
-	if len(errs) > 0 {
-		// Map order is random; report in key order so the result is stable.
-		slices.SortFunc(errs, func(a, b *BindError) int { return strings.Compare(a.Name, b.Name) })
-		return errs
+	if len(failed) > 0 {
+		return keyOrderedFailures(typ.Key(), failed)
 	}
 	field.Set(m)
 	return nil
 }
 
-// setStruct sets a struct value to a field
-func setStruct(field reflect.Value, value any) error {
-	structMap, ok := value.(map[string]any)
-	if !ok {
-		if reflect.TypeOf(value).Kind() == reflect.Map {
-			// A map of some other key or element type cannot be walked as
-			// decoded JSON would be.
-			return fmt.Errorf("value mismatch for struct mapping")
-		}
-		return fmt.Errorf("cannot set struct field with value of type %T", value)
+// convertMapKey converts text to a map key. A key type whose UnmarshalText
+// leaves an uncomparable value, which no map can hold, is refused rather than
+// left to panic.
+func convertMapKey(key reflect.Value, text string) error {
+	if err := setField(key, text); err != nil {
+		return err
 	}
-	return bindNestedFields(field, structMap)
+	if !key.Comparable() {
+		return fmt.Errorf("%s holds a value that cannot be a map key", key.Type())
+	}
+	return nil
+}
+
+// keyFailures is one map entry's failures, with the key as the client
+// spelled it, which names and orders them.
+type keyFailures struct {
+	raw  string
+	errs BindErrors
+}
+
+// mapKeyField and mapKeyName name a map entry in a failure: Meta["a"] and
+// meta[a]. They are built only for an entry that failed.
+func mapKeyField(k string) string { return "[" + strconv.Quote(shortKey(k)) + "]" }
+func mapKeyName(k string) string  { return "[" + shortKey(k) + "]" }
+
+// maxKeyInPath is the most of a map key a failure's path repeats. A key is
+// the client's text, and every failure beneath it carries it, so a long one
+// is cut rather than repeated in full a hundred times.
+const maxKeyInPath = 64
+
+// shortKey is k, or at most its first maxKeyInPath bytes and "…".
+func shortKey(k string) string { return clipText(k, maxKeyInPath) }
+
+// addKeyFailures records one map entry's failures under id: the converted key,
+// so that two spellings of one key, such as "01" and "1" for an integer key,
+// are one entry, or the raw text of a key that did not convert.
+func addKeyFailures(failed map[any]keyFailures, id any, raw string, errs BindErrors) map[any]keyFailures {
+	if failed == nil {
+		failed = make(map[any]keyFailures)
+	}
+	failed[id] = keyFailures{raw: raw, errs: errs}
+	return failed
+}
+
+// keyOrderedFailures lists map entries' failures in key order, keeping each
+// entry's own failures in the order its fields are declared. For an integer
+// key type, keys written as whole numbers come first, by value, so that 9
+// comes before 10, and any others after them by text; the order is total, so
+// it is the same on every run.
+func keyOrderedFailures(keyType reflect.Type, failed map[any]keyFailures) BindErrors {
+	entries := slices.Collect(maps.Values(failed))
+	numeric := false
+	switch keyType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		numeric = true
+	}
+	slices.SortFunc(entries, func(a, b keyFailures) int {
+		if numeric {
+			xNeg, x, xn := wholeNumber(a.raw)
+			yNeg, y, yn := wholeNumber(b.raw)
+			switch {
+			case xn && yn:
+				if c := compareWhole(xNeg, x, yNeg, y); c != 0 {
+					return c
+				}
+			case xn:
+				return -1
+			case yn:
+				return 1
+			}
+		}
+		return strings.Compare(a.raw, b.raw)
+	})
+	var errs BindErrors
+	for _, e := range entries {
+		errs = append(errs, e.errs...)
+	}
+	return errs
+}
+
+// wholeNumber reports whether s is written as a whole number, an optional
+// sign and digits, returning whether it is negative and its digits without
+// leading zeros, which compare exactly however long they are.
+func wholeNumber(s string) (neg bool, digits string, ok bool) {
+	digits = s
+	if digits != "" && (digits[0] == '-' || digits[0] == '+') {
+		neg, digits = digits[0] == '-', digits[1:]
+	}
+	if digits == "" || strings.Trim(digits, "0123456789") != "" {
+		return false, "", false
+	}
+	digits = strings.TrimLeft(digits, "0")
+	if digits == "" {
+		return false, "0", true // -0 is 0
+	}
+	return neg, digits, true
+}
+
+// compareWhole compares two whole numbers from wholeNumber.
+func compareWhole(aNeg bool, a string, bNeg bool, b string) int {
+	if aNeg != bNeg {
+		if aNeg {
+			return -1
+		}
+		return 1
+	}
+	c := cmp.Compare(len(a), len(b))
+	if c == 0 {
+		c = strings.Compare(a, b)
+	}
+	if aNeg {
+		return -c
+	}
+	return c
+}
+
+// setStruct reports a value that cannot fill a struct field. A JSON object
+// fills one token by token, in decodeObjectIntoStruct, so what reaches here
+// is text, a number, a bool or an array, none of which a struct can take.
+func setStruct(field reflect.Value, value any) error {
+	return fmt.Errorf("cannot set struct field with value of type %T", value)
 }
 
 // isEmptyValue checks if a value is empty or zero

@@ -1,6 +1,7 @@
 package binder
 
 import (
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +57,8 @@ func TestLargeUint64KeepsPrecision(t *testing.T) {
 
 // Numbers written in exponent or decimal form were accepted through float64
 // before and must still be.
+// A whole number written in float form binds to an integer field; a fraction
+// is an error rather than truncated, as it is from a query string.
 func TestNumbersInFloatFormStillBindToInt(t *testing.T) {
 	tests := []struct {
 		json string
@@ -63,7 +66,6 @@ func TestNumbersInFloatFormStillBindToInt(t *testing.T) {
 	}{
 		{"1e5", 100000},
 		{"1.0", 1},
-		{"2.9", 2},
 		{"-1e3", -1000},
 	}
 
@@ -77,6 +79,15 @@ func TestNumbersInFloatFormStillBindToInt(t *testing.T) {
 		if got.N != tt.want {
 			t.Errorf("n %s bound as %d, want %d", tt.json, got.N, tt.want)
 		}
+	}
+	var frac struct {
+		N int  `body:"n"`
+		U uint `body:"u"`
+	}
+	err := Bind(numReq(t, `{"n":2.9,"u":0.5}`), &frac)
+	var errs BindErrors
+	if !errors.As(err, &errs) || len(errs) != 2 || frac.N != 0 || frac.U != 0 {
+		t.Errorf("got %v, N=%d U=%d; want two failures and nothing bound", err, frac.N, frac.U)
 	}
 }
 
