@@ -272,6 +272,16 @@ type ListOrders struct {
   JSON body it is not, since `form:` does not read one.
 - `form:` has its own keys: a `body:"x"` field and a `form:"x"` field both bind.
 
+### Other Frameworks' Tags
+
+Tags binder does not read are left alone, with three exceptions: Gin's
+`binding` and `uri` and Echo's `param`. A field carrying one was meant to bind,
+and binder would leave it unset without a word, so binding refuses the type
+with `ErrInvalidTarget`, naming the field and what to use instead: `path:` for
+`uri:` and `param:`, and the `required` option and a `Validate` method for
+`binding:`. A `validate:` tag is not refused, since a `Validate` method may hand
+it to a validation library.
+
 ## Options
 
 Add `,omitempty` to skip binding if the value is present but empty, leaving
@@ -506,7 +516,7 @@ end binding at once, since nothing bound after them could be trusted:
 |-------|---------|------------------|
 | `ErrMalformedBody` | The body could not be parsed as its `Content-Type` declares | 400 Bad Request |
 | `ErrBodyTooLarge` | The body exceeded the size limit | 413 Content Too Large |
-| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct, the request was nil, or the target has a field that cannot be bound, such as a pointer type that points to itself | 500 Internal Server Error |
+| `ErrInvalidTarget` | The target was not a non-nil pointer to a struct, the request was nil, or the target has a field that cannot be bound, such as a pointer type that points to itself, or one tagged `binding`, `uri` or `param` for another framework | 500 Internal Server Error |
 
 Two further sentinels are carried by individual `BindErrors` entries rather
 than returned alone: `ErrMissingRequired`, for a field tagged `required` that
@@ -552,7 +562,7 @@ figures; it costs more memory than the binding itself.
 | Bind | 747 | 336 | 7 |
 | BindMixed/WithJSON | 752 | 372 | 13 |
 | BindManyQueryParams | 942 | 128 | 1 |
-| BindWithoutCache | 2,232 | 3,462 | 19 |
+| BindWithoutCache | 2,384 | 3,494 | 20 |
 | BindMultipart | 7,876 | 31,657 | 78 |
 
 The one allocation in the path, query, cookie and header benchmarks is the
@@ -564,7 +574,7 @@ parsed before any field can be converted. A form body is parsed into a map
 first, and costs about the same as JSON.
 
 `Bind` against `BindWithoutCache` measures the per-type tag cache: 747 ns and
-7 allocations with it warm, against 2,232 ns and 19 allocations when it is
+7 allocations with it warm, against 2,384 ns and 20 allocations when it is
 cleared before every iteration.
 
 `BindManyQueryParams` binds eight query parameters and `BindNoQueryParams`

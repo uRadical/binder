@@ -14,9 +14,15 @@
 //	err := binder.Bind(r, &req)
 //
 // Path parameters are read with r.PathValue, as set by http.ServeMux patterns.
-// Binder has no dependencies outside the standard library. Once binding
-// succeeds, a target implementing Validator is validated before Bind returns;
-// transformation is left to the caller.
+// A form:"name" tag reads a form body's value, or else the query's, as
+// r.FormValue does. Fields may be slices, maps (from a JSON object or
+// name[key]=value pairs), nested and embedded structs, pointers, and any type
+// implementing encoding.TextUnmarshaler or decoding itself from JSON.
+//
+// Every field that fails is reported at once, as BindErrors naming each
+// input. Binder has no dependencies outside the standard library. Once
+// binding succeeds, a target implementing Validator is validated before Bind
+// returns; transformation is left to the caller.
 package binder
 
 import (
@@ -463,7 +469,9 @@ var ErrMalformedBody = errors.New("malformed request body")
 
 // ErrInvalidTarget is returned by Bind when the destination is not a non-nil
 // pointer to a struct, the request is nil, or the target has a field that
-// cannot be bound, such as one whose type is a pointer to itself. Unlike
+// cannot be bound, such as one whose type is a pointer to itself, or one
+// tagged for another framework's binder (binding, uri or param), which would
+// otherwise be left unset without a word. Unlike
 // ErrBodyTooLarge and ErrMalformedBody it reports a programming error rather
 // than a bad request, so a handler that sees it should answer
 // http.StatusInternalServerError rather than blaming the client.
@@ -1883,7 +1891,7 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 			}
 		}
 	}
-	info.invalid = pointerCycleError(typ, info.fields)
+	info.invalid = cmp.Or(pointerCycleError(typ, info.fields), foreignTagError(typ))
 	if info.invalid == nil {
 		info.validatePath = promotedValidatePath(typ)
 	}
@@ -1914,6 +1922,94 @@ func newFieldInfo(tf taggedField) fieldInfo {
 		fi.HeaderKey = http.CanonicalHeaderKey(tf.name)
 	}
 	return fi
+}
+
+// foreignTags are tags other frameworks bind by, with what binder uses in
+// their place. binder does not read them, so a field carrying one would be
+// left unset without a word; the mistake is reported instead. validate is not
+// among them: a Validate method may hand it to a validation library.
+var foreignTags = [...]struct{ tag, key, use string }{
+	{"binding", "binding:", "the required option, and a Validate method for other rules"},
+	{"uri", "uri:", `path:"%s"`},
+	{"param", "param:", `path:"%s"`},
+}
+
+// foreignTagError reports a field of typ carrying one of foreignTags, or nil.
+// It looks at every field of typ and of the structs it embeds or binds into,
+// through pointers, slices and maps, but not inside a type that decodes
+// itself, whose fields binder never sees.
+func foreignTagError(typ reflect.Type) error {
+	// The target's own fields bind whatever its type, so the walk starts
+	// from them rather than asking whether typ decodes itself.
+	seen := []reflect.Type{typ}
+	found := findForeignFields(typ, &seen)
+	if found == nil {
+		return nil
+	}
+	use := found.use
+	if strings.Contains(use, "%s") {
+		name, _ := splitTag(found.value)
+		use = fmt.Sprintf(use, name)
+	}
+	return fmt.Errorf("%w: %s has the tag %s:%q, which binder does not read; use %s", ErrInvalidTarget, found.path, found.tag, found.value, use)
+}
+
+// foreignTagUse is a field found carrying a foreign tag.
+type foreignTagUse struct {
+	path, tag, value, use string
+}
+
+// findForeignTag is foreignTagError's walk. A field's path is built only for
+// the field it finds, as the walk unwinds, and a field's tags are looked
+// through only when they mention a foreign tag or lead to a struct.
+func findForeignTag(t reflect.Type, seen *[]reflect.Type) *foreignTagUse {
+	t = structBehind(t)
+	if t == nil || slices.Contains(*seen, t) || isTextUnmarshaler(t) || unmarshalsJSON(t) || t == fileHeaderStruct {
+		return nil
+	}
+	*seen = append(*seen, t)
+	return findForeignFields(t, seen)
+}
+
+// findForeignFields looks through the fields of the struct type t.
+func findForeignFields(t reflect.Type, seen *[]reflect.Type) *foreignTagUse {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		for _, ft := range foreignTags {
+			if !strings.Contains(string(f.Tag), ft.key) {
+				continue
+			}
+			if v, ok := f.Tag.Lookup(ft.tag); ok {
+				return &foreignTagUse{path: f.Name, tag: ft.tag, value: v, use: ft.use}
+			}
+		}
+		if structBehind(f.Type) == nil {
+			continue
+		}
+		if _, _, _, binds := fieldTag(f, bindSources[:]); binds || f.Anonymous {
+			if found := findForeignTag(f.Type, seen); found != nil {
+				found.path = f.Name + "." + found.path
+				return found
+			}
+		}
+	}
+	return nil
+}
+
+// structBehind returns the struct type t is, or holds through pointers,
+// slices, arrays and maps, or nil when there is none.
+func structBehind(t reflect.Type) reflect.Type {
+	for i := 0; i < maxPointerDepth; i++ {
+		switch t.Kind() {
+		case reflect.Struct:
+			return t
+		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+			t = t.Elem()
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // pointerCycleError reports a field of typ that reaches a pointer type that

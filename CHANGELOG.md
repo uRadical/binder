@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-01
+
 ### Upgrading
 
 - **`Validator` now takes a context.** Change `Validate() error` to
@@ -75,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is reported and later occurrences are only checked for being well-formed, as
   in `encoding/json`. The body used to be decoded into a map first, so only
   the last occurrence was ever looked at.
+- **Other frameworks' binding tags are refused.** A field tagged `binding`,
+  `uri` or `param`, as Gin and Echo bind by, used to be skipped, leaving it
+  unset. Binding now refuses the type with `ErrInvalidTarget`, naming the
+  field and what to use instead: `path:` for `uri:` and `param:`, and the
+  `required` option and a `Validate` method for `binding:`. `validate:` tags
+  are still left alone.
 - **Nested options apply.** `required` and `omitempty` inside a nested struct
   used to be ignored; they now behave as they do at the top level.
 
@@ -111,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Far fewer allocations.** Against the comparison benchmarks, binding a JSON
   body went from 23 allocations to 8, a query string from 14 to 1, and a
   request using every source from 27 to 6, with memory per request down 79
-  to 90% and time down 23 to 50%. Path, query, header and cookie values are
+  to 90% and time down 22 to 46%. Path, query, header and cookie values are
   now read without parsing the whole query or Cookie header, with differential
   fuzz tests against `net/url` and `net/http` showing the results match.
   A form body is parsed from the bytes already read rather than through
@@ -367,5 +375,7 @@ was reported in the field.
 Initial release. Used internally on client projects rather than published for
 general use.
 
+[Unreleased]: https://github.com/uRadical/binder/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/uRadical/binder/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/uRadical/binder/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/uRadical/binder/releases/tag/v1.0.0

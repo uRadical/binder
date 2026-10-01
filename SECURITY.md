@@ -9,7 +9,8 @@ Reports are welcome.
 
 | Version | Supported |
 |---------|-----------|
-| 1.1.x   | Yes       |
+| 1.2.x   | Yes       |
+| 1.1.x   | No        |
 | 1.0.x   | No        |
 
 Fixes land on the latest minor release. There are no backports to earlier
