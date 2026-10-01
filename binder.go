@@ -54,6 +54,7 @@ const (
 	jjson  = "json"
 	cookie = "cookie"
 	header = "header"
+	form   = "form"
 )
 
 // Tag option constants
@@ -63,9 +64,9 @@ const (
 )
 
 // bindSources lists the tag sources in precedence order. The first source
-// present on a field is the one it binds from. Header is last so that adding
-// it did not change which tag an existing field binds from.
-var bindSources = [...]string{path, query, body, jjson, cookie, header}
+// present on a field is the one it binds from. Header and form come last so
+// that adding them did not change which tag an existing field binds from.
+var bindSources = [...]string{path, query, body, jjson, cookie, header, form}
 
 // fieldTag returns the active binding tag for a struct field: the source it
 // binds from, the name to look up in that source, and the options that follow
@@ -319,7 +320,7 @@ type fieldInfo struct {
 	Index     []int               // path to the field, through any embedded structs
 	Name      string              // Go name for error reporting, such as Paging.Page
 	FieldType reflect.StructField // the field itself
-	Source    string              // "path", "query", "body", "json", "cookie", "header"
+	Source    string              // "path", "query", "body", "json", "cookie", "header", "form"
 	TagName   string              // key to look up in Source, without options
 	OmitEmpty bool
 	Required  bool
@@ -385,6 +386,8 @@ type typeInfo struct {
 	// body finds the field each body member binds, and holds what decoding
 	// a JSON body into those fields needs.
 	body objectFields
+	// formKeys names the keys form fields read, which a form body may send.
+	formKeys map[string]struct{}
 	// bodyMaps names the body fields that are maps, whose members a form body
 	// sends as name[key] fields.
 	bodyMaps map[string]struct{}
@@ -573,6 +576,7 @@ func (o BindOptions) maxBodySize() int64 {
 //   - json:"name"   - Alternative to body tag for JSON data
 //   - cookie:"name" - HTTP cookies
 //   - header:"name" - HTTP request headers, matched case-insensitively
+//   - form:"name"   - A form body's value, or else the query's, as r.FormValue reads
 //
 // Tag modifiers:
 //
@@ -666,7 +670,7 @@ func BindWithOptions(r *http.Request, i any, opts BindOptions) error {
 	// unknown members must be reported, when every member is one.
 	var bodyData map[string]any
 	var unknown []string
-	if len(info.body.index) > 0 || opts.DisallowUnknownFields {
+	if len(info.body.index) > 0 || len(info.formKeys) > 0 || opts.DisallowUnknownFields {
 		bodyData, unknown, err = parseRequestBody(r, opts.maxBodySize(), info, val, opts.DisallowUnknownFields, bound, &errs)
 		if err != nil {
 			return err
@@ -1077,6 +1081,9 @@ func unknownKeys(info *typeInfo, bodyData map[string]any) []string {
 	var unknown []string
 	for name := range bodyData {
 		if _, found := info.body.index[name]; found {
+			continue
+		}
+		if _, found := info.formKeys[name]; found {
 			continue
 		}
 		// A form field such as meta[a] belongs to a map field named meta,
@@ -1571,6 +1578,23 @@ func extractFieldValue(r *http.Request, fi fieldInfo, bodyData map[string]any, q
 		vs := r.Header[fi.HeaderKey]
 		return vs, anyNonEmpty(vs), nil
 
+	case form:
+		// As r.FormValue reads: the form body's value when it has the key,
+		// and otherwise the query's. A JSON body is not a form, and leaves
+		// bodyData nil, so there the query alone is read.
+		if fi.IsMap {
+			if m := groupFormValues(bodyData, fi.TagName); len(m) > 0 {
+				return m, true, nil
+			}
+			m := queries.group(fi.TagName)
+			return m, len(m) > 0, nil
+		}
+		if v, exists := bodyData[fi.TagName]; exists {
+			return v, true, nil
+		}
+		vs := queries.all(fi.TagName)
+		return vs, anyNonEmpty(vs), nil
+
 	default:
 		return nil, false, nil
 	}
@@ -1839,8 +1863,18 @@ func typeInfoFor(typ reflect.Type) *typeInfo {
 	for i, tf := range tagged {
 		fi := newFieldInfo(tf)
 		info.fields[i] = fi
-		if fi.Source == body || fi.Source == jjson {
-			info.body.add(i, fi.TagName, fi.FieldType.Type, fi.OmitEmpty, fi.Index, fi.Name)
+		if fi.Source == form {
+			// A form field reads a form body but never a JSON one, so it
+			// stays out of the fields the JSON walk fills.
+			if info.formKeys == nil {
+				info.formKeys = make(map[string]struct{})
+			}
+			info.formKeys[fi.TagName] = struct{}{}
+		}
+		if fi.Source == body || fi.Source == jjson || fi.Source == form {
+			if fi.Source != form {
+				info.body.add(i, fi.TagName, fi.FieldType.Type, fi.OmitEmpty, fi.Index, fi.Name)
+			}
 			if fi.IsMap {
 				if info.bodyMaps == nil {
 					info.bodyMaps = make(map[string]struct{})

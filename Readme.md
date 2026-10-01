@@ -107,12 +107,13 @@ The library supports binding from multiple sources:
 - `body:"name"` - Binds from the request body: JSON, `x-www-form-urlencoded` or `multipart/form-data`
 - `json:"name"` - Backwards compatibility with existing types
 - `header:"name"` - Binds from request headers, matched case-insensitively
+- `form:"name"` - Binds from a form body when it has the key, and otherwise from the query string, as `r.FormValue` reads (see [Form Tag](#form-tag))
 
 Bodies are parsed as JSON, form-encoded data or a multipart form, chosen by the
 request's `Content-Type`. The `body:` tag reads from whichever it is.
 
 When a field carries more than one of these, the first in this order wins:
-`path`, `query`, `body`, `json`, `cookie`, `header`.
+`path`, `query`, `body`, `json`, `cookie`, `header`, `form`.
 
 A tag with an empty name, such as `query:",required"`, binds under the Go
 field name, matched exactly (for a header, case-insensitively, as any header). As in `encoding/json`, `json:"-"` is not a binding
@@ -243,6 +244,33 @@ that means writing options `encoding/json` does not define, and linters such as
 staticcheck will flag `json:"email,required"` as an unknown tag option. Nothing
 breaks, but prefer `body:` when a field needs binder options, and keep `json:`
 for fields whose tag is shared with serialisation.
+
+### Form Tag
+
+`form:` reads a value the way `net/http`'s `r.FormValue` does, and as Gin's
+`form` tag does: from a form body when the body has the key, and otherwise
+from the query string. One field then serves an HTML form post and a
+`GET ?page=2` alike:
+
+```go
+type ListOrders struct {
+    Page   int               `form:"page"`   // body page=2, or ?page=2
+    Status []string          `form:"status"` // every value, from whichever has the key
+    Filter map[string]string `form:"filter"` // filter[team]=core, from either
+}
+```
+
+- A form body is `application/x-www-form-urlencoded` or `multipart/form-data`,
+  file parts included. A JSON body is not a form, so on a JSON request `form:`
+  reads the query alone, and a JSON member of the same name is not bound by it.
+- Values come from one source or the other, never both: a slice or map takes
+  the body's values when the body has any, and otherwise the query's.
+- `required` and `omitempty` follow the rules of the source the value came
+  from: a key present but empty in a form body satisfies `required`, and an
+  empty query value counts as missing.
+- With `DisallowUnknownFields`, a `form:` key is known in a form body; in a
+  JSON body it is not, since `form:` does not read one.
+- `form:` has its own keys: a `body:"x"` field and a `form:"x"` field both bind.
 
 ## Options
 
@@ -712,7 +740,7 @@ version, the following are stable and will not change incompatibly:
 - The sentinel errors `ErrMalformedBody`, `ErrBodyTooLarge`,
   `ErrInvalidTarget`, `ErrMissingRequired` and `ErrUnknownField`. Match on
   these with `errors.Is` rather than on message text.
-- The struct tags `path`, `query`, `body`, `json`, `cookie` and `header`, the
+- The struct tags `path`, `query`, `body`, `json`, `cookie`, `header` and `form`, the
   order in which they take precedence, and the `omitempty` and `required`
   options.
 

@@ -80,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `form:"name"` binds from a form body when it has the key, and otherwise from
+  the query string, as `r.FormValue` reads and as Gin's `form` tag does, so one
+  field serves a form post and a `GET` query alike. A JSON body is not a form:
+  there `form:` reads the query alone.
 - A JSON string binds into a `[]byte` as base64, as `encoding/json` encodes
   one; text from a query, header or form is taken as its bytes.
 - At most 100 failures are reported per `Bind`. Once that many are recorded,

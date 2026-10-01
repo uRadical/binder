@@ -179,6 +179,8 @@ type fuzzShapes struct {
 	Timeout time.Duration            `body:"timeout"`
 	Retry   *time.Duration           `header:"X-Retry"`
 	Opt     *bool                    `body:"opt,omitempty"`
+	Form    []string                 `form:"fm"`
+	FormMap map[string]int           `form:"fmap"`
 }
 
 // FuzzBindShapes drives the newer shapes from every source. The contract is
@@ -187,7 +189,7 @@ type fuzzShapes struct {
 // whose name may be empty is an unknown member whose name was itself empty.
 func FuzzBindShapes(f *testing.F) {
 	f.Add("application/json", `{"by":"x","meta":{"a":"b"},"counts":{"1":2},"any":[1,{"a":null}],"price":1.5,"prices":[1,"2"],"raw":{"a":1},"timeout":"5s","opt":false}`, "page=2&at=3&f[x]=true&w[a]=1s&rq=v", "10s")
-	f.Add("application/x-www-form-urlencoded", "meta[a]=b&counts[1]=x&price=2.5&timeout=1m&by=", "f[a]=maybe&w[b]=5", "soon")
+	f.Add("application/x-www-form-urlencoded", "meta[a]=b&counts[1]=x&price=2.5&timeout=1m&by=&fm=1&fmap[x]=y", "f[a]=maybe&w[b]=5&fm=2&fmap[z]=3", "soon")
 	f.Add("application/json", `{"teams":{"not-a-uuid":"x"},"counts":{"k":1},"meta":"flat"}`, "limit=x&f[]=1&f[a][b]=1", "")
 	f.Add("application/json", `{"by":null,"meta":{"a":null},"any":null}`, "", "")
 
