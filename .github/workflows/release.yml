@@ -1,0 +1,72 @@
+name: Release
+
+# Pushing a version tag on main publishes a GitHub release, its notes taken
+# from that version's section of CHANGELOG.md:
+#
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# A tag with a suffix, such as v1.3.0-rc.1, is published as a pre-release.
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Check the tag is on main
+      run: |
+        git fetch origin main
+        if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+          echo "::error::$GITHUB_REF_NAME is not on main; tag a commit on main to release it."
+          exit 1
+        fi
+
+    # The tag may be pushed together with its commit, before CI on main has
+    # finished, so the tests run here too.
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Test
+      run: |
+        go vet ./...
+        go test -race ./...
+
+    - name: Release notes from CHANGELOG.md
+      run: |
+        version="${GITHUB_REF_NAME#v}"
+        awk -v heading="## [$version]" '
+          index($0, heading) == 1 { found = 1; next }
+          found && /^## \[/       { exit }
+          found && /^\[[^]]+\]: /  { exit }
+          found                   { print }
+        ' CHANGELOG.md > notes.md
+        if ! grep -q '[^[:space:]]' notes.md; then
+          echo "::error::CHANGELOG.md has no section for [$version]; add one before tagging."
+          exit 1
+        fi
+
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        flags=()
+        if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          flags+=(--prerelease)
+        fi
+        gh release create "$GITHUB_REF_NAME" \
+          --title "$GITHUB_REF_NAME" \
+          --notes-file notes.md \
+          --verify-tag \
+          "${flags[@]}"
